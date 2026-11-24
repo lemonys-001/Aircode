@@ -1,11 +1,16 @@
+# Build caches & dependencies
 node_modules/
-.aircode/
-.aircode-data/
-*.o
-*.obj
-*.res
-*.pdb
+ui-dist/
+src-tauri/target/
+src-tauri/gen/
 *.log
+*.lib
+*.res
+*.o
 .DS_Store
-!windows-exe/
-!windows-exe/Aircode.exe
+
+# Explicitly retain Windows x64 deliverables in dist/
+!dist/
+!dist/AI-Coding-Agent.exe
+!dist/AI-Coding-Agent-Setup.exe
+!dist/SHA256SUMS.txt
