@@ -1,0 +1,11 @@
+node_modules/
+.aircode/
+.aircode-data/
+*.o
+*.obj
+*.res
+*.pdb
+*.log
+.DS_Store
+!windows-exe/
+!windows-exe/Aircode.exe
