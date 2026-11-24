@@ -1,0 +1,38 @@
+========================================================================
+  AIRCODE STUDIO FOR WINDOWS (v1.2.0) — 10-SECOND QUICKSTART
+========================================================================
+
+1. ZERO INSTALL / ZERO DEPENDENCIES
+   Just double-click `Aircode.exe`!
+   - Single standalone 1.7 MB native 64-bit Windows GUI executable
+   - No Node.js, Python, WSL, Docker, or external .dll files required
+   - Uses Windows 10/11's built-in Edge WebView2 + WinHTTP TLS 1.3
+   - Starts in <40 milliseconds with zero flashing black console windows
+
+2. USING AIRCODE WITH ZERO CLOUD COMPUTE LIMITS (100% FREE OPTIONS)
+   Click the Model pill at the top-right ("Local Instant · FREE") to pick:
+   - [Option A] Ollama (100% Offline Local AI on your PC):
+       Install Ollama (https://ollama.com) and run:
+         ollama run qwen2.5-coder:7b
+       Then click "Scan Local Servers" -> "Use Ollama Local" in Aircode!
+   - [Option B] LM Studio (Local GGUF server on 127.0.0.1:1234)
+   - [Option C] OpenRouter Free Coding Models ($0.00):
+       Select `qwen/qwen3-coder:free` or `deepseek/deepseek-chat-v3-0324:free`
+   - [Option D] Google Gemini Free Tier (`gemini-2.5-flash`) or Groq Free Tier
+   - [Option E] Anthropic Claude, OpenAI, DeepSeek, GitHub Models, or Custom URL
+
+3. WINDOWS EXPLORER INTEGRATION & PORTABLE MODE
+   - Drag & drop any project folder onto `Aircode.exe` to open it directly.
+   - Inside Aircode, click ⚙️ (top-right) -> "Windows .EXE Integration" ->
+     "Add 'Open in Aircode' to Right-Click" (uses HKCU — no Admin UAC needed!).
+   - Portable USB Mode: create an empty file named `.aircode-portable` next
+     to `Aircode.exe` to store all settings & sessions in `.aircode-data/`.
+
+4. KEYBOARD SHORTCUTS
+   - Tab        : Cycle Agent Modes (Build / Plan / Turbo / Debug / Review)
+   - Ctrl + P   : Command Palette & Instant Fuzzy File Open
+   - Ctrl + K   : Inline AI Code Transform inside the Code Editor
+   - Ctrl + S   : Save Active File (creates automatic Undo Checkpoint)
+   - @          : Attach @file, @git-diff, @terminal, or @problems to chat
+   - /          : Slash Commands (/init, /review, /compact, /undo, /clear)
+========================================================================

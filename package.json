@@ -1,0 +1,13 @@
+{
+  "name": "aircode-studio",
+  "version": "1.2.0",
+  "description": "Aircode Studio — Ultra-fast native Windows AI Coding IDE & Autonomous Agent (.exe)",
+  "type": "module",
+  "scripts": {
+    "dev": "node server/preview-server.mjs",
+    "preview": "node server/preview-server.mjs",
+    "bundle-ui": "node scripts/bundle_ui.mjs",
+    "build:windows": "bash scripts/build_windows_exe.sh"
+  },
+  "license": "GPL-3.0"
+}
