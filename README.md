@@ -1,74 +1,103 @@
-# ⚡ Aircode Studio for Windows
+# AI Coding Agent — Native Windows x64 Desktop Application
 
-> **Ultra-fast native Windows AI Coding IDE & Autonomous Engineering Agent (`1.7 MB` single-file `.exe`)** — combining the best of **OpenCode**, **Claude Code**, **Cursor**, **Windsurf**, **Cline / Roo Code**, **Zed**, and **Aider** with **zero setup** and **zero terminal/shell required**.
+A standalone, native **Windows 10/11 (x64)** desktop autonomous AI coding application inspired by OpenCode, Claude Code, and Cursor — featuring an offline multi-tab **Monaco Editor** (with side-by-side Git `DiffEditor`), real **Windows ConPTY** PowerShell & CMD terminals, persistent **SQLite** session & audit storage, native Win32 filesystem/drive/dialog integration, and a continuous multi-provider **Autonomous Coding Agent**.
 
----
-
-## 📦 Prebuilt Windows Executable Ready to Run
-
-Your compiled standalone Windows 64-bit desktop binary is ready inside **`windows-exe/`**:
-
-- **[`windows-exe/Aircode.exe`](windows-exe/Aircode.exe)** (`1.70 MB`, PE32+ x86_64 Native Windows GUI)
-- **[`windows-exe/QUICKSTART-WINDOWS.txt`](windows-exe/QUICKSTART-WINDOWS.txt)**
-
-### Setup on Windows 10 / Windows 11
-1. Download **`windows-exe/Aircode.exe`**.
-2. **Double-click `Aircode.exe`** — no installer, no Node.js, no Python, no WSL, no external `.dll` files, and no console black window.
+> **Zero Web Server / Zero Browser Dependency**: `AI-Coding-Agent.exe` launches directly as a native Win32 GUI desktop window (`PE32+ AMD64`, `SUBSYSTEM_WINDOWS_GUI`) and mounts its embedded offline UI assets directly inside WebView2 via `SetVirtualHostNameToFolderMapping` — no `localhost` web server, no browser tab, and no external DLLs.
 
 ---
 
-## 🚀 Why Aircode Is Faster & Lighter Than Electron / CLI Tools
+## Prebuilt Windows x64 Executables (`dist/`)
 
-| Metric | Electron IDEs | Terminal CLI Agents | **Aircode Studio (`Aircode.exe`)** |
+Both compiled 64-bit Windows executables are included directly in `dist/` (checksums in [`dist/SHA256SUMS.txt`](dist/SHA256SUMS.txt)):
+
+| Deliverable | Size | Format | Description |
 | :--- | :--- | :--- | :--- |
-| **Binary Size** | 180 – 350 MB | Requires Node / Bun / Python | **1.70 MB single `.exe`** |
-| **Cold Startup** | 1.8 – 4.5s | Terminal setup + PATH config | **< 40 ms native Win32** |
-| **UI Experience** | Heavy Chromium bundle | Terminal / Shell text only | **Full Desktop IDE + Agent Focus UI (Edge WebView2)** |
-| **TLS & Streaming** | Bundled OpenSSL / Node | Runtime-dependent | **Native Windows `WinHTTP` TLS 1.3 + SSE** |
-| **Subprocess Execution** | Often flashes CMD boxes | Manual shell | **`CreateProcessW` + `CREATE_NO_WINDOW` (100% silent)** |
-| **HiDPI & Dark Titlebar** | Custom hacks | Terminal-dependent | **Per-Monitor v2 Manifest + DWM Immersive Dark Mode** |
+| **`dist/AI-Coding-Agent.exe`** | `6.83 MB` | `PE32+ GUI (x86_64)` | Standalone single-file portable Windows x64 desktop application. Double-click to launch immediately, or pass a project path (`AI-Coding-Agent.exe "D:\Work\MyApp"`). |
+| **`dist/AI-Coding-Agent-Setup.exe`** | `7.36 MB` | `PE32+ GUI (x86_64)` | Native Windows x64 GUI Setup Wizard & Uninstaller. Installs to `%LOCALAPPDATA%\Programs\AI-Coding-Agent`, creates Desktop & Start Menu `.lnk` shortcuts, registers *"Open with AI Coding Agent"* in Windows Explorer folder context menus, and registers an uninstaller in Windows Installed Apps (`--silent` / `/S` also supported). |
 
 ---
 
-## ✨ Features Unified From Every Top Coding App
+## Core Desktop Capabilities
 
-### 1. Autonomous Multi-Mode Agent (OpenCode + Claude Code + Roo Code)
-- **5 Specialized Modes (`Tab` cycles modes instantly)**:
-  - **🔨 Build Mode** — Full autonomous engineering loop (`list_files`, `read_file`, `grep_search`, `write_file`, CRLF-safe surgical `edit_file`, `run_command`, `git_status`, `git_diff`, `spawn_subagent`).
-  - **📐 Plan Mode** — Read-only software architect that inspects your repo and generates a step-by-step plan with a 1-click **"▶ Execute This Plan in Build Mode"** button.
-  - **⚡ Turbo Composer** — Rapid multi-file surgical edits.
-  - **🐛 Debug & Fix** — Diagnoses compiler, linter, and terminal errors and verifies fixes.
-  - **🛡️ Security & Code Review** — Audits diffs and workspace files for bugs and vulnerabilities.
-- **Permission Guardrails**: Switch live between `🛡️ Auto-Edit`, `⚡ Autonomous (YOLO)`, and `🔒 Read-Only`.
-- **Sub-Agent Delegation (`spawn_subagent`)**: Runs focused codebase exploration sub-tasks without bloating main context.
-- **Live Thinking Stream**: Expandable real-time reasoning trace supporting Anthropic Extended Thinking, DeepSeek R1 `reasoning_content`, and Ollama/QwQ `<think>` blocks.
+### 1. Autonomous Multi-Provider AI Coding Agent (9 Real Tools)
+Supports **OpenAI**, **Anthropic**, **Google Gemini**, **OpenRouter**, **Ollama** (local `http://127.0.0.1:11434` with one-click live model discovery), and **Custom OpenAI-Compatible** endpoints.
 
-### 2. Zero-Cloud-Limit Local & Free Model Hub
-Built specifically so you never get blocked by cloud compute quotas:
-- **🦙 Ollama Auto-Discovery (`127.0.0.1:11434`)** & **🎛️ LM Studio (`127.0.0.1:1234`)** — 100% local, offline, unlimited tokens. Includes automatic XML `<tool_call>` fallback so even small local 3B/7B models can execute full coding tools!
-- **🌐 OpenRouter `:free` Coding Presets** — `qwen/qwen3-coder:free`, `deepseek/deepseek-chat-v3-0324:free`, `deepseek/deepseek-r1:free`, `meta-llama/llama-3.3-70b-instruct:free`.
-- **✨ Free Cloud Tiers** — Google Gemini (`gemini-2.5-flash`), Groq LPU (`llama-3.3-70b-versatile`), GitHub Models.
-- **🚀 Frontier Providers** — Native Anthropic `/v1/messages` tool-use protocol (`claude-sonnet-4-5`, `claude-opus-4-5`), OpenAI (`gpt-4.1`, `o4-mini`), DeepSeek, or any custom OpenAI-compatible URL.
-- **⚡ Built-In `Aircode Local Instant` Engine** — Works offline with zero API keys out of the box for `/init`, `/review`, workspace indexing, and Repo Map exploration.
+In **Autonomous Mode**, the agent executes a continuous multi-step engineering loop (`read -> plan -> edit -> diagnose/test -> recover -> verify`) using 9 native workspace tools:
+- `read_file` — Line-numbered file inspection with `start_line` / `end_line` slicing
+- `write_file` — Full file creation/overwrite with automatic unified diff capture
+- `edit_file` — Surgical exact-context replacement with diff recording
+- `search_project` — Fast workspace-wide symbol and text search
+- `execute_command` — Silent (`CREATE_NO_WINDOW`) PowerShell execution capturing `stdout`, `stderr`, and exit codes
+- `install_dependencies` — Automated package installation across `npm`, `pnpm`, `yarn`, `cargo`, and `pip`
+- `run_tests` — Auto-detected (`Cargo.toml`, `package.json`, `pytest`) or custom test suite runner
+- `diagnose_errors` — Compiler & typecheck verification (`tsc --noEmit`, `cargo check`) fed back into the loop for automatic self-healing
+- `git_operation` — Safe Git `status`, `diff`, `log`, `branch`, `add`, and `commit` operations
 
-### 3. Full Visual Desktop IDE (Cursor + Windsurf + Zed + Aider)
-- **Dual Workspace Layouts**: Switch anytime between **IDE Studio** (Explorer + Multi-Tab Editor + Terminal + Agent) and **Agent Focus** (OpenCode Desktop layout).
-- **Multi-Tab Code Editor + `Ctrl+K` Inline AI Transform**: Line gutter, live syntax highlighting, `Ctrl+S` save with automatic checkpointing, and inline `Ctrl+K` code transformations with live Accept/Discard diff preview.
-- **Aider-Style Structural Repo Map**: Automatically indexes classes, structs, functions, and exports across TypeScript/JS, Python, C/C++, Rust, Go, C#, and Java.
-- **Time-Travel Checkpoints (`/undo`) & Visual Diff Center (`± Diffs`)**: Every agent turn or file save snapshots original files so 1 click restores any previous state.
-- **Git Source Control Panel**: Branch status, stage/unstage, **✨ 1-Click AI Commit Message**, commit, and recent commit log.
-- **Rules, Memory Bank & MCP Hub**: Visual editor for `AGENTS.md` (`/init` auto-generator), `CLAUDE.md`, `.aircoderules`, `.aircode/MEMORY.md`, and **MCP (Model Context Protocol)** servers.
-- **Integrated Multi-Shell Terminal + Diagnostics**: Run `PowerShell`, `CMD`, or `Bash` commands from the UI with **`🔧 AI Fix Error`** 1-click handoff.
-- **Windows Explorer Integration**: Native `IFileOpenDialog` folder picker, drag-and-drop folder launch, 1-click `"Open in Aircode"` Explorer right-click menu (`HKCU`, no Admin UAC needed), and `.aircode-portable` USB mode.
+### 2. Permission System, Modes & Emergency Stop
+- **Ask Mode**: Prompts via a native approval modal before any file modification, shell command, or mutating Git action.
+- **Plan Mode**: Enforces strict read-only codebase exploration (`read_file`, `search_project`, `diagnose_errors`) to produce architectural plans without touching files.
+- **Autonomous Mode**: Runs multi-step tool chains automatically while respecting configurable **Require Shell Approval**, **Require File Deletion Confirmation**, and **Workspace Sandbox Restriction** (`restrictToWorkspace`).
+- **Emergency Stop**: Top-toolbar & agent-panel red stop control immediately halts the active agent loop and cancels pending approvals.
+- **SQLite Audit Trail**: Every tool invocation (arguments, duration, status, and unified diff) is permanently logged in `%LOCALAPPDATA%\AI-Coding-Agent\agent.db`.
+
+### 3. Desktop Studio GUI
+- **Project Explorer & Windows Drive Switcher**: Switch across `C:\`, `D:\`, and other logical Windows drives with live capacity indicators, open folders via the native Windows `IFileOpenDialog` picker, create/delete files, search across the project, or reveal files in `explorer.exe`. Real-time external disk changes automatically refresh the tree via `ReadDirectoryChangesW`.
+- **Multi-Tab Offline Monaco Editor & Diff Viewer**: Syntax highlighting for 20+ languages, dirty-state indicators, `Ctrl+S` saving, customizable font size, and side-by-side **Monaco `DiffEditor`** comparing `HEAD` vs. working tree.
+- **Integrated Multi-Tab Windows ConPTY Terminal**: Real Windows Pseudo Console (`CreatePseudoConsole`) tabs running `powershell.exe` or `cmd.exe` with live resizing, custom environment variables, working directory sync, and `Ctrl+C` signal support.
+- **Integrated Git Panel**: Stage/unstage files, inspect diffs in Monaco, commit changes, and create or switch branches.
 
 ---
 
-## 🛠️ Building From Source
+## Repository Structure
+
+```text
+Aircode/
+├── dist/
+│   ├── AI-Coding-Agent.exe          # Standalone Windows x64 desktop executable
+│   ├── AI-Coding-Agent-Setup.exe    # Windows x64 GUI installer & uninstaller
+│   └── SHA256SUMS.txt               # SHA-256 integrity checksums
+├── src/                             # React 18 + TypeScript + Offline Monaco + Xterm UI
+│   ├── App.tsx                      # Root desktop workbench & IPC event wiring
+│   ├── main.tsx                     # Offline Monaco worker bootstrap & custom dark theme
+│   ├── lib/tauri.ts                 # Native Tauri 2 & WebView2 IPC client (zero HTTP)
+│   ├── types/desktop.ts             # Shared TypeScript interfaces
+│   ├── components/                  # Explorer, MonacoWorkbench, ConPtyTerminal, GitPanel, AgentPanel, Modals
+│   └── styles/desktop.css           # Dark native desktop studio stylesheet
+├── src-tauri/                       # Tauri 2 Rust Backend + Native Win32 x64 Host
+│   ├── Cargo.toml                   # Tauri 2, rusqlite, portable-pty, notify, reqwest, rfd, windows-sys
+│   ├── tauri.conf.json              # Tauri 2 desktop window & NSIS bundle configuration
+│   ├── nsis/installer.nsi           # NSIS Windows installer script
+│   ├── src/                         # Rust modules: main.rs, lib.rs, db.rs, fs_ops.rs, pty.rs, git_ops.rs, permissions.rs, agent.rs
+│   └── win32-native-host/           # Native C++17 Win32 WebView2 + SQLite3 + ConPTY + WinHTTP x64 host & setup wizard
+├── scripts/
+│   ├── build-windows.ps1            # Native Windows Tauri 2 + Rust + NSIS build script
+│   ├── build-windows.bat            # CMD wrapper for build-windows.ps1
+│   ├── cross-build-win64.sh         # Zig x86_64-windows-gnu cross-compiler script
+│   └── pack_ui_bundle.py            # Offline UI binary asset packer
+└── DEPENDENCIES.md                  # Runtime & build toolchain documentation
+```
+
+---
+
+## Building from Source
+
+### Option A: Native Tauri 2 Rust Build on Windows 10/11 x64
+In this cloud build environment, `crates.io` (`static.crates.io`) is network-restricted, so the Rust crate in `src-tauri/` is provided ready to compile on any Windows x64 machine with Rust + Visual Studio C++ Build Tools + Node.js 20+:
+
+```powershell
+# PowerShell (on Windows 10/11 x64)
+.\scripts\build-windows.ps1
+```
+Or from `cmd.exe`:
+```bat
+scripts\build-windows.bat
+```
+This runs `npm install`, `npm run build` (`tsc --noEmit && vite build`), and `npx tauri build --bundles nsis`, copying the compiled Rust Tauri executable and NSIS installer into `dist\`.
+
+### Option B: Cross-Compiling the Native Win32 x64 Executables (`dist/*.exe`)
+The prebuilt executables in `dist/` were compiled directly from `ui-dist/` + `src-tauri/win32-native-host/` + SQLite3 amalgamation targeting `x86_64-windows-gnu`:
 
 ```bash
-# Run cross-platform Web / Studio preview server (Node 22+)
-npm run preview
-
-# Cross-compile standalone native Windows 64-bit executable -> windows-exe/Aircode.exe
-npm run build:windows
+./scripts/cross-build-win64.sh
 ```
+See [`DEPENDENCIES.md`](DEPENDENCIES.md) for full dependency and toolchain details.

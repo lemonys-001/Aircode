@@ -1,0 +1,2 @@
+0eb7c40f49fc607a8cd7d6bb7c90ef57377f9871722e25f05030bec07789d490  AI-Coding-Agent.exe
+1cd0761643ac6130d01ff20a15cc1e0a9655acee16401fe75a722acbe409250d  AI-Coding-Agent-Setup.exe
