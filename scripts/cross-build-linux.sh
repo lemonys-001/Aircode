@@ -57,9 +57,13 @@ print(f['url'])")"
   python3 -c "
 import zipfile,sys
 zipfile.ZipFile('$WORK_DIR/zig.whl').extractall('$WORK_DIR/zigpkg')"
-  ZIG_BIN="$(find "$WORK_DIR/zigpkg" -type f -name zig | head -1)"
-  [ -n "$ZIG_BIN" ] || die "zig binary not found in wheel"
-  install -Dm755 "$ZIG_BIN" "$ZIG"
+  # The wheel ships a full zig installation (zig binary + lib/ + include/);
+  # the binary locates its siblings via its own path, so copy the whole tree.
+  ZIG_ROOT="$(dirname "$(find "$WORK_DIR/zigpkg" -type f -name zig | head -1)")"
+  [ -d "$ZIG_ROOT" ] || die "zig installation not found in wheel"
+  rm -rf "$ZIG_DIR"; mkdir -p "$ZIG_DIR"
+  cp -a "$ZIG_ROOT/." "$ZIG_DIR/"
+  chmod +x "$ZIG"
 fi
 log "zig: $($ZIG version)"
 
@@ -73,7 +77,8 @@ for t in "${TARGETS[@]}"; do
   TARBALL_URL="$(curl -fsSL "$MIRROR_NPM/@rustbin/rust-std-${RUST_VERSION}-${t}" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-print(d['dist']['tarball'])")"
+v=d.get('versions',{}).get(d.get('dist-tags',{}).get('latest','')) or d.get('dist',{})
+print(v['dist']['tarball'] if 'dist' in v else v.get('tarball',''))")"
   [ -n "$TARBALL_URL" ] || die "could not resolve rust-std tarball for ${t}"
   curl -fsSL -o "$WORK_DIR/${t}.tgz" "$TARBALL_URL"
   rm -rf "$WORK_DIR/x-${t}"; mkdir -p "$WORK_DIR/x-${t}"
@@ -136,7 +141,7 @@ while i < len(args):
     out.append(a); i += 1
 if not target:
     target = cfg_target() or "x86_64-linux-gnu"
-zt = target if "-" in target and target.split("-")[0] in ARCH.values() else zig_target(target)
+zt = zig_target(target)
 env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=os.environ.get("ZIG_GLOBAL_CACHE_DIR", "/tmp/zig-cache"))
 sys.exit(subprocess.run([ZIG, "cc", "-target", zt] + out, env=env).returncode)
 SH
