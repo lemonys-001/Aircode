@@ -382,6 +382,30 @@ mod tests {
     }
 
     #[test]
+    fn test_shell_workspace_view_renders() {
+        let dir = std::env::temp_dir().join(make_unique_id("shell_ws_test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = std::sync::Arc::new(SqliteStore::open(&dir).unwrap());
+        let mut app = ui::studio::StudioApp::new_headless_for_test(store, dir.clone());
+        std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+        app.reload_workspace(false);
+
+        // Chat first, then flip to the IDE and make sure it still paints.
+        let mut chat = TestSurface::new(1440, 900);
+        app.render(&mut chat);
+        app.execute_action(ui::UiAction::ToggleShellView);
+        assert_eq!(app.shell_view(), ui::shell::ShellView::Workspace);
+        let mut ws = TestSurface::new(1440, 900);
+        app.render(&mut ws);
+        assert!(ws.text_calls > 40, "workspace view drew almost nothing");
+        // The shell chrome (tab strip + status bar) is shared by both views.
+        assert!(ws.drawn.iter().any(|t| t.contains("Workspace")));
+        assert!(ws.drawn.iter().any(|t| t.contains("Tokens:")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_opencode_zen_client_emulation() {
         use crate::opencode_auth::{
             is_zen_free_model, new_zen_session_id, zen_client_headers, zen_tool_name_in,

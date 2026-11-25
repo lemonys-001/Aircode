@@ -57,7 +57,10 @@ use crate::vt_screen::VtScreen;
 // ---------------------------------------------------------------------------
 // Layout constants — generous spacing for a clean, modern, uncluttered feel
 // ---------------------------------------------------------------------------
-const HEADER_H: i32 = 52;
+/// Workspace-mode chrome must sit below the shell's tab strip and above its
+/// status bar, otherwise the two layers overlap.
+const SHELL_CHROME_TOP: i32 = crate::ui::shell::TABSTRIP_H + 1;
+const SHELL_CHROME_BOTTOM: i32 = crate::ui::shell::STATUSBAR_H;
 const RAIL_W: i32 = 60;
 const FOOTER_H: i32 = 26;
 const PAD: i32 = 14;
@@ -534,7 +537,7 @@ impl StudioApp {
         self.mcp_servers = load_mcp_configs(&self.workspace, &platform::app_data_dir());
     }
 
-    fn reload_workspace(&mut self, reset_watcher: bool) {
+    pub fn reload_workspace(&mut self, reset_watcher: bool) {
         self.drives = platform::list_drives();
         self.entries = scan_project_tree(&self.workspace, &self.collapsed_dirs, false, 950);
         self.git_snapshot = inspect_git_status(&self.workspace);
@@ -3009,8 +3012,8 @@ impl StudioApp {
         {
             return CursorShape::Arrow;
         }
-        let top = HEADER_H;
-        let bottom = self.height - FOOTER_H;
+        let top = SHELL_CHROME_TOP;
+        let bottom = self.height - SHELL_CHROME_BOTTOM;
         if self.mouse_y >= top && self.mouse_y < bottom {
             let panel_x = if self.left_panel_open {
                 RAIL_W + self.left_w
@@ -6688,8 +6691,8 @@ impl StudioApp {
                     return self.compute_cursor();
                 }
 
-                let top = HEADER_H;
-                let bottom = self.height - FOOTER_H;
+                let top = SHELL_CHROME_TOP;
+                let bottom = self.height - SHELL_CHROME_BOTTOM;
                 if y >= top && y < bottom {
                     let panel_x = if self.left_panel_open {
                         RAIL_W + self.left_w
@@ -6928,8 +6931,8 @@ impl StudioApp {
             || self.pending_approval.is_some()
             || self.pending_delete.is_some();
 
-        let top = HEADER_H;
-        let bottom = self.height - FOOTER_H;
+        let top = SHELL_CHROME_TOP;
+        let bottom = self.height - SHELL_CHROME_BOTTOM;
         let panel_x = if self.left_panel_open {
             RAIL_W + self.left_w
         } else {
