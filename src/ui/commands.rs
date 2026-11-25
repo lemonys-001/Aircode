@@ -62,7 +62,7 @@ pub fn builtin_palette_commands(show_thinking: bool, mode: &str, effort: &str, t
         },
         PaletteItem {
             id: "cmd:cycle_model".into(),
-            slash: "/model".into(),
+            slash: "(model box)".into(),
             title: "Cycle the Active Model".into(),
             subtitle: "Step through the models available for this provider".into(),
             shortcut: "".into(),

@@ -1014,8 +1014,18 @@ impl StudioApp {
             "/tools" => {
                 self.execute_action(UiAction::ToggleToolBlocks);
             }
-            "/model" | "/models" => {
+            "/model" => {
                 self.cycle_model();
+            }
+            "/models" => {
+                // Documented behaviour: refresh the anonymous Zen catalog.
+                self.fetch_zen_free_models();
+                if !self.connect.zen_free_models.is_empty() {
+                    self.show_toast(format!(
+                        "{} free Zen models live right now.",
+                        self.connect.zen_free_models.len()
+                    ));
+                }
             }
             "/editor" => {
                 self.center_view = CenterView::Editor;
