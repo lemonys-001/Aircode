@@ -1,0 +1,20 @@
+[package]
+name = "ai-coding-agent"
+version = "2.0.0"
+edition = "2021"
+description = "Pure-Rust Native Desktop AI Coding Agent & Studio IDE (Zero Web / No WebView)"
+authors = ["Aircode Contributors"]
+
+[[bin]]
+name = "AI-Coding-Agent"
+path = "src/main.rs"
+
+[lib]
+name = "ai_coding_agent"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+panic = "abort"

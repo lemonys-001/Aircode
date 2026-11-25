@@ -1,103 +1,87 @@
-# AI Coding Agent — Native Windows x64 Desktop Application
+# AI Coding Agent — 100% Pure-Rust Native Desktop IDE & Studio
 
-A standalone, native **Windows 10/11 (x64)** desktop autonomous AI coding application inspired by OpenCode, Claude Code, and Cursor — featuring an offline multi-tab **Monaco Editor** (with side-by-side Git `DiffEditor`), real **Windows ConPTY** PowerShell & CMD terminals, persistent **SQLite** session & audit storage, native Win32 filesystem/drive/dialog integration, and a continuous multi-provider **Autonomous Coding Agent**.
-
-> **Zero Web Server / Zero Browser Dependency**: `AI-Coding-Agent.exe` launches directly as a native Win32 GUI desktop window (`PE32+ AMD64`, `SUBSYSTEM_WINDOWS_GUI`) and mounts its embedded offline UI assets directly inside WebView2 via `SetVirtualHostNameToFolderMapping` — no `localhost` web server, no browser tab, and no external DLLs.
-
----
-
-## Prebuilt Windows x64 Executables (`dist/`)
-
-Both compiled 64-bit Windows executables are included directly in `dist/` (checksums in [`dist/SHA256SUMS.txt`](dist/SHA256SUMS.txt)):
-
-| Deliverable | Size | Format | Description |
-| :--- | :--- | :--- | :--- |
-| **`dist/AI-Coding-Agent.exe`** | `6.83 MB` | `PE32+ GUI (x86_64)` | Standalone single-file portable Windows x64 desktop application. Double-click to launch immediately, or pass a project path (`AI-Coding-Agent.exe "D:\Work\MyApp"`). |
-| **`dist/AI-Coding-Agent-Setup.exe`** | `7.36 MB` | `PE32+ GUI (x86_64)` | Native Windows x64 GUI Setup Wizard & Uninstaller. Installs to `%LOCALAPPDATA%\Programs\AI-Coding-Agent`, creates Desktop & Start Menu `.lnk` shortcuts, registers *"Open with AI Coding Agent"* in Windows Explorer folder context menus, and registers an uninstaller in Windows Installed Apps (`--silent` / `/S` also supported). |
+> **Zero WebView. Zero HTML/CSS/JavaScript. Zero Electron/Tauri Web Frontend.**
+> A **100% Pure-Rust Native Desktop GUI Application** targeting **Windows 10 / 11 (x64)** — with a clean cross-platform OS abstraction (`src/platform/windows.rs` + `src/platform/linux.rs`) ready for **Linux**.
 
 ---
 
-## Core Desktop Capabilities
+## Pre-Built Native Windows x64 Deliverables (`dist/`)
 
-### 1. Autonomous Multi-Provider AI Coding Agent (9 Real Tools)
-Supports **OpenAI**, **Anthropic**, **Google Gemini**, **OpenRouter**, **Ollama** (local `http://127.0.0.1:11434` with one-click live model discovery), and **Custom OpenAI-Compatible** endpoints.
+Ready-to-run 64-bit Windows (`PE32+ AMD64`, `WINDOWS_GUI`) executables are included directly in [`dist/`](./dist):
 
-In **Autonomous Mode**, the agent executes a continuous multi-step engineering loop (`read -> plan -> edit -> diagnose/test -> recover -> verify`) using 9 native workspace tools:
-- `read_file` — Line-numbered file inspection with `start_line` / `end_line` slicing
-- `write_file` — Full file creation/overwrite with automatic unified diff capture
-- `edit_file` — Surgical exact-context replacement with diff recording
-- `search_project` — Fast workspace-wide symbol and text search
-- `execute_command` — Silent (`CREATE_NO_WINDOW`) PowerShell execution capturing `stdout`, `stderr`, and exit codes
-- `install_dependencies` — Automated package installation across `npm`, `pnpm`, `yarn`, `cargo`, and `pip`
-- `run_tests` — Auto-detected (`Cargo.toml`, `package.json`, `pytest`) or custom test suite runner
-- `diagnose_errors` — Compiler & typecheck verification (`tsc --noEmit`, `cargo check`) fed back into the loop for automatic self-healing
-- `git_operation` — Safe Git `status`, `diff`, `log`, `branch`, `add`, and `commit` operations
-
-### 2. Permission System, Modes & Emergency Stop
-- **Ask Mode**: Prompts via a native approval modal before any file modification, shell command, or mutating Git action.
-- **Plan Mode**: Enforces strict read-only codebase exploration (`read_file`, `search_project`, `diagnose_errors`) to produce architectural plans without touching files.
-- **Autonomous Mode**: Runs multi-step tool chains automatically while respecting configurable **Require Shell Approval**, **Require File Deletion Confirmation**, and **Workspace Sandbox Restriction** (`restrictToWorkspace`).
-- **Emergency Stop**: Top-toolbar & agent-panel red stop control immediately halts the active agent loop and cancels pending approvals.
-- **SQLite Audit Trail**: Every tool invocation (arguments, duration, status, and unified diff) is permanently logged in `%LOCALAPPDATA%\AI-Coding-Agent\agent.db`.
-
-### 3. Desktop Studio GUI
-- **Project Explorer & Windows Drive Switcher**: Switch across `C:\`, `D:\`, and other logical Windows drives with live capacity indicators, open folders via the native Windows `IFileOpenDialog` picker, create/delete files, search across the project, or reveal files in `explorer.exe`. Real-time external disk changes automatically refresh the tree via `ReadDirectoryChangesW`.
-- **Multi-Tab Offline Monaco Editor & Diff Viewer**: Syntax highlighting for 20+ languages, dirty-state indicators, `Ctrl+S` saving, customizable font size, and side-by-side **Monaco `DiffEditor`** comparing `HEAD` vs. working tree.
-- **Integrated Multi-Tab Windows ConPTY Terminal**: Real Windows Pseudo Console (`CreatePseudoConsole`) tabs running `powershell.exe` or `cmd.exe` with live resizing, custom environment variables, working directory sync, and `Ctrl+C` signal support.
-- **Integrated Git Panel**: Stage/unstage files, inspect diffs in Monaco, commit changes, and create or switch branches.
+| Deliverable | Size | Description |
+| --- | --- | --- |
+| **`dist/AI-Coding-Agent.exe`** | **2.35 MB** | Self-contained, portable **100% Pure-Rust Native GUI Studio** (statically linked SQLite3, Win32 ClearType GDI UI, ConPTY terminal, WinHTTP TLS client, and 9-tool AI Agent). Run directly with zero installation or runtime dependencies. |
+| **`dist/AI-Coding-Agent-Setup.exe`** | **2.78 MB** | **Pure-Rust Native Windows Setup Wizard & Uninstaller** — installs to `%LOCALAPPDATA%\Programs\AI-Coding-Agent` (no UAC elevation required), creates Desktop & Start Menu `.lnk` shortcuts via COM `IShellLinkW`, adds *"Open with AI Coding Agent"* to Windows Explorer folders, registers `Uninstall.exe` in Windows *Installed Apps*, and supports `/S` silent install & `--uninstall`. |
+| **`dist/SHA256SUMS.txt`** | — | SHA-256 checksums for both Windows x64 binaries. |
 
 ---
 
-## Repository Structure
+## Pure-Rust Native Architecture (No Webpage Inside)
 
-```text
-Aircode/
-├── dist/
-│   ├── AI-Coding-Agent.exe          # Standalone Windows x64 desktop executable
-│   ├── AI-Coding-Agent-Setup.exe    # Windows x64 GUI installer & uninstaller
-│   └── SHA256SUMS.txt               # SHA-256 integrity checksums
-├── src/                             # React 18 + TypeScript + Offline Monaco + Xterm UI
-│   ├── App.tsx                      # Root desktop workbench & IPC event wiring
-│   ├── main.tsx                     # Offline Monaco worker bootstrap & custom dark theme
-│   ├── lib/tauri.ts                 # Native Tauri 2 & WebView2 IPC client (zero HTTP)
-│   ├── types/desktop.ts             # Shared TypeScript interfaces
-│   ├── components/                  # Explorer, MonacoWorkbench, ConPtyTerminal, GitPanel, AgentPanel, Modals
-│   └── styles/desktop.css           # Dark native desktop studio stylesheet
-├── src-tauri/                       # Tauri 2 Rust Backend + Native Win32 x64 Host
-│   ├── Cargo.toml                   # Tauri 2, rusqlite, portable-pty, notify, reqwest, rfd, windows-sys
-│   ├── tauri.conf.json              # Tauri 2 desktop window & NSIS bundle configuration
-│   ├── nsis/installer.nsi           # NSIS Windows installer script
-│   ├── src/                         # Rust modules: main.rs, lib.rs, db.rs, fs_ops.rs, pty.rs, git_ops.rs, permissions.rs, agent.rs
-│   └── win32-native-host/           # Native C++17 Win32 WebView2 + SQLite3 + ConPTY + WinHTTP x64 host & setup wizard
-├── scripts/
-│   ├── build-windows.ps1            # Native Windows Tauri 2 + Rust + NSIS build script
-│   ├── build-windows.bat            # CMD wrapper for build-windows.ps1
-│   ├── cross-build-win64.sh         # Zig x86_64-windows-gnu cross-compiler script
-│   └── pack_ui_bundle.py            # Offline UI binary asset packer
-└── DEPENDENCIES.md                  # Runtime & build toolchain documentation
-```
+Every subsystem is implemented directly in Rust (`edition = "2021"`) with **zero external Cargo crate dependencies** and **zero web browser engine**:
+
+| Module | Responsibility |
+| --- | --- |
+| `src/ui/studio.rs`, `src/ui/mod.rs` | **Native Double-Buffered Studio GUI Workbench** — resizable 4-zone dark IDE layout: Top Studio Bar, Left Explorer/Search/Git Dock, Center Multi-Tab Syntax-Highlighted Code Editor & Side-by-Side Diff Viewer, Bottom Multi-Tab ConPTY Terminal, Right Autonomous AI Agent Timeline & Composer, plus Settings/SQLite Audit & Permission Approval Modals. |
+| `src/platform/windows.rs` | **Pure-Rust Win32 Native Backend** — 32-bit `CreateDIBSection` pixel backbuffer + ClearType `Segoe UI` / `Cascadia Mono` / `Consolas` GDI typography, `DwmSetWindowAttribute` dark titlebar, genuine Windows **ConPTY** (`CreatePseudoConsole` / `HPCON`), **WinHTTP** TLS 1.2/1.3 HTTPS client, `GetLogicalDriveStringsW` + `GetDiskFreeSpaceExW` drive selector, `SHBrowseForFolderW` native folder dialog, `ReadDirectoryChangesW` live filesystem watcher, and Unicode Win32 Clipboard. |
+| `src/platform/linux.rs` | **Pure-Rust Linux Backend** — runtime-loaded X11 native window (`libX11.so.6` via `dlopen`), `SoftwareSurface` 32-bit renderer, POSIX shell session, `curl` HTTPS transport, `zenity` folder picker, and `xclip`/memory clipboard. |
+| `src/agent.rs` | **Autonomous Multi-Provider AI Coding Engine** — supports **Ollama** (local offline + 1-click `/api/tags` model discovery), **OpenAI**, **Anthropic**, **Google Gemini**, **OpenRouter**, and **Custom OpenAI-compatible** endpoints; continuous multi-step tool loop (`Ask`, `Plan`, and `Autonomous` modes); thread-synchronized `PermissionGate`; and instant **Emergency Stop**. |
+| `src/editor.rs` & `src/syntax.rs` | **Native Code Editor & Side-by-Side Diff Engine** — multi-tab UTF-8 code editor with 80-step undo/redo, click/drag selection, clipboard copy/cut/paste, auto-indent, inline Find (`Ctrl+F` / `F3`), lexical syntax highlighting (Rust, TypeScript/JS, Python, C/C++, Go, JSON, TOML/YAML, PowerShell/Shell, SQL, Markdown), and 50/50 split `HEAD` vs Working Copy diff viewer. |
+| `src/vt_screen.rs` | **ANSI / VT100 Terminal Grid** — parses CSI cursor movement, erase modes, 16-color, 256-color, and 24-bit TrueColor (`38;2;R;G;B`) escape sequences with 1,500-line scrollback for `powershell.exe` and `cmd.exe` ConPTY sessions. |
+| `src/sqlite.rs` | **Embedded SQLite3 Persistence** — safe Rust FFI over statically compiled `vendor/sqlite3/sqlite3.c` (`WAL` mode) storing provider keys, safety settings, recent workspaces, chat sessions, and full tool execution audit logs in `%LOCALAPPDATA%\AI-Coding-Agent\agent.db`. |
+| `src/fs_ops.rs` & `src/git_ops.rs` | **Sandboxed Workspace & Silent Git Operations** — canonical path boundary guard preventing writes outside the active workspace, fast project text search, and `CREATE_NO_WINDOW` Git status/stage/unstage/branch/commit/diff execution. |
+| `installer/src/main.rs` | **Pure-Rust Native Win32 Installer** — embeds `AI-Coding-Agent.exe` via `include_bytes!`, renders a dark-themed Win32 wizard, creates COM `.lnk` shortcuts, registers Explorer context menus & Windows *Installed Apps* uninstaller. |
+
+---
+
+## 9 Built-In Autonomous Coding Tools
+
+1. **`read_file`** — Reads workspace source files with 1-based line numbers and line-range slicing.
+2. **`write_file`** — Creates or overwrites files inside the canonical workspace sandbox (auto-creating parent directories and recording unified diffs).
+3. **`edit_file`** — Performs exact surgical snippet replacements and records before/after diffs.
+4. **`search_project`** — Case-insensitive or case-sensitive multi-file project text search (`file:line:col`).
+5. **`execute_command`** — Runs PowerShell / CMD / shell commands inside the workspace (gated by `PermissionGate` when shell approval is enabled).
+6. **`install_dependencies`** — Installs Cargo, npm/pnpm/yarn, or Python `pip` packages with user approval.
+7. **`run_tests`** — Auto-detects `Cargo.toml`, `package.json`, `pyproject.toml`/`pytest`, or `.sln` and runs the project test suite.
+8. **`diagnose_errors`** — Runs compiler/linter diagnostics (`cargo check`, `tsc --noEmit`, `py_compile`) so the agent can self-heal build errors automatically.
+9. **`git_operation`** — Runs non-interactive `git status`, `diff`, `log`, `branch`, `add`, or `commit`.
+
+---
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+O` | Open Windows native folder picker (`SHBrowseForFolderW`) |
+| `Ctrl+S` | Save active file tab (or save Settings modal to SQLite) |
+| `Ctrl+N` | Open new Rust scratch buffer |
+| `Ctrl+F` / `F3` | Toggle inline Find bar / Jump to next match |
+| `Ctrl+Shift+F` | Open workspace-wide Search panel |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / Redo in Code Editor |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / Cut / Paste via native OS Unicode Clipboard |
+| `F5` | Refresh workspace tree, Git status, and clean open tabs |
+| `Enter` / `Shift+Enter` | Launch AI Agent run (in prompt box) / Insert newline |
+| `Esc` | Dismiss active modal or inline bar |
 
 ---
 
 ## Building from Source
 
-### Option A: Native Tauri 2 Rust Build on Windows 10/11 x64
-In this cloud build environment, `crates.io` (`static.crates.io`) is network-restricted, so the Rust crate in `src-tauri/` is provided ready to compile on any Windows x64 machine with Rust + Visual Studio C++ Build Tools + Node.js 20+:
+### Windows 10 / 11 (x64) — Native Build
+Requires only the standard [Rust toolchain (`rustup`)](https://rustup.rs) (MSVC or GNU target — zero Node.js, zero npm, zero external Cargo crates):
 
 ```powershell
-# PowerShell (on Windows 10/11 x64)
 .\scripts\build-windows.ps1
+# Or double-click scripts\build-windows.bat
 ```
-Or from `cmd.exe`:
-```bat
-scripts\build-windows.bat
-```
-This runs `npm install`, `npm run build` (`tsc --noEmit && vite build`), and `npx tauri build --bundles nsis`, copying the compiled Rust Tauri executable and NSIS installer into `dist\`.
 
-### Option B: Cross-Compiling the Native Win32 x64 Executables (`dist/*.exe`)
-The prebuilt executables in `dist/` were compiled directly from `ui-dist/` + `src-tauri/win32-native-host/` + SQLite3 amalgamation targeting `x86_64-windows-gnu`:
-
+### Linux — Native Build & Automated Test Suite
 ```bash
-./scripts/cross-build-win64.sh
+./scripts/build-linux.sh
 ```
-See [`DEPENDENCIES.md`](DEPENDENCIES.md) for full dependency and toolchain details.
+
+### Cross-Compiling Windows x64 `.exe` Binaries from Linux
+```bash
+./scripts/cross-build-rust-win64.sh
+```
