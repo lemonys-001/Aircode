@@ -1,6 +1,21 @@
-//! Pure-Rust Native Desktop IDE Workbench (`StudioApp`).
+//! AirCode — Pure-Rust Native Desktop Studio Workbench (`StudioApp`).
+//!
 //! Renders directly onto the OS 32-bit pixel surface (Win32 DIBSection + ClearType GDI on Windows,
-//! X11 SoftwareSurface on Linux) — zero WebView, zero HTML/CSS/JS.
+//! X11 SoftwareSurface on Linux) — zero WebView, zero HTML/CSS/JS application UI.
+//!
+//! v2.1 layout (uncluttered & spacious):
+//!   ┌───────────────────────────────────────────────────────────────────────────────┐
+//!   │ Header: brand · workspace · provider · mode · effort · theme · Ctrl+K search    │
+//!   ├──────┬───────────────────────────────────────────────┬─────────────────────────┤
+//!   │ Rail │ Explorer / Search / Git / Sessions / Skills   │  Agent · Timeline       │
+//!   │ 58px │ (native editor, minimap, diff view)           │  (chat, prompts, tools) │
+//!   ├──────┴───────────────────────────────────────────────┴─────────────────────────┤
+//!   │ Integrated Terminal Drawer (toggle Ctrl+J)                                       │
+//!   ├─────────────────────────────────────────────────────────────────────────────────┤
+//!   │ Status footer                                                                    │
+//!   └─────────────────────────────────────────────────────────────────────────────────┘
+//! Overlays: Fuzzy Command Panel (Ctrl+K / Ctrl+P / /), /connect Wizard, Theme Picker,
+//! Safety Settings, Permission Gate & Delete Confirmation.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -9,26 +24,43 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use crate::agent::{
-    probe_ollama_models, spawn_autonomous_agent_run, AgentUiEvent, PermissionGate, PermissionPrompt,
+    probe_ollama_models, spawn_autonomous_agent_run, spawn_session_compaction, AgentUiEvent,
+    PermissionGate, PermissionPrompt,
 };
+use crate::browser::{open_in_external_browser, BrowserJsEngine, BrowserOwner, SharedBrowser};
 use crate::editor::{char_len, slice_chars, DiffLineKind, EditorTab, TabContent};
 use crate::fs_ops::{
     resolve_workspace_path, scan_project_tree, search_project_files, DriveInfo, FileEntry,
     SearchMatch,
 };
-use crate::git_ops::{
-    inspect_git_status, load_head_and_working_diff, run_git, GitStatusSnapshot,
+use crate::git_ops::{inspect_git_status, load_head_and_working_diff, run_git, GitStatusSnapshot};
+use crate::mcp::{load_mcp_configs, save_workspace_mcp_configs, McpServerConfig};
+use crate::opencode_auth::{
+    discover_local_credentials, try_spawn_local_opencode_server, ProviderGuide, PROVIDER_GUIDES,
 };
 use crate::platform::{
     self, CursorShape, DesktopAppHandler, DirectoryWatcher, FontRole, KeyCode, Modifiers, MouseBtn,
     NativePtySession, PtyEvent, SurfaceCanvas, WindowEvent,
 };
-use crate::sqlite::{
-    AppSettings, SessionDetail, SessionSummary, SqliteStore, ToolExecutionRecord,
+use crate::skills::load_all_skills;
+use crate::sqlite::{AppSettings, SessionDetail, SessionSummary, SqliteStore, ToolExecutionRecord};
+use crate::subagents::{load_all_subagents, save_subagent, SubAgentSpec};
+use crate::syntax::tokenize_line;
+use crate::themes::ThemePalette;
+use crate::ui::commands::{builtin_palette_commands, filter_palette_items, PaletteItem};
+use crate::ui::{
+    CenterView, FocusTarget, HitZone, LeftTab, ModalDialog, UiAction, UiRect,
 };
-use crate::syntax::{tokenize_line, LangFamily};
-use crate::ui::{FocusTarget, HitZone, LeftTab, SettingsTab, Theme, UiAction, UiRect};
 use crate::vt_screen::VtScreen;
+
+// ---------------------------------------------------------------------------
+// Layout constants — generous spacing for a clean, modern, uncluttered feel
+// ---------------------------------------------------------------------------
+const HEADER_H: i32 = 52;
+const RAIL_W: i32 = 60;
+const FOOTER_H: i32 = 26;
+const PAD: i32 = 12;
+const CARD_RADIUS: i32 = 8;
 
 struct TerminalSession {
     title: String,
@@ -38,9 +70,9 @@ struct TerminalSession {
     screen: VtScreen,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DragSplitter {
-    LeftSidebar,
+    LeftPanel,
     RightAgent,
     BottomTerminal,
 }
@@ -51,38 +83,67 @@ struct DeleteConfirmState {
     rel_path: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentPanelTab {
+    Chat,
+    Timeline,
+}
+
+/// Guided OpenCode-style `/connect` wizard state.
+#[derive(Clone, Debug)]
+pub struct ConnectWizardState {
+    pub provider_id: String,
+    pub model: String,
+    pub key_input: String,
+    pub url_input: String,
+    pub opencode_auth_mode: String, // "zen" | "local-serve"
+    pub detected_summary: Vec<String>,
+    pub detected_opencode_file: Option<String>,
+    pub local_server_alive: bool,
+    pub ollama_alive: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ChatBlock {
+    bg: u32,
+    fg: u32,
+    text: String,
+    diff_rel: Option<String>,
+    /// Some((prompt_index)) when this block starts a persisted message
+    msg_idx: Option<usize>,
+}
+
 pub struct StudioApp {
-    width: i32,
-    height: i32,
+    pub width: i32,
+    pub height: i32,
     mouse_x: i32,
     mouse_y: i32,
 
-    // Resizable Dock Dimensions
+    // Resizable dock dimensions
     left_w: i32,
     right_w: i32,
     term_h: i32,
     active_splitter: Option<DragSplitter>,
     editor_dragging_selection: bool,
 
-    // SQLite store + settings
+    // SQLite store + live settings + dynamic theme palette
     db: Arc<SqliteStore>,
-    settings: AppSettings,
-    settings_draft: AppSettings,
+    pub settings: AppSettings,
+    palette: ThemePalette,
     ollama_models: Vec<String>,
-    tool_audit_log: Vec<ToolExecutionRecord>,
 
-    // Workspace & Explorer (note: collapsed_dirs holds collapsed relative paths)
+    // Workspace & Explorer
     workspace: PathBuf,
     drives: Vec<DriveInfo>,
     entries: Vec<FileEntry>,
     collapsed_dirs: HashSet<String>,
     explorer_scroll: usize,
     left_tab: LeftTab,
+    left_panel_open: bool,
     watcher: Option<DirectoryWatcher>,
     fs_changed_flag: Arc<AtomicBool>,
 
-    // Inline create file/folder bar
-    creating_entry: Option<bool>, // Some(true)=dir, Some(false)=file
+    creating_entry: Option<bool>,
     new_entry_name: String,
 
     // Search panel
@@ -95,39 +156,75 @@ pub struct StudioApp {
     commit_message: String,
     git_scroll: usize,
 
-    // Code Editor & Side-by-Side Diff Viewer tabs
+    // Sessions & prompt timeline
+    sessions: Vec<SessionSummary>,
+    active_session: SessionDetail,
+    sessions_scroll: usize,
+    agent_panel_tab: AgentPanelTab,
+    timeline_scroll: usize,
+    msg_line_offsets: Vec<usize>,
+
+    // Code Editor & Diff viewer tabs
     tabs: Vec<EditorTab>,
     active_tab: usize,
     show_find_bar: bool,
     find_query: String,
+    show_goto_line: bool,
+    goto_line_buf: String,
     editor_rect: UiRect,
+    show_minimap: bool,
 
-    // ConPTY Multi-Tab Terminal
+    // Integrated terminal drawer
     terminals: Vec<TerminalSession>,
     active_term: usize,
+    terminal_open: bool,
     term_grid_rect: UiRect,
 
-    // Autonomous AI Agent & SQLite Sessions
-    sessions: Vec<SessionSummary>,
-    active_session: SessionDetail,
+    // Autonomous AI agent
+    pub active_mode: String,
     live_tools: Vec<ToolExecutionRecord>,
     streaming_thinking: String,
     streaming_text: String,
     agent_prompt: String,
     agent_running: bool,
+    compacting: bool,
     agent_status_line: String,
     agent_rx: Option<Receiver<AgentUiEvent>>,
+    compact_rx: Option<Receiver<AgentUiEvent>>,
     permission_gate: Arc<PermissionGate>,
     agent_scroll_lines: usize,
 
-    // Modals & Toast Notifications
-    settings_modal: Option<SettingsTab>,
+    // Inbuilt Agentic Browser
+    browser: SharedBrowser,
+    center_view: CenterView,
+    browser_url_buf: String,
+    browser_scroll: i32,
+    browser_rect: UiRect,
+
+    // Command palette & modals
+    modal: ModalDialog,
+    palette_open: bool,
+    palette_query: String,
+    palette_index: usize,
+    connect: ConnectWizardState,
+
+    // Skills / Sub-Agents / MCP hub
+    skills: Vec<crate::skills::SkillEntry>,
+    subagents: Vec<SubAgentSpec>,
+    mcp_servers: Vec<McpServerConfig>,
+    extensions_scroll: usize,
+    new_mcp_name: String,
+    new_mcp_target: String,
+    show_mcp_add: bool,
+    hidden_thinking_ids: Vec<String>,
+
+    // Safety / preferences modal
+
     pending_approval: Option<PermissionPrompt>,
     pending_delete: Option<DeleteConfirmState>,
     toast_text: String,
     toast_ticks: u32,
 
-    // Focus & Hit-testing
     focus: FocusTarget,
     blink_phase: bool,
     tick_counter: u64,
@@ -139,24 +236,32 @@ impl StudioApp {
         Self::new_with_options(initial_workspace, true)
     }
 
+    /// Headless constructor used by unit tests / CI smoke runs (no PTY spawning).
+    pub fn new_headless_for_test(store: Arc<SqliteStore>, workspace: PathBuf) -> Self {
+        Self::build(Some(store), Some(workspace), false)
+    }
+
     pub fn new_with_options(initial_workspace: Option<PathBuf>, spawn_default_shell: bool) -> Self {
+        Self::build(None, initial_workspace, spawn_default_shell)
+    }
+
+    fn build(
+        store: Option<Arc<SqliteStore>>,
+        initial_workspace: Option<PathBuf>,
+        spawn_default_shell: bool,
+    ) -> Self {
         let data_dir = platform::app_data_dir();
-        let db = Arc::new(
-            SqliteStore::open(&data_dir).unwrap_or_else(|_| {
-                let fallback = std::env::temp_dir().join("ai_coding_agent_fallback_db");
+        let db = store.unwrap_or_else(|| {
+            Arc::new(SqliteStore::open(&data_dir).unwrap_or_else(|_| {
+                let fallback = std::env::temp_dir().join("aircode_fallback_db");
                 SqliteStore::open(&fallback).expect("fallback sqlite open")
-            }),
-        );
+            }))
+        });
         let settings = db.load_settings();
         let recent = db.list_recent_projects();
 
         let ws = initial_workspace
-            .or_else(|| {
-                recent
-                    .first()
-                    .map(PathBuf::from)
-                    .filter(|p| p.is_dir())
-            })
+            .or_else(|| recent.first().map(PathBuf::from).filter(|p| p.is_dir()))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
         let ws_clean = clean_win_verbatim(&std::fs::canonicalize(&ws).unwrap_or(ws));
@@ -167,28 +272,30 @@ impl StudioApp {
         let sessions = db.list_sessions();
         let drives = platform::list_drives();
         let fs_changed_flag = Arc::new(AtomicBool::new(false));
+        let palette = ThemePalette::by_id(&settings.theme, Some(&ws_clean));
+        let browser = SharedBrowser::new();
 
         let mut app = Self {
-            width: 1480,
-            height: 920,
+            width: 1520,
+            height: 940,
             mouse_x: 0,
             mouse_y: 0,
-            left_w: 276,
-            right_w: 404,
-            term_h: 236,
+            left_w: 288,
+            right_w: 430,
+            term_h: 232,
             active_splitter: None,
             editor_dragging_selection: false,
-            settings_draft: settings.clone(),
             db,
-            settings,
+            settings: settings.clone(),
+            palette,
             ollama_models: Vec::new(),
-            tool_audit_log: Vec::new(),
             workspace: ws_clean,
             drives,
             entries: Vec::new(),
             collapsed_dirs: HashSet::new(),
             explorer_scroll: 0,
             left_tab: LeftTab::Explorer,
+            left_panel_open: true,
             watcher: None,
             fs_changed_flag,
             creating_entry: None,
@@ -199,51 +306,111 @@ impl StudioApp {
             git_snapshot: GitStatusSnapshot::default(),
             commit_message: String::new(),
             git_scroll: 0,
+            sessions,
+            active_session,
+            sessions_scroll: 0,
+            agent_panel_tab: AgentPanelTab::Chat,
+            timeline_scroll: 0,
+            msg_line_offsets: Vec::new(),
             tabs: Vec::new(),
             active_tab: 0,
             show_find_bar: false,
             find_query: String::new(),
-            editor_rect: UiRect::new(276, 80, 800, 580),
+            show_goto_line: false,
+            goto_line_buf: String::new(),
+            editor_rect: UiRect::new(RAIL_W, 100, 700, 400),
+            show_minimap: true,
             terminals: Vec::new(),
             active_term: 0,
-            term_grid_rect: UiRect::new(276, 690, 800, 200),
-            sessions,
-            active_session,
+            terminal_open: true,
+            term_grid_rect: UiRect::new(RAIL_W, 600, 700, 200),
+            active_mode: if settings.default_mode.is_empty() {
+                "build".to_string()
+            } else {
+                settings.default_mode.clone()
+            },
             live_tools: Vec::new(),
             streaming_thinking: String::new(),
             streaming_text: String::new(),
             agent_prompt: String::new(),
             agent_running: false,
-            agent_status_line: "Ready — 100% Pure-Rust Native Studio".to_string(),
+            compacting: false,
+            agent_status_line: "Ready — AirCode Pure-Rust Studio".to_string(),
             agent_rx: None,
+            compact_rx: None,
             permission_gate: Arc::new(PermissionGate::new()),
             agent_scroll_lines: 0,
-            settings_modal: None,
+            browser,
+            center_view: CenterView::Editor,
+            browser_url_buf: String::new(),
+            browser_scroll: 0,
+            browser_rect: UiRect::new(RAIL_W, 100, 700, 400),
+            modal: ModalDialog::None,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_index: 0,
+            connect: ConnectWizardState {
+                provider_id: settings.active_provider.clone(),
+                model: settings.active_model.clone(),
+                key_input: String::new(),
+                url_input: "http://127.0.0.1:4096".to_string(),
+                opencode_auth_mode: settings.opencode_auth_mode.clone(),
+                detected_summary: Vec::new(),
+                detected_opencode_file: None,
+                local_server_alive: false,
+                ollama_alive: false,
+            },
+            skills: Vec::new(),
+            subagents: Vec::new(),
+            mcp_servers: Vec::new(),
+            extensions_scroll: 0,
+            new_mcp_name: String::new(),
+            new_mcp_target: String::new(),
+            show_mcp_add: false,
+            hidden_thinking_ids: Vec::new(),
             pending_approval: None,
             pending_delete: None,
-            toast_text: "AI Coding Agent (Pure-Rust Native GUI) initialized.".to_string(),
-            toast_ticks: 90,
+            toast_text: "AirCode v2.1 — Pure-Rust AI Coding Studio & Agentic Browser".to_string(),
+            toast_ticks: 110,
             focus: FocusTarget::AgentPrompt,
             blink_phase: true,
             tick_counter: 0,
-            hit_zones: Vec::with_capacity(256),
+            hit_zones: Vec::with_capacity(320),
         };
 
+        app.reload_customizations();
         app.reload_workspace(true);
         if spawn_default_shell {
             let shell = if app.settings.default_shell == "cmd" {
                 "cmd"
-            } else {
+            } else if cfg!(target_os = "windows") {
                 "powershell"
+            } else {
+                "sh"
             };
             app.spawn_terminal(shell);
         }
         app
     }
 
+    // -----------------------------------------------------------------------
+    // Small utilities
+    // -----------------------------------------------------------------------
     fn show_toast(&mut self, msg: impl Into<String>) {
         self.toast_text = msg.into();
-        self.toast_ticks = 95;
+        self.toast_ticks = 100;
+    }
+
+    fn refresh_palette(&mut self) {
+        self.palette = ThemePalette::by_id(&self.settings.theme, Some(&self.workspace));
+    }
+
+    /// Hot-reloads skills, sub-agents and MCP servers from `.aircode/`.
+    fn reload_customizations(&mut self) {
+        let disabled: HashSet<String> = self.settings.disabled_skills.iter().cloned().collect();
+        self.skills = load_all_skills(&self.workspace, &platform::app_data_dir(), &disabled);
+        self.subagents = load_all_subagents(&self.workspace);
+        self.mcp_servers = load_mcp_configs(&self.workspace, &platform::app_data_dir());
     }
 
     fn reload_workspace(&mut self, reset_watcher: bool) {
@@ -284,6 +451,8 @@ impl StudioApp {
         self.explorer_scroll = 0;
         self.collapsed_dirs.clear();
         self.reload_workspace(true);
+        self.reload_customizations();
+        self.refresh_palette();
         self.sync_active_pty_cwd();
         self.show_toast(format!("Workspace: {}", self.workspace.display()));
     }
@@ -293,6 +462,7 @@ impl StudioApp {
             if tab.full_path.as_deref() == Some(abs_path) {
                 self.active_tab = idx;
                 self.focus = FocusTarget::Editor;
+                self.center_view = CenterView::Editor;
                 return Ok(());
             }
         }
@@ -319,6 +489,7 @@ impl StudioApp {
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         self.focus = FocusTarget::Editor;
+        self.center_view = CenterView::Editor;
         Ok(())
     }
 
@@ -328,12 +499,14 @@ impl StudioApp {
             if matches!(t.content, TabContent::Diff { .. }) && t.rel_path == rel_path {
                 *t = EditorTab::new_diff(rel_path.to_string(), &orig, &modified);
                 self.active_tab = idx;
+                self.center_view = CenterView::Editor;
                 return;
             }
         }
         self.tabs
             .push(EditorTab::new_diff(rel_path.to_string(), &orig, &modified));
         self.active_tab = self.tabs.len() - 1;
+        self.center_view = CenterView::Editor;
     }
 
     fn refresh_open_code_tabs_from_disk(&mut self) {
@@ -418,7 +591,7 @@ impl StudioApp {
                 };
                 let mut screen = VtScreen::new(cols.max(60) as usize, rows.max(12) as usize);
                 screen.feed_str(&format!(
-                    "\x1b[36m[ConPTY Connected: {} in {}]\x1b[0m\r\n",
+                    "\x1b[36m[Connected: {} in {}]\x1b[0m\r\n",
                     label,
                     self.workspace.display()
                 ));
@@ -430,6 +603,7 @@ impl StudioApp {
                     screen,
                 });
                 self.active_term = self.terminals.len() - 1;
+                self.terminal_open = true;
             }
             Err(e) => self.show_toast(format!("Terminal error: {}", e)),
         }
@@ -449,9 +623,12 @@ impl StudioApp {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Agent run + background stream draining
+    // -----------------------------------------------------------------------
     fn launch_agent_prompt(&mut self, prompt_override: Option<String>) {
         if self.agent_running {
-            self.show_toast("Agent is currently running — click STOP to interrupt first.");
+            self.show_toast("Agent is running — click STOP to interrupt first.");
             return;
         }
         let prompt = prompt_override.unwrap_or_else(|| {
@@ -468,14 +645,16 @@ impl StudioApp {
         self.streaming_thinking.clear();
         self.streaming_text.clear();
         self.agent_scroll_lines = 0;
+        self.agent_panel_tab = AgentPanelTab::Chat;
 
         let (tx, rx) = mpsc::channel();
         let sid = self.active_session.id.clone();
-        let mode = self.settings.default_mode.clone();
+        let mode = self.active_mode.clone();
 
         spawn_autonomous_agent_run(
             self.db.clone(),
             self.permission_gate.clone(),
+            self.browser.clone(),
             self.workspace.clone(),
             sid.clone(),
             prompt,
@@ -483,17 +662,32 @@ impl StudioApp {
             tx,
         );
 
-        // Reload active session immediately so user prompt appears right away
         if let Some(updated) = self.db.load_session(&sid) {
             self.active_session = updated;
         }
         self.agent_rx = Some(rx);
         self.agent_running = true;
-        self.agent_status_line = "Starting autonomous agent loop...".to_string();
+        self.agent_status_line = format!(
+            "Autonomous run started — {} / {} mode",
+            self.settings.active_provider, self.active_mode
+        );
+    }
+
+    fn spawn_compaction(&mut self) {
+        if self.compacting {
+            self.show_toast("Compaction already in progress.");
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        spawn_session_compaction(self.db.clone(), self.active_session.id.clone(), tx);
+        self.compact_rx = Some(rx);
+        self.compacting = true;
+        self.agent_status_line = "Compacting session context into a checkpoint...".to_string();
+        self.show_toast("Compacting session context...");
     }
 
     fn drain_background_streams(&mut self) {
-        // 1. Drain ConPTY terminal streams
+        // 1. Terminal PTY streams
         for term in &mut self.terminals {
             while let Ok(ev) = term.rx.try_recv() {
                 match ev {
@@ -508,35 +702,30 @@ impl StudioApp {
             }
         }
 
-        // 2. Drain FS watcher
+        // 2. Filesystem watcher
         if self.fs_changed_flag.swap(false, Ordering::SeqCst) {
             self.entries = scan_project_tree(&self.workspace, &self.collapsed_dirs, false, 950);
             self.git_snapshot = inspect_git_status(&self.workspace);
             self.refresh_open_code_tabs_from_disk();
         }
 
-        // 3. Drain Autonomous AI Agent events
+        // 3. Autonomous agent events
         let mut finished_session: Option<Option<SessionDetail>> = None;
         let mut workspace_mutated = false;
 
-        if let Some(rx) = &self.agent_rx {
+        let agent_rx = self.agent_rx.take();
+        if let Some(rx) = agent_rx {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
-                    AgentUiEvent::Status(s) => {
-                        self.agent_status_line = s;
-                    }
-                    AgentUiEvent::ThinkingDelta(d) => {
-                        self.streaming_thinking.push_str(&d);
-                    }
+                    AgentUiEvent::Status(s) => self.agent_status_line = s,
+                    AgentUiEvent::ThinkingDelta(d) => self.streaming_thinking.push_str(&d),
                     AgentUiEvent::TextDelta(d) => {
                         if !self.streaming_text.is_empty() {
                             self.streaming_text.push('\n');
                         }
                         self.streaming_text.push_str(&d);
                     }
-                    AgentUiEvent::ToolStarted(rec) => {
-                        self.live_tools.push(rec);
-                    }
+                    AgentUiEvent::ToolStarted(rec) => self.live_tools.push(rec),
                     AgentUiEvent::ToolFinished(rec) => {
                         if !rec.file_path.is_empty()
                             || matches!(
@@ -546,9 +735,7 @@ impl StudioApp {
                         {
                             workspace_mutated = true;
                         }
-                        if let Some(existing) =
-                            self.live_tools.iter_mut().find(|r| r.id == rec.id)
-                        {
+                        if let Some(existing) = self.live_tools.iter_mut().find(|r| r.id == rec.id) {
                             *existing = rec;
                         } else {
                             self.live_tools.push(rec);
@@ -557,16 +744,51 @@ impl StudioApp {
                     AgentUiEvent::PermissionRequested(prompt) => {
                         self.pending_approval = Some(prompt);
                     }
-                    AgentUiEvent::WorkspaceMutated => {
-                        workspace_mutated = true;
+                    AgentUiEvent::WorkspaceMutated => workspace_mutated = true,
+                    AgentUiEvent::OpenBrowserViewport => {
+                        self.center_view = CenterView::Browser;
+                        self.show_toast("Agent opened the Agentic Browser viewport.");
+                    }
+                    AgentUiEvent::ReloadCustomizations => {
+                        self.reload_customizations();
+                        self.show_toast("Customizations reloaded (skills / MCP / sub-agents).");
                     }
                     AgentUiEvent::Error(err) => {
                         self.agent_status_line = format!("Error: {}", err);
                     }
-                    AgentUiEvent::Done(opt_detail) => {
-                        finished_session = Some(opt_detail);
-                    }
+                    AgentUiEvent::Done(opt_detail) => finished_session = Some(opt_detail),
                 }
+            }
+            if self.agent_running {
+                self.agent_rx = Some(rx);
+            }
+        }
+
+        // 4. Compaction stream
+        let compact_rx = self.compact_rx.take();
+        if let Some(rx) = compact_rx {
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    AgentUiEvent::Status(s) => self.agent_status_line = s,
+                    AgentUiEvent::Done(detail) => {
+                        if let Some(d) = detail {
+                            self.active_session = d;
+                        }
+                        self.compacting = false;
+                        self.compact_rx = None;
+                        self.sessions = self.db.list_sessions();
+                        self.show_toast("Session compacted — timeline & forks preserved.");
+                    }
+                    AgentUiEvent::Error(err) => {
+                        self.compacting = false;
+                        self.compact_rx = None;
+                        self.agent_status_line = format!("Compaction error: {}", err);
+                    }
+                    _ => {}
+                }
+            }
+            if self.compacting {
+                self.compact_rx = Some(rx);
             }
         }
 
@@ -590,16 +812,588 @@ impl StudioApp {
             }
             self.sessions = self.db.list_sessions();
             if !self.agent_status_line.starts_with("Error:") {
-                self.agent_status_line = "Completed autonomous turn.".to_string();
+                self.agent_status_line = "Turn complete.".to_string();
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slash commands, fuzzy command palette, /connect wizard, themes & extensions
+// ---------------------------------------------------------------------------
+impl StudioApp {
+    /// Executes a `/command` typed into the agent prompt. Returns true when handled.
+    pub fn execute_slash_command(&mut self, raw: &str) -> bool {
+        let cmd = raw.trim();
+        if cmd.is_empty() {
+            return false;
+        }
+        let lower = cmd.to_ascii_lowercase();
+
+        match lower.as_str() {
+            "/thinking" | "/thinking on" | "/think" => {
+                self.settings.show_thinking = true;
+                self.persist_settings();
+                self.show_toast("AI thinking blocks are now VISIBLE.");
+            }
+            "/thinking off" | "/hide-thinking" => {
+                self.settings.show_thinking = false;
+                self.persist_settings();
+                self.show_toast("AI thinking blocks are now HIDDEN.");
+            }
+            "/plan" | "/mode plan" => {
+                self.active_mode = "plan".to_string();
+                self.settings.default_mode = "plan".to_string();
+                self.persist_settings();
+                self.show_toast("PLAN mode — read-only research & architecture planning.");
+            }
+            "/build" | "/mode build" => {
+                self.active_mode = "build".to_string();
+                self.settings.default_mode = "build".to_string();
+                self.persist_settings();
+                self.show_toast("BUILD mode — full autonomous execution enabled.");
+            }
+            "/compact" | "/summarize" => self.spawn_compaction(),
+            "/fork" => {
+                self.execute_action(UiAction::ForkActiveSession);
+            }
+            "/new" | "/new-session" => {
+                self.execute_action(UiAction::NewSession);
+            }
+            "/timeline" => {
+                self.agent_panel_tab = AgentPanelTab::Timeline;
+                self.show_toast("Prompt Timeline — click a prompt to jump or fork from it.");
+            }
+            "/chat" => {
+                self.agent_panel_tab = AgentPanelTab::Chat;
+            }
+            "/browser" => {
+                self.center_view = CenterView::Browser;
+                self.show_toast("Agentic Browser viewport opened.");
+            }
+            "/editor" => {
+                self.center_view = CenterView::Editor;
+            }
+            "/terminal" => {
+                self.terminal_open = !self.terminal_open;
+            }
+            "/takeover" => {
+                self.browser.interrupt_for_user();
+                self.show_toast("You now control the browser — AI actions paused.");
+            }
+            "/resume" => {
+                self.browser.hand_back_to_ai();
+                self.show_toast("AI browser control resumed.");
+            }
+            "/skills" | "/mcp" | "/subagents" | "/extensions" => {
+                self.left_tab = LeftTab::Extensions;
+                self.left_panel_open = true;
+            }
+            "/sessions" => {
+                self.left_tab = LeftTab::Sessions;
+                self.left_panel_open = true;
+            }
+            "/theme" | "/themes" => {
+                self.modal = ModalDialog::ThemePicker;
+            }
+            "/connect" | "/setup" | "/auth" | "/keys" => {
+                self.open_connect_wizard();
+            }
+            "/settings" | "/safety" => {
+                self.modal = ModalDialog::SafetySettings;
+            }
+            "/goto" => {
+                self.show_goto_line = true;
+                self.focus = FocusTarget::GotoLineInput;
+            }
+            "/find" => {
+                self.show_find_bar = true;
+                self.focus = FocusTarget::FindInput;
+            }
+            "/customize" | "/customizer" => {
+                self.agent_prompt = "Use the aircode-customizer skill to customize AirCode. First read .aircode/skills/aircode-customizer/SKILL.md, then ask me which theme colors, font size, skills, sub-agents or MCP servers I want, and write the correct .aircode/ files.".to_string();
+                self.show_toast("AirCode Customizer skill prompt loaded.");
+            }
+            _ => {
+                // Parameterized commands
+                if let Some(rest) = lower.strip_prefix("/effort") {
+                    let effort = rest.trim();
+                    if matches!(effort, "low" | "medium" | "max" | "ultra") {
+                        self.settings.agent_effort = effort.to_string();
+                        self.persist_settings();
+                        self.show_toast(format!("Agent effort set to {}", effort.to_uppercase()));
+                        return true;
+                    }
+                    self.cycle_effort();
+                    return true;
+                }
+                if let Some(rest) = lower.strip_prefix("/theme ") {
+                    let id = rest.trim();
+                    if ThemePalette::builtin_list().iter().any(|(bid, _)| *bid == id) {
+                        self.settings.theme = id.to_string();
+                        self.refresh_palette();
+                        self.persist_settings();
+                        self.show_toast(format!("Theme applied: {}", self.palette.name));
+                        return true;
+                    }
+                    self.show_toast(format!("Unknown theme '{}' — opening theme picker.", id));
+                    self.modal = ModalDialog::ThemePicker;
+                    return true;
+                }
+                if let Some(rest) = lower.strip_prefix("/model ") {
+                    let m = rest.trim().to_string();
+                    if !m.is_empty() {
+                        self.settings.active_model = m;
+                        self.persist_settings();
+                        self.show_toast(format!("Model set to {}", self.settings.active_model));
+                        return true;
+                    }
+                }
+                if let Some(rest) = lower.strip_prefix("/provider ") {
+                    let p = rest.trim().to_string();
+                    if PROVIDER_GUIDES.iter().any(|g| g.id == p) {
+                        self.settings.active_provider = p.clone();
+                        if let Some(first) = AppSettings::preset_models_for_provider(&p).first() {
+                            self.settings.active_model = (*first).to_string();
+                        }
+                        self.persist_settings();
+                        self.show_toast(format!("Provider set to {}", p));
+                        return true;
+                    }
+                }
+                if let Some(rest) = lower.strip_prefix("/fork ") {
+                    // "/fork 3" forks from prompt #3
+                    if let Ok(n) = rest.trim().parse::<usize>() {
+                        self.execute_action(UiAction::ForkFromMessage(n.saturating_sub(1)));
+                        return true;
+                    }
+                }
+                if let Some(rest) = lower.strip_prefix("/goto ") {
+                    if let Ok(n) = rest.trim().parse::<usize>() {
+                        let vis = self.visible_editor_rows();
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                            tab.goto_line(n, vis);
+                        }
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    fn persist_settings(&mut self) {
+        self.db.save_settings(&self.settings);
+    }
+
+    fn visible_editor_rows(&self) -> usize {
+        ((self.editor_rect.h - 12).max(40) / 20).max(3) as usize
+    }
+
+    pub fn open_command_palette(&mut self) {
+        self.palette_open = true;
+        self.palette_query.clear();
+        self.palette_index = 0;
+        self.modal = ModalDialog::CommandPalette;
+        self.focus = FocusTarget::CommandPaletteInput;
+    }
+
+    fn palette_entries(&self) -> Vec<PaletteItem> {
+        let files: Vec<(String, String)> = self
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .take(900)
+            .map(|e| (e.rel_path.clone(), e.name.clone()))
+            .collect();
+        let commands = builtin_palette_commands(
+            self.settings.show_thinking,
+            &self.active_mode,
+            &self.settings.agent_effort,
+            &self.settings.theme,
+        );
+        filter_palette_items(&self.palette_query, &commands, &files)
+    }
+
+    fn apply_palette_item(&mut self, item: &PaletteItem) {
+        self.modal = ModalDialog::None;
+        self.palette_open = false;
+        if item.is_file {
+            if let Some(rel) = item.id.strip_prefix("file:") {
+                let abs = self.workspace.join(rel);
+                if let Err(e) = self.open_file_in_tab(&abs, rel) {
+                    self.show_toast(e);
+                }
+            }
+            return;
+        }
+        let id = item.id.clone();
+        self.execute_action(UiAction::ExecuteCommandId(id));
+    }
+
+    fn execute_command_id(&mut self, id: String) {
+        match id.as_str() {
+            "cmd:connect" => self.open_connect_wizard(),
+            "cmd:toggle_thinking" => {
+                self.settings.show_thinking = !self.settings.show_thinking;
+                self.persist_settings();
+                self.show_toast(if self.settings.show_thinking {
+                    "AI thinking blocks VISIBLE."
+                } else {
+                    "AI thinking blocks HIDDEN."
+                });
+            }
+            "cmd:compact" => self.spawn_compaction(),
+            "cmd:fork" => self.execute_action(UiAction::ForkActiveSession),
+            "cmd:new_session" => self.execute_action(UiAction::NewSession),
+            "cmd:timeline" => {
+                self.agent_panel_tab = AgentPanelTab::Timeline;
+            }
+            "cmd:mode_plan" => self.execute_action(UiAction::SetMode("plan")),
+            "cmd:mode_build" => self.execute_action(UiAction::SetMode("build")),
+            "cmd:effort_low" => self.execute_action(UiAction::SetEffort("low")),
+            "cmd:effort_medium" => self.execute_action(UiAction::SetEffort("medium")),
+            "cmd:effort_max" => self.execute_action(UiAction::SetEffort("max")),
+            "cmd:effort_ultra" => self.execute_action(UiAction::SetEffort("ultra")),
+            "cmd:theme_picker" => self.modal = ModalDialog::ThemePicker,
+            "cmd:browser" => {
+                self.center_view = CenterView::Browser;
+                self.show_toast("Agentic Browser — co-browse with your AI.");
+            }
+            "cmd:browser_takeover" => {
+                self.center_view = CenterView::Browser;
+                self.browser.interrupt_for_user();
+                self.show_toast("Browser takeover active.");
+            }
+            "cmd:skills" => {
+                self.left_tab = LeftTab::Extensions;
+                self.left_panel_open = true;
+            }
+            "cmd:customize_aircode" => {
+                let _ = self.execute_slash_command("/customize");
+            }
+            "cmd:toggle_terminal" => self.terminal_open = !self.terminal_open,
+            "cmd:goto_line" => {
+                self.show_goto_line = true;
+                self.focus = FocusTarget::GotoLineInput;
+            }
+            "cmd:find" => {
+                self.show_find_bar = true;
+                self.focus = FocusTarget::FindInput;
+            }
+            "cmd:open_folder" => self.execute_action(UiAction::PickFolder),
+            "cmd:safety" => self.modal = ModalDialog::SafetySettings,
+            "panel:chat" => {
+                self.agent_panel_tab = AgentPanelTab::Chat;
+            }
+            "panel:timeline" => {
+                self.agent_panel_tab = AgentPanelTab::Timeline;
+            }
+            "mcp:add" => {
+                self.show_mcp_add = true;
+                self.focus = FocusTarget::McpNameInput;
+            }
+            "skills:guide" => self.execute_action(UiAction::OpenCustomizerGuide),
+            "subagent:new" => {
+                self.save_subagent_from_dialog("helper", "General Helper", "medium", false);
+            }
+            _ => {
+                if let Some(rest) = id.strip_prefix("theme:") {
+                    self.execute_action(UiAction::ApplyTheme(rest.to_string()));
+                }
             }
         }
     }
 
+    fn cycle_effort(&mut self) {
+        let order = ["low", "medium", "max", "ultra"];
+        let cur = order
+            .iter()
+            .position(|e| *e == self.settings.agent_effort)
+            .unwrap_or(1);
+        let next = order[(cur + 1) % order.len()];
+        self.settings.agent_effort = next.to_string();
+        self.persist_settings();
+        self.show_toast(format!("Agent effort -> {}", next.to_uppercase()));
+    }
+
+    // -----------------------------------------------------------------------
+    // /connect guided provider setup (OpenCode-style)
+    // -----------------------------------------------------------------------
+    pub fn open_connect_wizard(&mut self) {
+        let disc = discover_local_credentials(&self.settings.opencode_server_url, &self.settings.ollama_base_url);
+        self.connect = ConnectWizardState {
+            provider_id: self.settings.active_provider.clone(),
+            model: self.settings.active_model.clone(),
+            key_input: String::new(),
+            url_input: self.settings.opencode_server_url.clone(),
+            opencode_auth_mode: self.settings.opencode_auth_mode.clone(),
+            detected_summary: disc.sources_summary.clone(),
+            detected_opencode_file: disc
+                .opencode_auth_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            local_server_alive: disc.local_opencode_server_alive,
+            ollama_alive: disc.local_ollama_alive,
+        };
+        self.modal = ModalDialog::ConnectWizard;
+        self.focus = FocusTarget::ConnectKeyInput;
+        self.show_toast("Guided AI setup — pick a provider, paste a key, or import detected auth.");
+    }
+
+    fn connect_provider_guide(&self) -> &'static ProviderGuide {
+        PROVIDER_GUIDES
+            .iter()
+            .find(|g| g.id == self.connect.provider_id)
+            .unwrap_or(&PROVIDER_GUIDES[0])
+    }
+
+    fn save_connect_wizard(&mut self) {
+        let provider = self.connect.provider_id.clone();
+        let model = self.connect.model.clone();
+        let key = self.connect.key_input.trim().to_string();
+        let mode = self.connect.opencode_auth_mode.clone();
+        let url = self.connect.url_input.trim().to_string();
+
+        self.settings.active_provider = provider.clone();
+        if !model.is_empty() {
+            self.settings.active_model = model;
+        }
+        if !url.is_empty() {
+            self.settings.opencode_server_url = url;
+        }
+        self.settings.opencode_auth_mode = mode.clone();
+        match provider.as_str() {
+            "opencode" => self.settings.opencode_api_key = key,
+            "anthropic" => self.settings.anthropic_api_key = key,
+            "openai" => self.settings.openai_api_key = key,
+            "gemini" => self.settings.gemini_api_key = key,
+            "openrouter" => self.settings.openrouter_api_key = key,
+            "custom" => {
+                self.settings.custom_api_key = key;
+                if !self.settings.opencode_server_url.starts_with("http") {
+                    self.settings.custom_base_url = self.settings.opencode_server_url.clone();
+                }
+            }
+            "ollama" => {
+                if !key.is_empty() {
+                    self.settings.ollama_base_url = key;
+                }
+            }
+            _ => {}
+        }
+        if self.settings.active_model.is_empty() {
+            if let Some(first) = AppSettings::preset_models_for_provider(&provider).first() {
+                self.settings.active_model = (*first).to_string();
+            }
+        }
+        self.persist_settings();
+        self.modal = ModalDialog::None;
+        self.show_toast(format!(
+            "Connected to {} ({}) — auth mode {}",
+            provider, self.settings.active_model, self.settings.opencode_auth_mode
+        ));
+    }
+
+    fn import_detected_auth(&mut self) {
+        let disc = discover_local_credentials(
+            &self.settings.opencode_server_url,
+            &self.settings.ollama_base_url,
+        );
+        let mut imported = Vec::new();
+        if let Some(k) = disc.opencode_zen_key.clone() {
+            self.settings.opencode_api_key = k;
+            imported.push("OpenCode Zen");
+        }
+        if let Some(k) = disc.anthropic_key.clone() {
+            self.settings.anthropic_api_key = k;
+            imported.push("Anthropic");
+        }
+        if let Some(k) = disc.openai_key.clone() {
+            self.settings.openai_api_key = k;
+            imported.push("OpenAI");
+        }
+        if let Some(k) = disc.gemini_key.clone() {
+            self.settings.gemini_api_key = k;
+            imported.push("Gemini");
+        }
+        if let Some(k) = disc.openrouter_key.clone() {
+            self.settings.openrouter_api_key = k;
+            imported.push("OpenRouter");
+        }
+        if disc.local_opencode_server_alive {
+            self.settings.opencode_auth_mode = "local-serve".to_string();
+            imported.push("opencode serve (bridge)");
+        }
+        self.connect.detected_summary = disc.sources_summary.clone();
+        self.connect.detected_opencode_file = disc
+            .opencode_auth_file
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
+        if imported.is_empty() {
+            self.show_toast("No local credentials found — paste a key or use OpenCode Zen public mode.");
+        } else {
+            self.persist_settings();
+            self.show_toast(format!("Imported credentials: {}", imported.join(", ")));
+        }
+    }
+
+    fn spawn_local_opencode_serve(&mut self) {
+        let port = 4096u16;
+        match try_spawn_local_opencode_server(port) {
+            Ok(url) => {
+                self.settings.opencode_server_url = url.clone();
+                self.settings.opencode_auth_mode = "local-serve".to_string();
+                self.connect.url_input = url.clone();
+                self.connect.opencode_auth_mode = "local-serve".to_string();
+                self.connect.local_server_alive = true;
+                self.persist_settings();
+                self.show_toast(format!("opencode serve bridge running at {}", url));
+            }
+            Err(e) => {
+                self.show_toast(e);
+                self.show_toast("Fallback: OpenCode Zen public/key mode still works offline.");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sessions, forks, compaction & timeline
+    // -----------------------------------------------------------------------
+    fn fork_active_session(&mut self, from_msg: Option<usize>) {
+        let src = self.active_session.id.clone();
+        let title_base = self.active_session.title.clone();
+        let forked = self.db.fork_session(&src, from_msg);
+        match forked {
+            Some(detail) => {
+                self.active_session = detail;
+                self.sessions = self.db.list_sessions();
+                self.agent_scroll_lines = 0;
+                self.show_toast(format!(
+                    "Forked {} ({} messages retained)",
+                    title_base,
+                    self.active_session.messages.len()
+                ));
+            }
+            None => self.show_toast("Fork failed — source session unavailable."),
+        }
+    }
+
+    fn scroll_to_message(&mut self, idx: usize) {
+        if let Some(off) = self.msg_line_offsets.get(idx).copied() {
+            self.agent_scroll_lines = off;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Skills, sub-agents, MCP hub
+    // -----------------------------------------------------------------------
+    fn toggle_skill(&mut self, slug: &str) {
+        let mut disabled = self.settings.disabled_skills.clone();
+        if disabled.iter().any(|s| s == slug) {
+            disabled.retain(|s| s != slug);
+        } else {
+            disabled.push(slug.to_string());
+        }
+        self.settings.disabled_skills = disabled;
+        self.persist_settings();
+        self.reload_customizations();
+    }
+
+    fn add_quick_mcp_server(&mut self) {
+        let name = self.new_mcp_name.trim().to_string();
+        let target = self.new_mcp_target.trim().to_string();
+        if name.is_empty() || target.is_empty() {
+            self.show_toast("MCP server needs a name and a command / URL.");
+            return;
+        }
+        let is_http = target.starts_with("http://") || target.starts_with("https://");
+        let (transport, command, url, args) = if is_http {
+            ("http".to_string(), String::new(), target.clone(), Vec::new())
+        } else {
+            let mut parts = target.split_whitespace();
+            let cmd = parts.next().unwrap_or("").to_string();
+            let rest: Vec<String> = parts.map(|s| s.to_string()).collect();
+            ("stdio".to_string(), cmd, String::new(), rest)
+        };
+        let mut servers = self.mcp_servers.clone();
+        servers.push(McpServerConfig {
+            name,
+            transport,
+            command,
+            args,
+            url,
+            enabled: true,
+            status: "unprobed".to_string(),
+            discovered_tools: Vec::new(),
+        });
+        match save_workspace_mcp_configs(&self.workspace, &servers) {
+            Ok(()) => {
+                self.mcp_servers = servers;
+                self.new_mcp_name.clear();
+                self.new_mcp_target.clear();
+                self.show_mcp_add = false;
+                self.show_toast("MCP server saved to .aircode/mcp.json");
+            }
+            Err(e) => self.show_toast(e),
+        }
+    }
+
+    fn probe_all_mcp_servers(&mut self) {
+        let mut probed = Vec::new();
+        let mut total_tools = 0usize;
+        for mut srv in self.mcp_servers.clone() {
+            match crate::mcp::probe_mcp_server_tools(&mut srv, &self.workspace) {
+                Ok(tools) => {
+                    total_tools += tools.len();
+                    srv.discovered_tools = tools;
+                    srv.status = "online".to_string();
+                }
+                Err(e) => {
+                    srv.status = format!("error: {}", crate::ui::studio::truncate_for_status(&e));
+                }
+            }
+            probed.push(srv);
+        }
+        self.mcp_servers = probed;
+        self.show_toast(format!("MCP probe complete — {} tools discovered.", total_tools));
+    }
+
+    fn save_subagent_from_dialog(&mut self, slug: &str, title: &str, effort: &str, readonly: bool) {
+        if slug.trim().is_empty() || title.trim().is_empty() {
+            self.show_toast("Sub-agent needs a slug and a title.");
+            return;
+        }
+        let spec = SubAgentSpec {
+            slug: slug.trim().to_string(),
+            title: title.trim().to_string(),
+            effort: effort.to_string(),
+            readonly,
+            system_prompt: format!(
+                "You are {}, a specialized AirCode sub-agent focused on: {}. Work autonomously and report a concise result.",
+                title.trim(),
+                title.trim()
+            ),
+            builtin: false,
+        };
+        match save_subagent(&self.workspace, &spec) {
+            Ok(_) => {
+                self.reload_customizations();
+                self.show_toast(format!("Sub-agent '{}' created in .aircode/subagents/", spec.slug));
+            }
+            Err(e) => self.show_toast(e),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Action dispatcher
+// ---------------------------------------------------------------------------
+impl StudioApp {
     fn execute_action(&mut self, action: UiAction) {
         match action {
-            UiAction::Focus(target) => {
-                self.focus = target;
-            }
+            UiAction::Focus(target) => self.focus = target,
             UiAction::PickFolder => {
                 if let Some(chosen) = platform::pick_folder_dialog(&self.workspace) {
                     self.switch_workspace(chosen);
@@ -613,19 +1407,45 @@ impl StudioApp {
                     self.switch_workspace(target);
                 }
             }
-            UiAction::SelectLeftTab(t) => {
-                self.left_tab = t;
-                match t {
-                    LeftTab::Search => self.focus = FocusTarget::SearchInput,
-                    LeftTab::Git => {
-                        self.git_snapshot = inspect_git_status(&self.workspace);
+            UiAction::ToggleRailTab(t) => {
+                if self.left_tab == t && self.left_panel_open {
+                    self.left_panel_open = false;
+                } else {
+                    self.left_tab = t;
+                    self.left_panel_open = true;
+                    match t {
+                        LeftTab::Search => self.focus = FocusTarget::SearchInput,
+                        LeftTab::Git => {
+                            self.git_snapshot = inspect_git_status(&self.workspace);
+                        }
+                        LeftTab::Sessions => self.sessions = self.db.list_sessions(),
+                        _ => {}
                     }
-                    LeftTab::Explorer => {}
+                }
+            }
+            UiAction::ToggleTerminalDrawer => {
+                self.terminal_open = !self.terminal_open;
+                if self.terminal_open && self.terminals.is_empty() {
+                    self.spawn_terminal(if cfg!(target_os = "windows") {
+                        "powershell"
+                    } else {
+                        "sh"
+                    });
+                }
+            }
+            UiAction::ToggleAgentPane => {
+                self.right_w = if self.right_w > 60 { 0 } else { 430 };
+            }
+            UiAction::SwitchCenterView(v) => {
+                self.center_view = v;
+                if v == CenterView::Browser {
+                    self.focus = FocusTarget::BrowserUrlInput;
                 }
             }
             UiAction::RefreshWorkspace => {
                 self.reload_workspace(false);
                 self.refresh_open_code_tabs_from_disk();
+                self.reload_customizations();
                 self.show_toast("Workspace refreshed.");
             }
             UiAction::StartCreateEntry { is_dir } => {
@@ -676,8 +1496,7 @@ impl StudioApp {
                 if !self.collapsed_dirs.remove(&rel) {
                     self.collapsed_dirs.insert(rel);
                 }
-                self.entries =
-                    scan_project_tree(&self.workspace, &self.collapsed_dirs, false, 950);
+                self.entries = scan_project_tree(&self.workspace, &self.collapsed_dirs, false, 950);
             }
             UiAction::OpenFile(abs, rel, _name, _is_binary) => {
                 if let Err(e) = self.open_file_in_tab(&abs, &rel) {
@@ -694,13 +1513,12 @@ impl StudioApp {
                     self.perform_delete_file(&abs, &rel);
                 }
             }
-            UiAction::RevealFile(abs) => {
-                platform::reveal_in_file_manager(&abs);
-            }
+            UiAction::RevealFile(abs) => platform::reveal_in_file_manager(&abs),
             UiAction::RunSearch => {
                 let q = self.search_query.trim().to_string();
                 if !q.is_empty() {
-                    self.search_results = search_project_files(&self.workspace, &q, false, 250);
+                    self.search_results =
+                        search_project_files(&self.workspace, &q, false, 250);
                     self.search_scroll = 0;
                     self.show_toast(format!(
                         "Found {} matches for '{}'",
@@ -761,7 +1579,7 @@ impl StudioApp {
                     Ok((0, out, _)) => {
                         self.commit_message.clear();
                         self.git_snapshot = inspect_git_status(&self.workspace);
-                        self.show_toast(out.lines().next().unwrap_or("Committed."));
+                        self.show_toast(out.lines().next().unwrap_or("Committed.").to_string());
                     }
                     Ok((_, o, e)) => {
                         self.show_toast(format!("Commit failed: {} {}", e.trim(), o.trim()));
@@ -776,13 +1594,12 @@ impl StudioApp {
                     self.show_toast(format!("Checked out {}", branch));
                 }
             }
-            UiAction::GitOpenDiff(rel) => {
-                self.open_git_diff_tab(&rel);
-            }
+            UiAction::GitOpenDiff(rel) => self.open_git_diff_tab(&rel),
             UiAction::SelectEditorTab(idx) => {
                 if idx < self.tabs.len() {
                     self.active_tab = idx;
                     self.focus = FocusTarget::Editor;
+                    self.center_view = CenterView::Editor;
                 }
             }
             UiAction::CloseEditorTab(idx) => {
@@ -801,12 +1618,13 @@ impl StudioApp {
                     name.clone(),
                     name,
                     Some(abs),
-                    "// Pure-Rust Scratch Buffer — press Ctrl+S to save into workspace\nfn main() {\n    println!(\"Hello from AI Coding Agent!\");\n}\n",
+                    "// AirCode Pure-Rust Scratch Buffer — Ctrl+S saves into the workspace\nfn main() {\n    println!(\"Hello from AirCode!\");\n}\n",
                     false,
                 );
                 self.tabs.push(tab);
                 self.active_tab = self.tabs.len() - 1;
                 self.focus = FocusTarget::Editor;
+                self.center_view = CenterView::Editor;
             }
             UiAction::ToggleFindBar => {
                 self.show_find_bar = !self.show_find_bar;
@@ -817,11 +1635,32 @@ impl StudioApp {
                 };
             }
             UiAction::FindNext => {
+                let vis = self.visible_editor_rows();
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    let vis_rows = ((self.editor_rect.h - 12).max(40) / 20) as usize;
-                    if !tab.find_next(&self.find_query, vis_rows.max(5)) {
+                    if !tab.find_next(&self.find_query, vis.max(5)) {
                         self.show_toast(format!("No match for '{}'", self.find_query));
                     }
+                }
+            }
+            UiAction::ToggleGotoLine => {
+                self.show_goto_line = !self.show_goto_line;
+                self.focus = if self.show_goto_line {
+                    FocusTarget::GotoLineInput
+                } else {
+                    FocusTarget::Editor
+                };
+            }
+            UiAction::ConfirmGotoLine => {
+                if let Ok(n) = self.goto_line_buf.trim().parse::<usize>() {
+                    let vis = self.visible_editor_rows();
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                        tab.goto_line(n, vis);
+                    }
+                    self.show_goto_line = false;
+                    self.goto_line_buf.clear();
+                    self.focus = FocusTarget::Editor;
+                } else {
+                    self.show_toast("Enter a valid line number.");
                 }
             }
             UiAction::SelectPtyTab(idx) => {
@@ -855,60 +1694,49 @@ impl StudioApp {
                     term.pty.write(b"\r");
                 }
             }
-            UiAction::CycleProvider => {
-                let providers = ["ollama", "openai", "anthropic", "gemini", "openrouter", "custom"];
-                let cur_idx = providers
-                    .iter()
-                    .position(|p| *p == self.settings.active_provider)
-                    .unwrap_or(0);
-                let next_p = providers[(cur_idx + 1) % providers.len()];
-                self.settings.active_provider = next_p.to_string();
-                if let Some(first_m) = AppSettings::preset_models_for_provider(next_p).first() {
-                    self.settings.active_model = (*first_m).to_string();
-                }
-                self.db.save_settings(&self.settings);
-                self.show_toast(format!(
-                    "Provider -> {} ({})",
-                    self.settings.active_provider, self.settings.active_model
-                ));
-            }
-            UiAction::CycleModel => {
-                let presets: Vec<String> = if self.settings.active_provider == "ollama"
-                    && !self.ollama_models.is_empty()
-                {
-                    self.ollama_models.clone()
-                } else {
-                    AppSettings::preset_models_for_provider(&self.settings.active_provider)
-                        .iter()
-                        .map(|s| (*s).to_string())
-                        .collect()
-                };
-                if !presets.is_empty() {
-                    let pos = presets
-                        .iter()
-                        .position(|m| m == &self.settings.active_model)
-                        .unwrap_or(0);
-                    self.settings.active_model = presets[(pos + 1) % presets.len()].clone();
-                    self.db.save_settings(&self.settings);
-                }
-            }
             UiAction::SetMode(mode) => {
+                self.active_mode = mode.to_string();
                 self.settings.default_mode = mode.to_string();
-                self.db.save_settings(&self.settings);
-                self.show_toast(format!("Agent mode set to {}", mode.to_uppercase()));
+                self.persist_settings();
+                self.show_toast(format!("{} mode active.", mode.to_uppercase()));
+            }
+            UiAction::CycleEffort => self.cycle_effort(),
+            UiAction::SetEffort(effort) => {
+                self.settings.agent_effort = effort.to_string();
+                self.persist_settings();
+                self.show_toast(format!("Agent effort -> {}", effort.to_uppercase()));
+            }
+            UiAction::ToggleThinkingVisibility => {
+                self.settings.show_thinking = !self.settings.show_thinking;
+                self.persist_settings();
+                self.show_toast(if self.settings.show_thinking {
+                    "AI thinking blocks VISIBLE."
+                } else {
+                    "AI thinking blocks HIDDEN."
+                });
+            }
+            UiAction::ToggleMessageThinking(msg_id) => {
+                if !self.hidden_thinking_ids.iter().any(|m| *m == msg_id) {
+                    self.hidden_thinking_ids.push(msg_id);
+                } else {
+                    self.hidden_thinking_ids.retain(|m| *m != msg_id);
+                }
             }
             UiAction::SendAgentPrompt => {
+                let text = self.agent_prompt.trim().to_string();
+                if text.starts_with('/') && self.execute_slash_command(&text) {
+                    self.agent_prompt.clear();
+                    return;
+                }
                 self.launch_agent_prompt(None);
             }
-            UiAction::QuickPrompt(text) => {
-                self.launch_agent_prompt(Some(text.to_string()));
-            }
+            UiAction::QuickPrompt(text) => self.launch_agent_prompt(Some(text.to_string())),
             UiAction::EmergencyStop => {
                 if self.agent_running {
                     self.permission_gate.trigger_emergency_stop();
                     self.pending_approval = None;
                     self.agent_status_line = "Emergency Stop triggered by user!".to_string();
-                    self.show_toast("Emergency Stop triggered — halting agent loop immediately.");
+                    self.show_toast("Emergency Stop — halting agent loop immediately.");
                 } else {
                     self.show_toast("No active agent run to stop.");
                 }
@@ -917,18 +1745,20 @@ impl StudioApp {
                 self.active_session = self.db.create_session(
                     "New Session",
                     &self.workspace.to_string_lossy(),
-                    &self.settings.default_mode,
+                    &self.active_mode,
                 );
                 self.sessions = self.db.list_sessions();
                 self.live_tools.clear();
                 self.agent_scroll_lines = 0;
                 self.focus = FocusTarget::AgentPrompt;
+                self.show_toast("New session created.");
             }
             UiAction::SelectSession(id) => {
                 if let Some(detail) = self.db.load_session(&id) {
                     self.active_session = detail;
                     self.live_tools.clear();
                     self.agent_scroll_lines = 0;
+                    self.sessions = self.db.list_sessions();
                 }
             }
             UiAction::DeleteSession(id) => {
@@ -941,81 +1771,182 @@ impl StudioApp {
                     self.sessions = self.db.list_sessions();
                 }
             }
-            UiAction::OpenSettings(tab) => {
-                self.settings_draft = self.settings.clone();
-                self.tool_audit_log = self.db.list_tool_history(60);
-                self.settings_modal = Some(tab);
-                if tab == SettingsTab::Providers {
-                    self.focus = FocusTarget::SettingsModel;
+            UiAction::ForkActiveSession => self.fork_active_session(None),
+            UiAction::ForkFromMessage(idx) => self.fork_active_session(Some(idx)),
+            UiAction::CompactActiveSession => self.spawn_compaction(),
+            UiAction::ScrollToMessage(idx) => {
+                self.agent_panel_tab = AgentPanelTab::Chat;
+                self.scroll_to_message(idx);
+            }
+            UiAction::OpenDiffPreview { title, diff } => {
+                let tab = EditorTab::new_diff(title.clone(), &diff, &String::new());
+                self.tabs.push(tab);
+                self.active_tab = self.tabs.len() - 1;
+                self.center_view = CenterView::Editor;
+                self.show_toast(format!("Opened diff preview: {}", title));
+            }
+            UiAction::OpenModal(m) => {
+                self.modal = m;
+                match m {
+                    ModalDialog::CommandPalette => self.open_command_palette(),
+                    ModalDialog::ConnectWizard => self.open_connect_wizard(),
+                    _ => {}
                 }
             }
             UiAction::CloseModal => {
-                self.settings_modal = None;
+                self.modal = ModalDialog::None;
+                self.palette_open = false;
             }
-            UiAction::SwitchSettingsTab(tab) => {
-                if tab == SettingsTab::ToolAudit {
-                    self.tool_audit_log = self.db.list_tool_history(60);
-                }
-                self.settings_modal = Some(tab);
-            }
-            UiAction::SelectSettingsProvider(p) => {
-                self.settings_draft.active_provider = p.to_string();
-                if let Some(first) = AppSettings::preset_models_for_provider(p).first() {
-                    self.settings_draft.active_model = (*first).to_string();
-                }
-            }
-            UiAction::SelectPresetModel(m) => {
-                self.settings_draft.active_model = m;
-            }
-            UiAction::ProbeOllama => {
-                let (reachable, models) = probe_ollama_models(&self.settings_draft.ollama_base_url);
-                if reachable {
-                    let count = models.len();
-                    if let Some(first) = models.first() {
-                        self.settings_draft.active_model = first.clone();
-                    }
+            UiAction::ExecuteCommandId(id) => self.execute_command_id(id),
+            UiAction::SelectConnectProvider(p) => {
+                self.connect.provider_id = p.to_string();
+                if p == "ollama" {
+                    let (alive, models) = probe_ollama_models(&self.settings.ollama_base_url);
                     self.ollama_models = models;
-                    self.show_toast(format!("Ollama online — {} local model(s) found.", count));
+                    self.connect.ollama_alive = alive;
+                    if let Some(first) = self.ollama_models.first() {
+                        self.connect.model = first.clone();
+                    }
+                }
+                if let Some(first) = AppSettings::preset_models_for_provider(p).first() {
+                    if self.connect.model.is_empty() || p != "ollama" {
+                        self.connect.model = (*first).to_string();
+                    }
+                }
+                self.focus = FocusTarget::ConnectKeyInput;
+            }
+            UiAction::SelectConnectModel(m) => self.connect.model = m,
+            UiAction::SetOpenCodeAuthMode(mode) => {
+                self.connect.opencode_auth_mode = mode.to_string();
+            }
+            UiAction::PasteKeyFromClipboard => {
+                if let Some(clip) = platform::clipboard_get_text() {
+                    let clean: String = clip
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .take(512)
+                        .collect();
+                    self.connect.key_input = clean;
+                    self.show_toast("Pasted key from clipboard.");
                 } else {
-                    self.show_toast("Ollama unreachable on configured base URL.");
+                    self.show_toast("Clipboard is empty or unavailable.");
+                }
+            }
+            UiAction::OpenProviderKeyUrl(url, open_external) => {
+                if open_external {
+                    open_in_external_browser(url);
+                    self.show_toast(format!("Opened {} in your system browser.", url));
+                } else {
+                    self.center_view = CenterView::Browser;
+                    self.browser_url_buf = url.to_string();
+                    let _ = self.browser.navigate(url, false);
+                }
+            }
+            UiAction::ImportDetectedAuth => self.import_detected_auth(),
+            UiAction::SpawnLocalOpenCodeServe => self.spawn_local_opencode_serve(),
+            UiAction::SaveConnectWizard => self.save_connect_wizard(),
+            UiAction::ApplyTheme(id) => {
+                self.settings.theme = id.clone();
+                self.refresh_palette();
+                self.persist_settings();
+                self.show_toast(format!("Theme: {}", self.palette.name));
+            }
+            UiAction::ToggleSkill(slug) => self.toggle_skill(&slug),
+            UiAction::OpenCustomizerGuide => {
+                self.center_view = CenterView::Editor;
+                let rel = ".aircode/skills/aircode-customizer/SKILL.md";
+                let abs = self.workspace.join(rel);
+                if abs.is_file() {
+                    let _ = self.open_file_in_tab(&abs, rel);
+                } else {
+                    let _ = self.execute_slash_command("/customize");
+                }
+            }
+            UiAction::ProbeAllMcpServers => self.probe_all_mcp_servers(),
+            UiAction::AddQuickMcpServer => self.add_quick_mcp_server(),
+            UiAction::ToggleMcpServer(idx) => {
+                if let Some(srv) = self.mcp_servers.get_mut(idx) {
+                    srv.enabled = !srv.enabled;
+                    srv.status = "unprobed".to_string();
+                    let servers = self.mcp_servers.clone();
+                    if let Err(e) = save_workspace_mcp_configs(&self.workspace, &servers) {
+                        self.show_toast(e);
+                    }
                 }
             }
             UiAction::ToggleSettingBool(field) => match field {
                 "require_shell_approval" => {
-                    self.settings_draft.require_shell_approval =
-                        !self.settings_draft.require_shell_approval;
+                    self.settings.require_shell_approval = !self.settings.require_shell_approval;
                 }
                 "require_delete_confirmation" => {
-                    self.settings_draft.require_delete_confirmation =
-                        !self.settings_draft.require_delete_confirmation;
+                    self.settings.require_delete_confirmation =
+                        !self.settings.require_delete_confirmation;
                 }
                 "restrict_to_workspace" => {
-                    self.settings_draft.restrict_to_workspace =
-                        !self.settings_draft.restrict_to_workspace;
+                    self.settings.restrict_to_workspace = !self.settings.restrict_to_workspace;
+                }
+                "show_thinking" => {
+                    self.settings.show_thinking = !self.settings.show_thinking;
+                }
+                "minimap" => {
+                    self.show_minimap = !self.show_minimap;
                 }
                 _ => {}
             },
-            UiAction::AdjustMaxIters(delta) => {
-                let next =
-                    (self.settings_draft.max_agent_iterations as isize + delta).clamp(2, 30);
-                self.settings_draft.max_agent_iterations = next as usize;
-            }
             UiAction::AdjustFontSize(delta) => {
-                self.settings_draft.editor_font_size =
-                    (self.settings_draft.editor_font_size + delta).clamp(12, 22);
+                self.settings.editor_font_size =
+                    (self.settings.editor_font_size + delta).clamp(12, 24);
+                self.persist_settings();
             }
-            UiAction::ToggleDefaultShell => {
-                self.settings_draft.default_shell = if self.settings_draft.default_shell == "cmd" {
-                    "powershell".to_string()
+            UiAction::BrowserBack => self.browser.go_back(),
+            UiAction::BrowserForward => self.browser.go_forward(),
+            UiAction::BrowserReload => {
+                let url = self.current_browser_url();
+                if !url.is_empty() {
+                    let _ = self.browser.navigate(&url, false);
+                }
+            }
+            UiAction::BrowserGoUrl => {
+                let url = self.browser_url_buf.trim().to_string();
+                if !url.is_empty() {
+                    match self.browser.navigate(&url, false) {
+                        Ok(_) => self.show_toast(format!("Loaded {}", url)),
+                        Err(e) => self.show_toast(e),
+                    }
+                }
+            }
+            UiAction::BrowserClickRef(r) => match self.browser.click_ref(r, false) {
+                Ok(_) => {}
+                Err(e) => self.show_toast(e),
+            },
+            UiAction::BrowserInterruptTakeover => {
+                self.browser.interrupt_for_user();
+                self.show_toast("You took control of the browser — AI paused.");
+            }
+            UiAction::BrowserHandBackToAi => {
+                self.browser.hand_back_to_ai();
+                self.show_toast("AI browser control resumed.");
+            }
+            UiAction::BrowserToggleEngine => {
+                let next = if self.browser_engine() == BrowserJsEngine::NativeFast {
+                    BrowserJsEngine::HeadlessDomJs
                 } else {
-                    "cmd".to_string()
+                    BrowserJsEngine::NativeFast
                 };
+                if let Ok(mut g) = self.browser.inner.lock() {
+                    g.engine = next;
+                }
+                self.show_toast(format!("Browser engine: {:?}", next));
             }
-            UiAction::SaveSettingsModal => {
-                self.settings = self.settings_draft.clone();
-                self.db.save_settings(&self.settings);
-                self.settings_modal = None;
-                self.show_toast("Settings persisted to SQLite database.");
+            UiAction::BrowserToggleDomInspector => {
+                if let Ok(mut g) = self.browser.inner.lock() {
+                    g.show_dom_inspector = !g.show_dom_inspector;
+                }
+            }
+            UiAction::BrowserPopOutExternal => {
+                let url = self.current_browser_url();
+                open_in_external_browser(&url);
+                self.show_toast("Opened current page in your system browser.");
             }
             UiAction::ApprovePermission { approved, remember } => {
                 if let Some(req) = self.pending_approval.take() {
@@ -1041,8 +1972,7 @@ impl StudioApp {
         };
         match res {
             Ok(()) => {
-                self.tabs
-                    .retain(|t| t.full_path.as_deref() != Some(abs));
+                self.tabs.retain(|t| t.full_path.as_deref() != Some(abs));
                 if self.active_tab >= self.tabs.len() && !self.tabs.is_empty() {
                     self.active_tab = self.tabs.len() - 1;
                 }
@@ -1053,56 +1983,220 @@ impl StudioApp {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Inbuilt Agentic Browser helpers
+    // -----------------------------------------------------------------------
+    fn current_browser_url(&self) -> String {
+        if let Ok(g) = self.browser.inner.lock() {
+            g.current_url.clone()
+        } else {
+            String::new()
+        }
+    }
+
+    fn browser_engine(&self) -> BrowserJsEngine {
+        if let Ok(g) = self.browser.inner.lock() {
+            g.engine
+        } else {
+            BrowserJsEngine::NativeFast
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard / mouse input pipeline
+// ---------------------------------------------------------------------------
+impl StudioApp {
     fn active_single_line_mut(&mut self) -> Option<&mut String> {
         match self.focus {
-            FocusTarget::SearchInput => Some(&mut self.search_query),
             FocusTarget::NewEntryInput => Some(&mut self.new_entry_name),
+            FocusTarget::SearchInput => Some(&mut self.search_query),
             FocusTarget::CommitInput => Some(&mut self.commit_message),
             FocusTarget::FindInput => Some(&mut self.find_query),
-            FocusTarget::SettingsModel => Some(&mut self.settings_draft.active_model),
-            FocusTarget::SettingsOpenAiKey => Some(&mut self.settings_draft.openai_api_key),
-            FocusTarget::SettingsAnthropicKey => Some(&mut self.settings_draft.anthropic_api_key),
-            FocusTarget::SettingsGeminiKey => Some(&mut self.settings_draft.gemini_api_key),
-            FocusTarget::SettingsOpenRouterKey => Some(&mut self.settings_draft.openrouter_api_key),
-            FocusTarget::SettingsOllamaUrl => Some(&mut self.settings_draft.ollama_base_url),
-            FocusTarget::SettingsCustomUrl => Some(&mut self.settings_draft.custom_base_url),
-            FocusTarget::SettingsCustomKey => Some(&mut self.settings_draft.custom_api_key),
+            FocusTarget::GotoLineInput => Some(&mut self.goto_line_buf),
+            FocusTarget::CommandPaletteInput => Some(&mut self.palette_query),
+            FocusTarget::BrowserUrlInput => Some(&mut self.browser_url_buf),
+            FocusTarget::ConnectKeyInput => Some(&mut self.connect.key_input),
+            FocusTarget::ConnectModelInput => Some(&mut self.connect.model),
+            FocusTarget::ConnectUrlInput => Some(&mut self.connect.url_input),
+            FocusTarget::McpNameInput => Some(&mut self.new_mcp_name),
+            FocusTarget::McpTargetInput => Some(&mut self.new_mcp_target),
             _ => None,
         }
     }
 
     fn handle_key_down(&mut self, key: KeyCode, mods: Modifiers) {
-        if mods.ctrl {
+        let modal_blocking = self.modal != ModalDialog::None
+            || self.pending_approval.is_some()
+            || self.pending_delete.is_some();
+
+        // ---- Command palette input takes priority when open -----------------
+        if self.palette_open {
             match key {
-                KeyCode::Letter('S') => {
-                    if self.settings_modal.is_some() {
-                        self.execute_action(UiAction::SaveSettingsModal);
+                KeyCode::Escape => {
+                    self.palette_open = false;
+                    self.modal = ModalDialog::None;
+                    self.focus = FocusTarget::AgentPrompt;
+                    return;
+                }
+                KeyCode::Up => {
+                    self.palette_index = self.palette_index.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    let max = self.palette_entries().len().saturating_sub(1);
+                    self.palette_index = (self.palette_index + 1).min(max);
+                    return;
+                }
+                KeyCode::Enter => {
+                    let items = self.palette_entries();
+                    if let Some(item) = items
+                        .get(self.palette_index.min(items.len().saturating_sub(1)))
+                        .cloned()
+                    {
+                        self.apply_palette_item(&item);
                     } else {
-                        self.save_active_tab();
+                        self.palette_open = false;
+                        self.modal = ModalDialog::None;
                     }
                     return;
                 }
-                KeyCode::Letter('O') => {
-                    self.execute_action(UiAction::PickFolder);
-                    return;
-                }
-                KeyCode::Letter('F') => {
-                    if mods.shift {
-                        self.execute_action(UiAction::SelectLeftTab(LeftTab::Search));
-                    } else {
-                        self.execute_action(UiAction::ToggleFindBar);
+                KeyCode::Backspace => {
+                    self.palette_query.pop();
+                    self.palette_index = 0;
+                    if self.palette_query.is_empty() {
+                        self.palette_open = false;
+                        self.modal = ModalDialog::None;
+                        self.focus = FocusTarget::AgentPrompt;
                     }
-                    return;
-                }
-                KeyCode::Letter('N') => {
-                    self.execute_action(UiAction::NewScratchTab);
                     return;
                 }
                 _ => {}
             }
         }
 
-        if key == KeyCode::F5 {
+        // ---- Global shortcuts -------------------------------------------------
+        if mods.ctrl && mods.shift {
+            match key {
+                KeyCode::Letter('P') => {
+                    self.open_connect_wizard();
+                    return;
+                }
+                KeyCode::Letter('E') => {
+                    self.left_tab = LeftTab::Explorer;
+                    self.left_panel_open = true;
+                    return;
+                }
+                KeyCode::Letter('F') => {
+                    self.left_tab = LeftTab::Search;
+                    self.left_panel_open = true;
+                    return;
+                }
+                KeyCode::Letter('G') => {
+                    self.left_tab = LeftTab::Git;
+                    self.left_panel_open = true;
+                    return;
+                }
+                KeyCode::Letter('S') => {
+                    self.left_tab = LeftTab::Sessions;
+                    self.left_panel_open = true;
+                    return;
+                }
+                KeyCode::Letter('X') => {
+                    self.left_tab = LeftTab::Extensions;
+                    self.left_panel_open = true;
+                    return;
+                }
+                KeyCode::Letter('T') => {
+                    self.agent_panel_tab = if self.agent_panel_tab == AgentPanelTab::Timeline {
+                        AgentPanelTab::Chat
+                    } else {
+                        AgentPanelTab::Timeline
+                    };
+                    return;
+                }
+                KeyCode::Letter('K') => {
+                    self.open_command_palette();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if mods.ctrl {
+            match key {
+                KeyCode::Letter('K') | KeyCode::Letter('P') => {
+                    self.open_command_palette();
+                    return;
+                }
+                KeyCode::Letter('B') => {
+                    self.center_view = if self.center_view == CenterView::Browser {
+                        CenterView::Editor
+                    } else {
+                        CenterView::Browser
+                    };
+                    return;
+                }
+                KeyCode::Letter('J') => {
+                    self.terminal_open = !self.terminal_open;
+                    return;
+                }
+                KeyCode::Letter('G') if !modal_blocking => {
+                    self.show_goto_line = !self.show_goto_line;
+                    self.focus = if self.show_goto_line {
+                        FocusTarget::GotoLineInput
+                    } else {
+                        FocusTarget::Editor
+                    };
+                    return;
+                }
+                _ => {}
+            }
+            if !modal_blocking {
+                match key {
+                    KeyCode::Letter('S') => {
+                        self.save_active_tab();
+                        return;
+                    }
+                    KeyCode::Letter('O') => {
+                        self.execute_action(UiAction::PickFolder);
+                        return;
+                    }
+                    KeyCode::Letter('F') => {
+                        if mods.shift {
+                            self.left_tab = LeftTab::Search;
+                            self.left_panel_open = true;
+                        } else {
+                            self.show_find_bar = true;
+                            self.focus = FocusTarget::FindInput;
+                        }
+                        return;
+                    }
+                    KeyCode::Letter('N') => {
+                        if mods.shift {
+                            self.execute_action(UiAction::NewSession);
+                        } else {
+                            self.execute_action(UiAction::NewScratchTab);
+                        }
+                        return;
+                    }
+                    KeyCode::Letter('W') => {
+                        self.execute_action(UiAction::CloseEditorTab(self.active_tab));
+                        return;
+                    }
+                    KeyCode::Tab => {
+                        if !self.tabs.is_empty() {
+                            let next = (self.active_tab + 1) % self.tabs.len();
+                            self.execute_action(UiAction::SelectEditorTab(next));
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if key == KeyCode::F5 && !modal_blocking {
             self.execute_action(UiAction::RefreshWorkspace);
             return;
         }
@@ -1123,12 +2217,9 @@ impl StudioApp {
                 self.pending_delete = None;
                 return;
             }
-            if self.settings_modal.is_some() {
-                self.settings_modal = None;
-                return;
-            }
-            if self.creating_entry.is_some() {
-                self.creating_entry = None;
+            if self.modal != ModalDialog::None {
+                self.modal = ModalDialog::None;
+                self.show_mcp_add = false;
                 return;
             }
             if self.show_find_bar {
@@ -1136,10 +2227,23 @@ impl StudioApp {
                 self.focus = FocusTarget::Editor;
                 return;
             }
+            if self.show_goto_line {
+                self.show_goto_line = false;
+                self.focus = FocusTarget::Editor;
+                return;
+            }
         }
 
-        // Terminal focus keyboard forwarding
-        if self.focus == FocusTarget::Terminal && self.settings_modal.is_none() {
+        if modal_blocking {
+            // Route simple navigation for modal focus targets
+            match key {
+                KeyCode::Up | KeyCode::Down => return,
+                _ => {}
+            }
+        }
+
+        // ---- Terminal focus ---------------------------------------------------
+        if self.focus == FocusTarget::Terminal && !modal_blocking {
             if let Some(term) = self.terminals.get_mut(self.active_term) {
                 if mods.ctrl {
                     match key {
@@ -1181,9 +2285,9 @@ impl StudioApp {
             return;
         }
 
-        // Code editor focus
-        if self.focus == FocusTarget::Editor && self.settings_modal.is_none() {
-            let vis_rows = ((self.editor_rect.h - 12).max(40) / 20) as usize;
+        // ---- Code editor focus -------------------------------------------------
+        if self.focus == FocusTarget::Editor && !modal_blocking && !self.tabs.is_empty() {
+            let vis = self.visible_editor_rows();
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 if mods.ctrl {
                     match key {
@@ -1218,23 +2322,46 @@ impl StudioApp {
                             }
                             return;
                         }
+                        KeyCode::Letter('D') => {
+                            tab.select_word_or_next_match(vis);
+                            return;
+                        }
+                        KeyCode::Other(191) => {
+                            tab.toggle_comment();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                if mods.alt {
+                    match key {
+                        KeyCode::Up => {
+                            tab.move_line_vertical(-1, vis);
+                            return;
+                        }
+                        KeyCode::Down => {
+                            tab.move_line_vertical(1, vis);
+                            return;
+                        }
                         _ => {}
                     }
                 }
 
+                // Smart indentation / unindentation of the selected block
+                if key == KeyCode::Tab && tab.ordered_selection().is_some() {
+                    tab.indent_block(!mods.shift);
+                    return;
+                }
+
                 match key {
-                    KeyCode::Left => tab.move_cursor(0, -1, mods.shift, vis_rows),
-                    KeyCode::Right => tab.move_cursor(0, 1, mods.shift, vis_rows),
-                    KeyCode::Up => tab.move_cursor(-1, 0, mods.shift, vis_rows),
-                    KeyCode::Down => tab.move_cursor(1, 0, mods.shift, vis_rows),
+                    KeyCode::Left => tab.move_cursor(0, -1, mods.shift, vis),
+                    KeyCode::Right => tab.move_cursor(0, 1, mods.shift, vis),
+                    KeyCode::Up => tab.move_cursor(-1, 0, mods.shift, vis),
+                    KeyCode::Down => tab.move_cursor(1, 0, mods.shift, vis),
                     KeyCode::Home => tab.jump_home_end(false, mods.shift),
                     KeyCode::End => tab.jump_home_end(true, mods.shift),
-                    KeyCode::PageUp => {
-                        tab.move_cursor(-(vis_rows as isize), 0, mods.shift, vis_rows)
-                    }
-                    KeyCode::PageDown => {
-                        tab.move_cursor(vis_rows as isize, 0, mods.shift, vis_rows)
-                    }
+                    KeyCode::PageUp => tab.move_cursor(-(vis as isize), 0, mods.shift, vis),
+                    KeyCode::PageDown => tab.move_cursor(vis as isize, 0, mods.shift, vis),
                     KeyCode::Backspace => tab.backspace(),
                     KeyCode::Delete => tab.delete_forward(),
                     KeyCode::Enter => tab.insert_newline_auto_indent(),
@@ -1245,8 +2372,8 @@ impl StudioApp {
             return;
         }
 
-        // Agent prompt composer
-        if self.focus == FocusTarget::AgentPrompt && self.settings_modal.is_none() {
+        // ---- Agent prompt composer -------------------------------------------
+        if self.focus == FocusTarget::AgentPrompt && !modal_blocking {
             if mods.ctrl && key == KeyCode::Letter('V') {
                 if let Some(clip) = platform::clipboard_get_text() {
                     self.agent_prompt.push_str(&clip);
@@ -1258,18 +2385,32 @@ impl StudioApp {
                     if mods.shift {
                         self.agent_prompt.push('\n');
                     } else {
-                        self.launch_agent_prompt(None);
+                        self.execute_action(UiAction::SendAgentPrompt);
                     }
                 }
                 KeyCode::Backspace => {
                     self.agent_prompt.pop();
+                }
+                KeyCode::Up => {
+                    if let Some(last) = self.active_session.messages.iter().rev().find(|m| m.role == "user") {
+                        self.agent_prompt = last.content.clone();
+                    }
                 }
                 _ => {}
             }
             return;
         }
 
-        // Single-line text inputs
+        // ---- Browser URL bar ----------------------------------------------------
+        if self.focus == FocusTarget::BrowserUrlInput && !modal_blocking {
+            match key {
+                KeyCode::Enter => self.execute_action(UiAction::BrowserGoUrl),
+                KeyCode::Escape => self.focus = FocusTarget::Editor,
+                _ => {}
+            }
+        }
+
+        // ---- Single-line inputs -------------------------------------------------
         let current_focus = self.focus;
         if let Some(line) = self.active_single_line_mut() {
             if mods.ctrl {
@@ -1295,11 +2436,21 @@ impl StudioApp {
                 }
                 KeyCode::Enter => match current_focus {
                     FocusTarget::SearchInput => self.execute_action(UiAction::RunSearch),
-                    FocusTarget::NewEntryInput => self.execute_action(UiAction::ConfirmCreateEntry),
+                    FocusTarget::NewEntryInput => {
+                        self.execute_action(UiAction::ConfirmCreateEntry)
+                    }
                     FocusTarget::CommitInput => self.execute_action(UiAction::GitCommit),
                     FocusTarget::FindInput => self.execute_action(UiAction::FindNext),
+                    FocusTarget::GotoLineInput => self.execute_action(UiAction::ConfirmGotoLine),
+                    FocusTarget::BrowserUrlInput => self.execute_action(UiAction::BrowserGoUrl),
+                    FocusTarget::ConnectKeyInput => self.execute_action(UiAction::SaveConnectWizard),
                     _ => {}
                 },
+                KeyCode::Escape => {
+                    if current_focus == FocusTarget::NewEntryInput {
+                        self.creating_entry = None;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1309,7 +2460,17 @@ impl StudioApp {
         if ch < ' ' {
             return;
         }
-        if self.focus == FocusTarget::Terminal && self.settings_modal.is_none() {
+        let modal_blocking = self.modal != ModalDialog::None
+            || self.pending_approval.is_some()
+            || self.pending_delete.is_some();
+
+        if self.palette_open {
+            self.palette_query.push(ch);
+            self.palette_index = 0;
+            return;
+        }
+
+        if self.focus == FocusTarget::Terminal && !modal_blocking {
             if let Some(term) = self.terminals.get_mut(self.active_term) {
                 let mut buf = [0u8; 4];
                 let s = ch.encode_utf8(&mut buf);
@@ -1319,16 +2480,21 @@ impl StudioApp {
             return;
         }
 
-        if self.focus == FocusTarget::Editor && self.settings_modal.is_none() {
+        if self.focus == FocusTarget::Editor && !modal_blocking {
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                let mut buf = [0u8; 4];
-                let s = ch.encode_utf8(&mut buf);
-                tab.insert_str(s);
+                tab.insert_smart_char(ch);
             }
             return;
         }
 
-        if self.focus == FocusTarget::AgentPrompt && self.settings_modal.is_none() {
+        if self.focus == FocusTarget::AgentPrompt && !modal_blocking {
+            // A leading "/" opens the fuzzy Command Panel in slash-command mode
+            if ch == '/' && self.agent_prompt.is_empty() {
+                self.open_command_palette();
+                self.palette_query = "/".to_string();
+                self.palette_index = 0;
+                return;
+            }
             self.agent_prompt.push(ch);
             return;
         }
@@ -1346,7 +2512,7 @@ impl StudioApp {
         scroll_y: usize,
         scroll_x: usize,
     ) -> (usize, usize) {
-        let gutter_w = 56;
+        let gutter_w = 58;
         let line_h = 20;
         let char_w = 8;
         let rel_y = (my - self.editor_rect.y - 6).max(0) as usize;
@@ -1358,29 +2524,42 @@ impl StudioApp {
     }
 
     fn compute_cursor(&self) -> CursorShape {
-        if self.settings_modal.is_some()
+        if self.modal != ModalDialog::None
             || self.pending_approval.is_some()
             || self.pending_delete.is_some()
         {
             return CursorShape::Arrow;
         }
-        let top = 44;
-        let bottom = self.height - 24;
+        let top = HEADER_H;
+        let bottom = self.height - FOOTER_H;
         if self.mouse_y >= top && self.mouse_y < bottom {
-            if (self.mouse_x - self.left_w).abs() <= 4
+            let panel_x = if self.left_panel_open {
+                RAIL_W + self.left_w
+            } else {
+                RAIL_W
+            };
+            if (self.mouse_x - panel_x).abs() <= 4
                 || (self.mouse_x - (self.width - self.right_w)).abs() <= 4
             {
                 return CursorShape::ResizeH;
             }
-            let term_top = bottom - self.term_h;
-            if self.mouse_x > self.left_w
-                && self.mouse_x < self.width - self.right_w
-                && (self.mouse_y - term_top).abs() <= 4
-            {
-                return CursorShape::ResizeV;
+            if self.terminal_open {
+                let term_top = bottom - self.term_h;
+                if self.mouse_x > panel_x
+                    && self.mouse_x < self.width - self.right_w
+                    && (self.mouse_y - term_top).abs() <= 4
+                {
+                    return CursorShape::ResizeV;
+                }
             }
         }
-        if self.editor_rect.contains(self.mouse_x, self.mouse_y) && !self.tabs.is_empty() {
+        if self.center_view == CenterView::Browser && self.browser_rect.contains(self.mouse_x, self.mouse_y) {
+            return CursorShape::Hand;
+        }
+        if self.center_view == CenterView::Editor
+            && self.editor_rect.contains(self.mouse_x, self.mouse_y)
+            && !self.tabs.is_empty()
+        {
             return CursorShape::IBeam;
         }
         for z in &self.hit_zones {
@@ -1393,11 +2572,12 @@ impl StudioApp {
         }
         CursorShape::Arrow
     }
+}
 
-    // =========================================================================
-    // RENDERING PIPELINE (Pure-Rust Double-Buffered Pixel + ClearType Renderer)
-    // =========================================================================
-
+// ---------------------------------------------------------------------------
+// Rendering pipeline — 100% Pure-Rust double-buffered pixel + ClearType renderer
+// ---------------------------------------------------------------------------
+impl StudioApp {
     fn push_hit(&mut self, rect: UiRect, action: UiAction) {
         self.hit_zones.push(HitZone { rect, action });
     }
@@ -1412,201 +2592,374 @@ impl StudioApp {
         border: u32,
         action: Option<UiAction>,
     ) {
+        if rect.w <= 0 || rect.h <= 0 {
+            return;
+        }
         let hovered = rect.contains(self.mouse_x, self.mouse_y);
         let fill = if hovered && action.is_some() {
-            lighten(bg, 18)
+            lighten(bg, 16)
         } else {
             bg
         };
-        canvas.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 5, fill);
-        canvas.stroke_rounded_rect(rect.x, rect.y, rect.w, rect.h, 5, border);
+        canvas.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 6, fill);
+        canvas.stroke_rounded_rect(rect.x, rect.y, rect.w, rect.h, 6, border);
         let tw = canvas.measure_text_width(label, FontRole::UiSemibold);
-        let tx = rect.x + ((rect.w - tw) / 2).max(4);
+        let tx = rect.x + ((rect.w - tw) / 2).max(5);
         let ty = rect.y + ((rect.h - 15) / 2).max(2);
-        canvas.draw_text_clipped(tx, ty, rect.w - 6, label, FontRole::UiSemibold, fg);
+        canvas.draw_text_clipped(tx, ty, rect.w - 8, label, FontRole::UiSemibold, fg);
         if let Some(act) = action {
             self.push_hit(rect, act);
         }
     }
 
+    fn draw_pill(
+        &mut self,
+        canvas: &mut dyn SurfaceCanvas,
+        rect: UiRect,
+        label: &str,
+        active: bool,
+        action: Option<UiAction>,
+    ) {
+        let p = self.palette.clone();
+        let bg = if active {
+            mix(p.accent, p.bg_card, 0.22)
+        } else {
+            p.bg_card
+        };
+        let fg = if active { p.accent } else { p.text_secondary };
+        self.draw_button(
+            canvas,
+            rect,
+            label,
+            bg,
+            fg,
+            if active { p.accent } else { p.border_subtle },
+            action,
+        );
+    }
+
+    fn draw_text_input(
+        &mut self,
+        canvas: &mut dyn SurfaceCanvas,
+        rect: UiRect,
+        value: &str,
+        placeholder: &str,
+        focused: bool,
+        font: FontRole,
+        action: UiAction,
+    ) {
+        let p = self.palette.clone();
+        canvas.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 6, p.bg_input);
+        canvas.stroke_rounded_rect(
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            6,
+            if focused { p.border_focus } else { p.border_subtle },
+        );
+        let shown = if focused && self.blink_phase {
+            format!("{}|", value)
+        } else {
+            value.to_string()
+        };
+        let (text, color) = if value.is_empty() && !focused {
+            (placeholder.to_string(), p.text_muted)
+        } else {
+            (shown, p.text_primary)
+        };
+        canvas.draw_text_clipped(rect.x + 9, rect.y + 5, rect.w - 16, &text, font, color);
+        self.push_hit(rect, action);
+    }
+
+    fn draw_section_title(
+        &mut self,
+        canvas: &mut dyn SurfaceCanvas,
+        x: i32,
+        y: i32,
+        w: i32,
+        label: &str,
+    ) {
+        let p = self.palette.clone();
+        canvas.draw_text_clipped(x, y, w, label, FontRole::UiSmall, p.text_muted);
+    }
+
+    // -----------------------------------------------------------------------
+    // Header
+    // -----------------------------------------------------------------------
     fn draw_top_header(&mut self, canvas: &mut dyn SurfaceCanvas, w: i32) {
-        let h = 44;
-        canvas.fill_rect(0, 0, w, h, Theme::BG_TITLEBAR);
-        canvas.draw_hline(0, h - 1, w, Theme::BORDER);
+        let p = self.palette.clone();
+        canvas.fill_rect(0, 0, w, HEADER_H, p.bg_header);
+        canvas.draw_hline(0, HEADER_H - 1, w, p.border_subtle);
 
         // Brand emblem
-        canvas.fill_rounded_rect(10, 8, 28, 28, 6, Theme::ACCENT_BLUE);
-        canvas.draw_text(14, 13, "RS", FontRole::UiSemibold, 0xFFFFFF);
-        canvas.draw_text(44, 7, "AI CODING AGENT", FontRole::UiTitle, Theme::TEXT_PRIMARY);
+        canvas.fill_rounded_rect(PAD, 11, 30, 30, 8, p.accent);
+        canvas.draw_text(PAD + 6, 18, "AC", FontRole::UiSemibold, p.on_accent_text(p.accent));
+        canvas.draw_text(PAD + 40, 8, "AirCode", FontRole::UiTitle, p.text_primary);
         canvas.draw_text(
-            44,
-            24,
-            "Pure-Rust Native Studio",
+            PAD + 40,
+            29,
+            "Pure-Rust Studio",
             FontRole::UiSmall,
-            Theme::ACCENT_CYAN,
+            p.text_muted,
         );
 
-        let mut x = 216;
+        let mut x = 176;
+
+        // Workspace pill
+        let ws_str = truncate_left(&self.workspace.to_string_lossy(), 30);
+        let ws_w = 236.min((w - 780).max(120));
         self.draw_button(
             canvas,
-            UiRect::new(x, 8, 98, 28),
-            "Open Folder",
-            Theme::BG_BUTTON,
-            Theme::TEXT_PRIMARY,
-            Theme::BORDER,
+            UiRect::new(x, 11, ws_w, 30),
+            &format!("{}  {}", glyph("folder"), ws_str),
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
             Some(UiAction::PickFolder),
         );
-        x += 106;
-
-        let ws_str = truncate_left(&self.workspace.to_string_lossy(), 34);
-        let ws_w = 240.min((w - 860).max(110));
-        canvas.fill_rounded_rect(x, 8, ws_w, 28, 5, Theme::BG_CARD);
-        canvas.stroke_rounded_rect(x, 8, ws_w, 28, 5, Theme::BORDER);
-        canvas.draw_text_clipped(
-            x + 8,
-            14,
-            ws_w - 16,
-            &ws_str,
-            FontRole::UiSmall,
-            Theme::TEXT_SECONDARY,
-        );
-        self.push_hit(UiRect::new(x, 8, ws_w, 28), UiAction::PickFolder);
         x += ws_w + 8;
 
-        let prov_label = format!("API: {}", self.settings.active_provider.to_uppercase());
+        // Command search (opens fuzzy palette)
         self.draw_button(
             canvas,
-            UiRect::new(x, 8, 118, 28),
+            UiRect::new(x, 11, 190, 30),
+            &format!("{}  Search commands   Ctrl+K", glyph("search")),
+            p.bg_input,
+            p.text_muted,
+            p.border_subtle,
+            Some(UiAction::OpenModal(ModalDialog::CommandPalette)),
+        );
+        x += 198;
+
+        // Provider pill
+        let prov_label = format!("{} {}", glyph("plug"), self.settings.active_provider.to_uppercase());
+        self.draw_pill(
+            canvas,
+            UiRect::new(x, 11, 118, 30),
             &prov_label,
-            Theme::BG_CARD_ALT,
-            Theme::ACCENT_CYAN,
-            Theme::BORDER,
-            Some(UiAction::CycleProvider),
+            false,
+            Some(UiAction::OpenModal(ModalDialog::ConnectWizard)),
         );
         x += 124;
 
-        let model_label = format!("Model: {}", truncate_right(&self.settings.active_model, 19));
-        self.draw_button(
+        // Model pill
+        let model_label = format!("{} {}", glyph("chip"), truncate_right(&self.settings.active_model, 16));
+        self.draw_pill(
             canvas,
-            UiRect::new(x, 8, 194, 28),
+            UiRect::new(x, 11, 176, 30),
             &model_label,
-            Theme::BG_CARD_ALT,
-            Theme::TEXT_PRIMARY,
-            Theme::BORDER,
-            Some(UiAction::CycleModel),
+            false,
+            Some(UiAction::OpenModal(ModalDialog::ConnectWizard)),
         );
+        x += 182;
 
-        let mut rx = w - 10;
-        rx -= 80;
+        // Mode toggle: Plan / Build
+        let mode_w = 62;
+        self.draw_pill(
+            canvas,
+            UiRect::new(x, 11, mode_w, 30),
+            "Plan",
+            self.active_mode == "plan",
+            Some(UiAction::SetMode("plan")),
+        );
+        self.draw_pill(
+            canvas,
+            UiRect::new(x + mode_w + 4, 11, mode_w, 30),
+            "Build",
+            self.active_mode == "build",
+            Some(UiAction::SetMode("build")),
+        );
+        x += mode_w * 2 + 12;
+
+        // Effort cycle
+        self.draw_pill(
+            canvas,
+            UiRect::new(x, 11, 96, 30),
+            &format!("{} {}", glyph("bolt"), self.settings.agent_effort.to_uppercase()),
+            true,
+            Some(UiAction::CycleEffort),
+        );
+        x += 102;
+
+        // Theme pill
+        self.draw_pill(
+            canvas,
+            UiRect::new(x, 11, 150, 30),
+            &format!("{} {}", glyph("brush"), truncate_right(&self.palette.name, 14)),
+            false,
+            Some(UiAction::OpenModal(ModalDialog::ThemePicker)),
+        );
+        let _ = x;
+
+        // Right-side controls
+        let mut rx = w - PAD;
+        rx -= 96;
         self.draw_button(
             canvas,
-            UiRect::new(rx, 8, 76, 28),
+            UiRect::new(rx, 11, 96, 30),
             "Settings",
-            Theme::BG_BUTTON,
-            Theme::TEXT_PRIMARY,
-            Theme::BORDER,
-            Some(UiAction::OpenSettings(SettingsTab::Providers)),
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
+            Some(UiAction::OpenModal(ModalDialog::SafetySettings)),
         );
-
-        rx -= 70;
+        rx -= 104;
         self.draw_button(
             canvas,
-            UiRect::new(rx, 8, 64, 28),
-            "SQLite",
-            Theme::BG_BUTTON,
-            Theme::TEXT_SECONDARY,
-            Theme::BORDER,
-            Some(UiAction::OpenSettings(SettingsTab::ToolAudit)),
+            UiRect::new(rx, 11, 100, 30),
+            "/ Connect",
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
+            Some(UiAction::OpenModal(ModalDialog::ConnectWizard)),
         );
-
-        rx -= 78;
-        let stop_bg = if self.agent_running {
-            Theme::ACCENT_RED
-        } else {
-            0x3B1820
-        };
-        let stop_fg = if self.agent_running {
-            0xFFFFFF
-        } else {
-            0xFCA5A5
-        };
-        self.draw_button(
-            canvas,
-            UiRect::new(rx, 8, 72, 28),
-            "STOP",
-            stop_bg,
-            stop_fg,
-            Theme::ACCENT_RED,
-            Some(UiAction::EmergencyStop),
-        );
-
-        let modes: [(&'static str, &str, u32); 3] = [
-            ("autonomous", "Auto", Theme::ACCENT_GREEN),
-            ("plan", "Plan", Theme::ACCENT_CYAN),
-            ("ask", "Ask", Theme::ACCENT_AMBER),
-        ];
-        for (mode_id, label, color) in modes {
-            rx -= 54;
-            let active = self.settings.default_mode == mode_id;
-            self.draw_button(
-                canvas,
-                UiRect::new(rx, 8, 50, 28),
-                label,
-                if active { color } else { Theme::BG_CARD },
-                if active { 0x05080F } else { Theme::TEXT_SECONDARY },
-                if active { color } else { Theme::BORDER },
-                Some(UiAction::SetMode(mode_id)),
-            );
-        }
     }
 
-    fn draw_left_sidebar(&mut self, canvas: &mut dyn SurfaceCanvas, top: i32, bottom: i32) {
-        let w = self.left_w;
-        let h = bottom - top;
-        canvas.fill_rect(0, top, w, h, Theme::BG_SIDEBAR);
-        canvas.draw_vline(w - 1, top, h, Theme::BORDER);
+    // -----------------------------------------------------------------------
+    // Left activity rail + panels
+    // -----------------------------------------------------------------------
+    fn draw_left_rail(&mut self, canvas: &mut dyn SurfaceCanvas, top: i32, bottom: i32) {
+        let p = self.palette.clone();
+        canvas.fill_rect(0, top, RAIL_W, bottom - top, p.bg_rail);
+        canvas.draw_vline(RAIL_W - 1, top, bottom - top, p.border_subtle);
 
-        let tab_w = (w - 16) / 3;
-        let git_label = if self.git_snapshot.files.is_empty() {
-            "Git".to_string()
-        } else {
-            format!("Git ({})", self.git_snapshot.files.len())
-        };
-        let tabs = [
-            (LeftTab::Explorer, "Explorer"),
-            (LeftTab::Search, "Search"),
-            (LeftTab::Git, git_label.as_str()),
+        let git_badge = self.git_snapshot.files.len();
+        let items: Vec<(LeftTab, &str, usize)> = vec![
+            (LeftTab::Explorer, "files", 0),
+            (LeftTab::Search, "search", 0),
+            (LeftTab::Git, "branch", git_badge),
+            (LeftTab::Sessions, "chat", self.sessions.len()),
+            (LeftTab::Extensions, "puzzle", self.skills.len() + self.mcp_servers.len()),
         ];
-        for (i, (t, label)) in tabs.iter().enumerate() {
-            let tx = 6 + i as i32 * (tab_w + 2);
-            let active = self.left_tab == *t;
-            self.draw_button(
-                canvas,
-                UiRect::new(tx, top + 6, tab_w, 26),
-                label,
-                if active {
-                    Theme::ACCENT_BLUE
-                } else {
-                    Theme::BG_CARD
-                },
-                if active {
-                    0xFFFFFF
-                } else {
-                    Theme::TEXT_SECONDARY
-                },
-                Theme::BORDER,
-                Some(UiAction::SelectLeftTab(*t)),
-            );
+        let mut y = top + PAD;
+        for (tab, glyph_name, badge) in items {
+            let rect = UiRect::new(6, y, RAIL_W - 12, 44);
+            let active = self.left_tab == tab && self.left_panel_open;
+            if active {
+                canvas.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 8, mix(p.accent, p.bg_rail, 0.20));
+            }
+            let hovered = rect.contains(self.mouse_x, self.mouse_y);
+            if !active && hovered {
+                canvas.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 8, p.bg_card);
+            }
+            let fg = if active { p.accent } else { p.text_muted };
+            canvas.draw_text(rect.x + 16, rect.y + 6, glyph(glyph_name), FontRole::UiTitle, fg);
+            let label = match tab {
+                LeftTab::Explorer => "Files",
+                LeftTab::Search => "Search",
+                LeftTab::Git => "Git",
+                LeftTab::Sessions => "Chats",
+                LeftTab::Extensions => "Tools",
+            };
+            canvas.draw_text_clipped(rect.x + 2, rect.y + 26, rect.w - 4, label, FontRole::UiSmall, fg);
+            if badge > 0 {
+                let bl = if badge > 99 { "99+".to_string() } else { badge.to_string() };
+                let bw = canvas.measure_text_width(&bl, FontRole::UiSmall) + 10;
+                canvas.fill_rounded_rect(
+                    rect.x + rect.w - bw - 2,
+                    rect.y + 2,
+                    bw,
+                    14,
+                    7,
+                    p.accent_secondary,
+                );
+                canvas.draw_text(rect.x + rect.w - bw + 3, rect.y + 3, &bl, FontRole::UiSmall, p.bg_rail);
+            }
+            self.push_hit(rect, UiAction::ToggleRailTab(tab));
+            y += 50;
         }
 
-        let body_top = top + 38;
+        // Bottom toggles: terminal + browser
+        let mut by = bottom - PAD - 44;
+        let term_rect = UiRect::new(6, by, RAIL_W - 12, 40);
+        canvas.fill_rounded_rect(
+            term_rect.x,
+            term_rect.y,
+            term_rect.w,
+            term_rect.h,
+            8,
+            if self.terminal_open {
+                mix(p.accent, p.bg_rail, 0.2)
+            } else {
+                p.bg_card
+            },
+        );
+        canvas.draw_text(
+            term_rect.x + 16,
+            term_rect.y + 4,
+            glyph("term"),
+            FontRole::UiTitle,
+            if self.terminal_open { p.accent } else { p.text_muted },
+        );
+        canvas.draw_text(
+            term_rect.x + 2,
+            term_rect.y + 24,
+            "Term",
+            FontRole::UiSmall,
+            p.text_muted,
+        );
+        self.push_hit(term_rect, UiAction::ToggleTerminalDrawer);
+        by -= 48;
+
+        let br_rect = UiRect::new(6, by, RAIL_W - 12, 40);
+        canvas.fill_rounded_rect(
+            br_rect.x,
+            br_rect.y,
+            br_rect.w,
+            br_rect.h,
+            8,
+            if self.center_view == CenterView::Browser {
+                mix(p.accent, p.bg_rail, 0.2)
+            } else {
+                p.bg_card
+            },
+        );
+        canvas.draw_text(
+            br_rect.x + 16,
+            br_rect.y + 4,
+            glyph("globe"),
+            FontRole::UiTitle,
+            if self.center_view == CenterView::Browser {
+                p.accent
+            } else {
+                p.text_muted
+            },
+        );
+        canvas.draw_text(br_rect.x + 2, br_rect.y + 24, "Web", FontRole::UiSmall, p.text_muted);
+        self.push_hit(br_rect, UiAction::SwitchCenterView(CenterView::Browser));
+    }
+
+    fn draw_left_panel(&mut self, canvas: &mut dyn SurfaceCanvas, top: i32, bottom: i32) {
+        let p = self.palette.clone();
+        let x = RAIL_W;
+        let w = self.left_w;
+        canvas.fill_rect(x, top, w, bottom - top, p.bg_sidebar);
+        canvas.draw_vline(x + w - 1, top, bottom - top, p.border_subtle);
+
+        let title = match self.left_tab {
+            LeftTab::Explorer => "EXPLORER",
+            LeftTab::Search => "SEARCH",
+            LeftTab::Git => "SOURCE CONTROL",
+            LeftTab::Sessions => "SESSIONS",
+            LeftTab::Extensions => "SKILLS · SUB-AGENTS · MCP",
+        };
+        self.draw_section_title(canvas, x + PAD, top + PAD, w - 24, title);
+        let body_top = top + PAD + 20;
         match self.left_tab {
             LeftTab::Explorer => self.draw_explorer_panel(canvas, body_top, bottom, w),
             LeftTab::Search => self.draw_search_panel(canvas, body_top, bottom, w),
             LeftTab::Git => self.draw_git_panel(canvas, body_top, bottom, w),
+            LeftTab::Sessions => self.draw_sessions_panel(canvas, body_top, bottom, w),
+            LeftTab::Extensions => self.draw_extensions_panel(canvas, body_top, bottom, w),
         }
     }
+}
 
+// ---------------------------------------------------------------------------
+// Left panels
+// ---------------------------------------------------------------------------
+impl StudioApp {
     fn draw_explorer_panel(
         &mut self,
         canvas: &mut dyn SurfaceCanvas,
@@ -1614,140 +2967,113 @@ impl StudioApp {
         bottom: i32,
         w: i32,
     ) {
-        // Logical Drives strip (C:\, D:\, ...)
-        let mut dx = 6;
-        let drives_clone = self.drives.clone();
-        for drv in drives_clone.iter().take(5) {
+        let p = self.palette.clone();
+        let x = RAIL_W;
+
+        // Drives / quick workspace switches
+        let mut dx = x + PAD;
+        for drv in self.drives.clone().into_iter().take(4) {
+            let bw = 52;
+            if dx + bw > x + w - PAD {
+                break;
+            }
             let active = self
                 .workspace
                 .to_string_lossy()
                 .to_uppercase()
                 .starts_with(&drv.letter.to_uppercase());
-            let bw = 46;
-            if dx + bw < w - 6 {
-                self.draw_button(
-                    canvas,
-                    UiRect::new(dx, y, bw, 22),
-                    &drv.letter,
-                    if active {
-                        Theme::BG_CARD_ALT
-                    } else {
-                        Theme::BG_CARD
-                    },
-                    if active {
-                        Theme::ACCENT_CYAN
-                    } else {
-                        Theme::TEXT_SECONDARY
-                    },
-                    if active {
-                        Theme::ACCENT_CYAN
-                    } else {
-                        Theme::BORDER
-                    },
-                    Some(UiAction::SwitchDrive(drv.mount_path.clone())),
-                );
-                dx += bw + 4;
-            }
+            self.draw_pill(
+                canvas,
+                UiRect::new(dx, y, bw, 24),
+                &drv.letter,
+                active,
+                Some(UiAction::SwitchDrive(drv.mount_path.clone())),
+            );
+            dx += bw + 6;
         }
-        y += 28;
+        y += 30;
 
-        let bw = (w - 20) / 3;
+        let bw = (w - PAD * 2 - 12) / 3;
         self.draw_button(
             canvas,
-            UiRect::new(6, y, bw, 24),
+            UiRect::new(x + PAD, y, bw, 26),
             "+ File",
-            Theme::BG_BUTTON,
-            Theme::TEXT_PRIMARY,
-            Theme::BORDER,
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
             Some(UiAction::StartCreateEntry { is_dir: false }),
         );
         self.draw_button(
             canvas,
-            UiRect::new(10 + bw, y, bw, 24),
+            UiRect::new(x + PAD + bw + 6, y, bw, 26),
             "+ Folder",
-            Theme::BG_BUTTON,
-            Theme::TEXT_PRIMARY,
-            Theme::BORDER,
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
             Some(UiAction::StartCreateEntry { is_dir: true }),
         );
         self.draw_button(
             canvas,
-            UiRect::new(14 + bw * 2, y, bw, 24),
+            UiRect::new(x + PAD + (bw + 6) * 2, y, bw, 26),
             "Refresh",
-            Theme::BG_BUTTON,
-            Theme::TEXT_SECONDARY,
-            Theme::BORDER,
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
             Some(UiAction::RefreshWorkspace),
         );
-        y += 30;
+        y += 34;
 
         if let Some(is_dir) = self.creating_entry {
-            canvas.fill_rounded_rect(6, y, w - 12, 52, 5, Theme::BG_CARD);
-            canvas.stroke_rounded_rect(6, y, w - 12, 52, 5, Theme::ACCENT_CYAN);
-            let prompt_lbl = if is_dir {
-                "New folder relative path:"
-            } else {
-                "New file relative path:"
-            };
-            canvas.draw_text(12, y + 4, prompt_lbl, FontRole::UiSmall, Theme::ACCENT_CYAN);
-            let inp_rect = UiRect::new(10, y + 22, w - 82, 24);
-            canvas.fill_rect(inp_rect.x, inp_rect.y, inp_rect.w, inp_rect.h, Theme::BG_INPUT);
-            canvas.stroke_rect(
-                inp_rect.x,
-                inp_rect.y,
-                inp_rect.w,
-                inp_rect.h,
-                Theme::BORDER_FOCUS,
+            let card = UiRect::new(x + PAD, y, w - PAD * 2, 62);
+            canvas.fill_rounded_rect(card.x, card.y, card.w, card.h, CARD_RADIUS, p.bg_card);
+            canvas.stroke_rounded_rect(card.x, card.y, card.w, card.h, CARD_RADIUS, p.accent);
+            canvas.draw_text(
+                card.x + 10,
+                card.y + 7,
+                if is_dir { "New folder path" } else { "New file path" },
+                FontRole::UiSmall,
+                p.accent,
             );
-            let shown = if self.focus == FocusTarget::NewEntryInput && self.blink_phase {
-                format!("{}|", self.new_entry_name)
-            } else {
-                self.new_entry_name.clone()
-            };
-            canvas.draw_text_clipped(
-                inp_rect.x + 6,
-                inp_rect.y + 4,
-                inp_rect.w - 10,
-                &shown,
+            let inp = UiRect::new(card.x + 8, card.y + 26, card.w - 78, 26);
+            self.draw_text_input(
+                canvas,
+                inp,
+                self.new_entry_name.clone().as_str(),
+                "src/module.rs",
+                self.focus == FocusTarget::NewEntryInput,
                 FontRole::TerminalMono,
-                Theme::TEXT_PRIMARY,
+                UiAction::Focus(FocusTarget::NewEntryInput),
             );
-            self.push_hit(inp_rect, UiAction::Focus(FocusTarget::NewEntryInput));
             self.draw_button(
                 canvas,
-                UiRect::new(w - 68, y + 22, 30, 24),
+                UiRect::new(card.x + card.w - 66, card.y + 26, 28, 26),
                 "OK",
-                Theme::ACCENT_GREEN,
-                0x04120B,
-                Theme::ACCENT_GREEN,
+                p.success,
+                p.on_accent_text(p.success),
+                p.success,
                 Some(UiAction::ConfirmCreateEntry),
             );
             self.draw_button(
                 canvas,
-                UiRect::new(w - 35, y + 22, 26, 24),
+                UiRect::new(card.x + card.w - 34, card.y + 26, 26, 26),
                 "X",
-                Theme::BG_BUTTON,
-                Theme::TEXT_SECONDARY,
-                Theme::BORDER,
+                p.bg_button,
+                p.text_secondary,
+                p.border_subtle,
                 Some(UiAction::CancelCreateEntry),
             );
-            y += 58;
+            y += 70;
         }
 
-        canvas.draw_hline(0, y - 2, w - 1, Theme::BORDER);
+        canvas.draw_hline(x, y - 4, w - 1, p.border_subtle);
 
-        let row_h = 23;
-        let avail_rows = ((bottom - y - 4).max(0) / row_h) as usize;
+        let row_h = 26;
+        let avail_rows = ((bottom - y - 6).max(0) / row_h) as usize;
         let max_scroll = self.entries.len().saturating_sub(avail_rows.max(1));
         if self.explorer_scroll > max_scroll {
             self.explorer_scroll = max_scroll;
         }
-
-        let active_abs = self
-            .tabs
-            .get(self.active_tab)
-            .and_then(|t| t.full_path.clone());
-
+        let active_abs = self.tabs.get(self.active_tab).and_then(|t| t.full_path.clone());
         let visible: Vec<FileEntry> = self
             .entries
             .iter()
@@ -1756,116 +3082,51 @@ impl StudioApp {
             .cloned()
             .collect();
 
-        canvas.push_clip(0, y, w - 1, bottom - y);
+        canvas.push_clip(x, y, w - 2, bottom - y);
         for (i, entry) in visible.into_iter().enumerate() {
             let ry = y + i as i32 * row_h;
-            let row_rect = UiRect::new(2, ry, w - 6, row_h - 1);
+            let row_rect = UiRect::new(x + 4, ry, w - 10, row_h - 2);
             let is_open = active_abs.as_ref() == Some(&entry.path);
             let hovered = row_rect.contains(self.mouse_x, self.mouse_y);
-
             if is_open {
-                canvas.fill_rounded_rect(
-                    row_rect.x,
-                    row_rect.y,
-                    row_rect.w,
-                    row_rect.h,
-                    4,
-                    0x182B49,
-                );
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 5, mix(p.accent, p.bg_sidebar, 0.20));
             } else if hovered {
-                canvas.fill_rounded_rect(
-                    row_rect.x,
-                    row_rect.y,
-                    row_rect.w,
-                    row_rect.h,
-                    4,
-                    0x131D31,
-                );
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 5, p.bg_card);
             }
-
-            let indent = 8 + (entry.depth.min(8) as i32) * 14;
+            let indent = x + PAD + (entry.depth.min(8) as i32) * 13;
             if entry.is_dir {
                 let collapsed = self.collapsed_dirs.contains(&entry.rel_path);
-                let glyph = if collapsed { ">" } else { "v" };
-                canvas.draw_text(
-                    indent,
-                    ry + 3,
-                    glyph,
-                    FontRole::TerminalMono,
-                    Theme::ACCENT_CYAN,
-                );
-                canvas.draw_text_clipped(
-                    indent + 14,
-                    ry + 3,
-                    w - indent - 24,
-                    &entry.name,
-                    FontRole::UiSemibold,
-                    Theme::TEXT_PRIMARY,
-                );
-                self.push_hit(row_rect, UiAction::ToggleDir(entry.rel_path));
-            } else {
-                let fam = LangFamily::from_path(&entry.name);
-                let badge_col = match fam {
-                    LangFamily::Rust => 0xF97316,
-                    LangFamily::TypeScript => 0x38BDF8,
-                    LangFamily::Python => 0xFACC15,
-                    LangFamily::CFamily => 0x60A5FA,
-                    LangFamily::Json | LangFamily::TomlYaml => 0xA855F7,
-                    LangFamily::Markdown => 0x34D399,
-                    _ => Theme::TEXT_MUTED,
-                };
                 canvas.draw_text(
                     indent,
                     ry + 4,
-                    fam.badge(),
+                    if collapsed { glyph("chev_r") } else { glyph("chev_d") },
                     FontRole::TerminalMono,
-                    badge_col,
+                    p.accent_secondary,
                 );
-                let name_w = if hovered {
-                    w - indent - 64
-                } else {
-                    w - indent - 32
-                };
                 canvas.draw_text_clipped(
-                    indent + 28,
-                    ry + 3,
-                    name_w.max(24),
+                    indent + 15,
+                    ry + 4,
+                    w - (indent + 15 - x) - 26,
+                    &entry.name,
+                    FontRole::UiSemibold,
+                    p.text_primary,
+                );
+                self.push_hit(row_rect, UiAction::ToggleDir(entry.rel_path));
+            } else {
+                let fam = crate::syntax::LangFamily::from_path(&entry.name);
+                canvas.draw_text(indent, ry + 5, fam.badge(), FontRole::TerminalMono, fam_color(fam, &p));
+                canvas.draw_text_clipped(
+                    indent + 26,
+                    ry + 4,
+                    w - (indent + 26 - x) - 26,
                     &entry.name,
                     FontRole::UiSmall,
-                    if is_open {
-                        0xFFFFFF
-                    } else {
-                        Theme::TEXT_SECONDARY
-                    },
+                    if is_open { p.text_primary } else { p.text_secondary },
                 );
-
-                if hovered {
-                    let del_rect = UiRect::new(w - 26, ry + 2, 20, row_h - 5);
-                    canvas.fill_rounded_rect(
-                        del_rect.x,
-                        del_rect.y,
-                        del_rect.w,
-                        del_rect.h,
-                        3,
-                        0x3B1820,
-                    );
-                    canvas.draw_text(del_rect.x + 6, del_rect.y + 1, "x", FontRole::UiSmall, 0xFCA5A5);
-                    self.push_hit(
-                        del_rect,
-                        UiAction::RequestDeleteFile(entry.path.clone(), entry.rel_path.clone()),
-                    );
-                    let open_rect =
-                        UiRect::new(row_rect.x, row_rect.y, row_rect.w - 28, row_rect.h);
-                    self.push_hit(
-                        open_rect,
-                        UiAction::OpenFile(entry.path, entry.rel_path, entry.name, false),
-                    );
-                } else {
-                    self.push_hit(
-                        row_rect,
-                        UiAction::OpenFile(entry.path, entry.rel_path, entry.name, false),
-                    );
-                }
+                self.push_hit(
+                    row_rect,
+                    UiAction::OpenFile(entry.path.clone(), entry.rel_path.clone(), entry.name.clone(), false),
+                );
             }
         }
         canvas.pop_clip();
@@ -1878,64 +3139,45 @@ impl StudioApp {
         bottom: i32,
         w: i32,
     ) {
-        let inp = UiRect::new(8, y, w - 62, 28);
-        let focused = self.focus == FocusTarget::SearchInput;
-        canvas.fill_rounded_rect(inp.x, inp.y, inp.w, inp.h, 5, Theme::BG_INPUT);
-        canvas.stroke_rounded_rect(
-            inp.x,
-            inp.y,
-            inp.w,
-            inp.h,
-            5,
-            if focused {
-                Theme::BORDER_FOCUS
-            } else {
-                Theme::BORDER
-            },
-        );
-        let disp = if self.search_query.is_empty() && !focused {
-            "Search workspace text...".to_string()
-        } else if focused && self.blink_phase {
-            format!("{}|", self.search_query)
-        } else {
-            self.search_query.clone()
-        };
-        canvas.draw_text_clipped(
-            inp.x + 8,
-            inp.y + 6,
-            inp.w - 14,
-            &disp,
+        let p = self.palette.clone();
+        let x = RAIL_W;
+        let inp = UiRect::new(x + PAD, y, w - PAD * 2 - 64, 28);
+        self.draw_text_input(
+            canvas,
+            inp,
+            self.search_query.clone().as_str(),
+            "Search in workspace...",
+            self.focus == FocusTarget::SearchInput,
             FontRole::UiSmall,
-            if self.search_query.is_empty() && !focused {
-                Theme::TEXT_MUTED
-            } else {
-                Theme::TEXT_PRIMARY
-            },
+            UiAction::Focus(FocusTarget::SearchInput),
         );
-        self.push_hit(inp, UiAction::Focus(FocusTarget::SearchInput));
         self.draw_button(
             canvas,
-            UiRect::new(w - 50, y, 42, 28),
+            UiRect::new(x + w - PAD - 58, y, 58, 28),
             "Find",
-            Theme::ACCENT_BLUE,
-            0xFFFFFF,
-            Theme::ACCENT_BLUE,
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
             Some(UiAction::RunSearch),
         );
-        y += 34;
+        y += 38;
 
         canvas.draw_text(
-            8,
+            x + PAD,
             y,
-            &format!("{} result(s)", self.search_results.len()),
+            &format!("{} results", self.search_results.len()),
             FontRole::UiSmall,
-            Theme::TEXT_MUTED,
+            p.text_muted,
         );
         y += 20;
 
-        let row_h = 38;
-        let avail = ((bottom - y - 4).max(0) / row_h) as usize;
-        let hits: Vec<SearchMatch> = self
+        let row_h = 40;
+        let avail = ((bottom - y - 6).max(0) / row_h) as usize;
+        let max_scroll = self.search_results.len().saturating_sub(avail.max(1));
+        if self.search_scroll > max_scroll {
+            self.search_scroll = max_scroll;
+        }
+        let visible: Vec<SearchMatch> = self
             .search_results
             .iter()
             .skip(self.search_scroll)
@@ -1943,39 +3185,29 @@ impl StudioApp {
             .cloned()
             .collect();
 
-        canvas.push_clip(0, y, w - 1, bottom - y);
-        for (i, hit) in hits.into_iter().enumerate() {
+        canvas.push_clip(x, y, w - 2, bottom - y);
+        for (i, m) in visible.into_iter().enumerate() {
             let ry = y + i as i32 * row_h;
-            let rect = UiRect::new(6, ry, w - 12, row_h - 3);
-            let hov = rect.contains(self.mouse_x, self.mouse_y);
-            canvas.fill_rounded_rect(
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                4,
-                if hov { Theme::BG_CARD_ALT } else { Theme::BG_CARD },
-            );
+            let card = UiRect::new(x + PAD - 2, ry, w - PAD * 2 + 4, row_h - 4);
+            let hovered = card.contains(self.mouse_x, self.mouse_y);
+            canvas.fill_rounded_rect(card.x, card.y, card.w, card.h, 6, if hovered { p.bg_card_hover } else { p.bg_card });
             canvas.draw_text_clipped(
-                rect.x + 6,
-                ry + 3,
-                rect.w - 12,
-                &format!("{}:{}", hit.rel_path, hit.line),
+                card.x + 8,
+                card.y + 4,
+                card.w - 16,
+                &format!("{}:{}", m.rel_path, m.line),
                 FontRole::UiSemibold,
-                Theme::ACCENT_CYAN,
+                p.accent_secondary,
             );
             canvas.draw_text_clipped(
-                rect.x + 6,
-                ry + 19,
-                rect.w - 12,
-                &hit.preview,
+                card.x + 8,
+                card.y + 21,
+                card.w - 16,
+                &m.preview,
                 FontRole::TerminalMono,
-                Theme::TEXT_SECONDARY,
+                p.text_secondary,
             );
-            self.push_hit(
-                rect,
-                UiAction::OpenSearchHit(hit.path, hit.rel_path, hit.line),
-            );
+            self.push_hit(card, UiAction::OpenSearchHit(m.path.clone(), m.rel_path.clone(), m.line));
         }
         canvas.pop_clip();
     }
@@ -1987,212 +3219,455 @@ impl StudioApp {
         bottom: i32,
         w: i32,
     ) {
+        let p = self.palette.clone();
+        let x = RAIL_W;
+
         if !self.git_snapshot.is_repo {
             canvas.draw_text(
-                12,
-                y + 12,
-                "Not a Git repository.",
-                FontRole::UiRegular,
-                Theme::TEXT_MUTED,
+                x + PAD,
+                y + 8,
+                "No git repository detected in this workspace.",
+                FontRole::UiSmall,
+                p.text_muted,
             );
             return;
         }
 
-        canvas.fill_rounded_rect(8, y, w - 16, 26, 5, Theme::BG_CARD);
-        canvas.draw_text_clipped(
-            14,
-            y + 5,
-            w - 28,
-            &format!("Branch: {}", self.git_snapshot.branch),
-            FontRole::UiSemibold,
-            Theme::ACCENT_GREEN,
+        // Branch selector row
+        let branch_w = (w - PAD * 2 - 120).clamp(80, 220);
+        self.draw_pill(
+            canvas,
+            UiRect::new(x + PAD, y, branch_w, 26),
+            &format!("{} {}", glyph("branch"), truncate_right(&self.git_snapshot.branch, 16)),
+            true,
+            None,
         );
-        y += 32;
-
-        // Branch switcher pills
-        if self.git_snapshot.branches.len() > 1 {
-            let mut bx = 8;
-            let branches = self.git_snapshot.branches.clone();
-            for b in branches.into_iter().take(3) {
-                let bw = ((w - 24) / 3).max(54);
-                let active = b == self.git_snapshot.branch;
-                self.draw_button(
-                    canvas,
-                    UiRect::new(bx, y, bw, 20),
-                    &truncate_right(&b, 10),
-                    if active { Theme::BG_CARD_ALT } else { Theme::BG_CARD },
-                    if active {
-                        Theme::ACCENT_CYAN
-                    } else {
-                        Theme::TEXT_MUTED
-                    },
-                    Theme::BORDER,
-                    Some(UiAction::GitCheckout(b)),
-                );
-                bx += bw + 4;
-            }
-            y += 26;
-        }
-
-        let focused = self.focus == FocusTarget::CommitInput;
-        let inp = UiRect::new(8, y, w - 16, 26);
-        canvas.fill_rounded_rect(inp.x, inp.y, inp.w, inp.h, 4, Theme::BG_INPUT);
-        canvas.stroke_rounded_rect(
-            inp.x,
-            inp.y,
-            inp.w,
-            inp.h,
-            4,
-            if focused {
-                Theme::BORDER_FOCUS
-            } else {
-                Theme::BORDER
-            },
-        );
-        let msg_disp = if self.commit_message.is_empty() && !focused {
-            "Commit message...".to_string()
-        } else if focused && self.blink_phase {
-            format!("{}|", self.commit_message)
-        } else {
-            self.commit_message.clone()
-        };
-        canvas.draw_text_clipped(
-            inp.x + 6,
-            inp.y + 5,
-            inp.w - 12,
-            &msg_disp,
-            FontRole::UiSmall,
-            if self.commit_message.is_empty() && !focused {
-                Theme::TEXT_MUTED
-            } else {
-                Theme::TEXT_PRIMARY
-            },
-        );
-        self.push_hit(inp, UiAction::Focus(FocusTarget::CommitInput));
-        y += 30;
-
-        let half = (w - 20) / 2;
         self.draw_button(
             canvas,
-            UiRect::new(8, y, half, 24),
+            UiRect::new(x + w - PAD - 112, y, 54, 26),
             "Stage All",
-            Theme::BG_BUTTON,
-            Theme::TEXT_PRIMARY,
-            Theme::BORDER,
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
             Some(UiAction::GitStageAll),
         );
         self.draw_button(
             canvas,
-            UiRect::new(12 + half, y, half, 24),
+            UiRect::new(x + w - PAD - 54, y, 54, 26),
+            "Diff",
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
+            None,
+        );
+        y += 34;
+
+        // Commit box
+        let commit = UiRect::new(x + PAD, y, w - PAD * 2, 34);
+        self.draw_text_input(
+            canvas,
+            commit,
+            self.commit_message.clone().as_str(),
+            "Commit message...",
+            self.focus == FocusTarget::CommitInput,
+            FontRole::UiSmall,
+            UiAction::Focus(FocusTarget::CommitInput),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(commit.x + commit.w - 74, commit.y + 4, 68, 26),
             "Commit",
-            Theme::ACCENT_GREEN,
-            0x04120B,
-            Theme::ACCENT_GREEN,
+            p.success,
+            p.on_accent_text(p.success),
+            p.success,
             Some(UiAction::GitCommit),
         );
-        y += 30;
+        y += 44;
 
-        canvas.draw_text(
-            8,
+        self.draw_section_title(
+            canvas,
+            x + PAD,
             y,
-            &format!("Working Tree ({})", self.git_snapshot.files.len()),
-            FontRole::UiSemibold,
-            Theme::TEXT_MUTED,
+            w - 24,
+            &format!("CHANGES ({})", self.git_snapshot.files.len()),
         );
         y += 18;
 
         let row_h = 26;
-        let max_file_rows = ((bottom - y - 108).max(50) / row_h) as usize;
-        let files_slice: Vec<_> = self
+        let avail = ((bottom - y - 6).max(0) / row_h) as usize;
+        let max_scroll = self.git_snapshot.files.len().saturating_sub(avail.max(1));
+        if self.git_scroll > max_scroll {
+            self.git_scroll = max_scroll;
+        }
+        let files: Vec<crate::git_ops::GitChangedFile> = self
             .git_snapshot
             .files
             .iter()
             .skip(self.git_scroll)
-            .take(max_file_rows)
+            .take(avail)
             .cloned()
             .collect();
 
-        for f in files_slice {
-            let badge_col = match f.status.as_str() {
-                "A" | "U" => Theme::ACCENT_GREEN,
-                "D" => Theme::ACCENT_RED,
-                _ => Theme::ACCENT_AMBER,
+        canvas.push_clip(x, y, w - 2, bottom - y);
+        for (i, f) in files.into_iter().enumerate() {
+            let ry = y + i as i32 * row_h;
+            let row_rect = UiRect::new(x + 4, ry, w - 10, row_h - 2);
+            let hovered = row_rect.contains(self.mouse_x, self.mouse_y);
+            if hovered {
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 5, p.bg_card);
+            }
+            let status_color = match f.status.as_str() {
+                "M" | "modified" => p.warning,
+                "A" | "added" => p.success,
+                "D" | "deleted" => p.danger,
+                _ => p.text_muted,
             };
-            canvas.fill_rounded_rect(6, y, w - 12, row_h - 2, 4, Theme::BG_CARD);
-            canvas.draw_text(12, y + 4, &f.status, FontRole::TerminalMono, badge_col);
+            canvas.draw_text(row_rect.x + 6, ry + 4, &f.status, FontRole::TerminalMono, status_color);
             canvas.draw_text_clipped(
-                30,
-                y + 4,
-                w - 114,
+                row_rect.x + 24,
+                ry + 4,
+                w - (row_rect.x + 24 - x) - 66,
                 &f.path,
                 FontRole::UiSmall,
-                Theme::TEXT_PRIMARY,
+                p.text_secondary,
+            );
+            if hovered {
+                let stage_rect = UiRect::new(row_rect.x + row_rect.w - 56, ry + 3, 26, row_h - 8);
+                canvas.fill_rounded_rect(stage_rect.x, stage_rect.y, stage_rect.w, stage_rect.h, 4, p.bg_button);
+                canvas.draw_text(stage_rect.x + 7, ry + 4, "+", FontRole::UiSmall, p.text_primary);
+                self.push_hit(
+                    stage_rect,
+                    UiAction::GitStageFile {
+                        path: f.path.clone(),
+                        currently_staged: f.staged,
+                    },
+                );
+                let diff_rect = UiRect::new(row_rect.x + row_rect.w - 28, ry + 3, 26, row_h - 8);
+                canvas.fill_rounded_rect(diff_rect.x, diff_rect.y, diff_rect.w, diff_rect.h, 4, p.bg_button);
+                canvas.draw_text(diff_rect.x + 7, ry + 4, "~", FontRole::UiSmall, p.accent_secondary);
+                self.push_hit(diff_rect, UiAction::GitOpenDiff(f.path.clone()));
+            }
+        }
+        canvas.pop_clip();
+    }
+
+    fn draw_sessions_panel(
+        &mut self,
+        canvas: &mut dyn SurfaceCanvas,
+        mut y: i32,
+        bottom: i32,
+        w: i32,
+    ) {
+        let p = self.palette.clone();
+        let x = RAIL_W;
+        self.draw_button(
+            canvas,
+            UiRect::new(x + PAD, y, (w - PAD * 2 - 8) / 2, 28),
+            "+ New Session",
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
+            Some(UiAction::NewSession),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(x + PAD + (w - PAD * 2 - 8) / 2 + 8, y, (w - PAD * 2 - 8) / 2, 28),
+            "Fork Active",
+            p.bg_card,
+            p.accent_secondary,
+            p.border_subtle,
+            Some(UiAction::ForkActiveSession),
+        );
+        y += 38;
+
+        let row_h = 58;
+        let avail = ((bottom - y - 6).max(0) / row_h) as usize;
+        let max_scroll = self.sessions.len().saturating_sub(avail.max(1));
+        if self.sessions_scroll > max_scroll {
+            self.sessions_scroll = max_scroll;
+        }
+        let sessions: Vec<SessionSummary> = self
+            .sessions
+            .iter()
+            .skip(self.sessions_scroll)
+            .take(avail)
+            .cloned()
+            .collect();
+
+        canvas.push_clip(x, y, w - 2, bottom - y);
+        for (i, s) in sessions.into_iter().enumerate() {
+            let ry = y + i as i32 * row_h;
+            let card = UiRect::new(x + PAD - 2, ry, w - PAD * 2 + 4, row_h - 6);
+            let active = s.id == self.active_session.id;
+            let hovered = card.contains(self.mouse_x, self.mouse_y);
+            canvas.fill_rounded_rect(
+                card.x,
+                card.y,
+                card.w,
+                card.h,
+                8,
+                if active { mix(p.accent, p.bg_sidebar, 0.16) } else if hovered { p.bg_card_hover } else { p.bg_card },
+            );
+            canvas.draw_text_clipped(
+                card.x + 10,
+                card.y + 6,
+                card.w - 20,
+                &truncate_right(&s.title, 30),
+                FontRole::UiSemibold,
+                if active { p.accent } else { p.text_primary },
+            );
+            canvas.draw_text_clipped(
+                card.x + 10,
+                card.y + 23,
+                card.w - 20,
+                &format!(
+                    "{} msgs · {} · {}",
+                    s.message_count,
+                    s.mode.to_uppercase(),
+                    crate::sqlite::short_time_label(&s.updated_at)
+                ),
+                FontRole::UiSmall,
+                p.text_muted,
+            );
+            if !s.parent_id.is_empty() {
+                canvas.draw_text(card.x + card.w - 66, card.y + 23, "fork", FontRole::UiSmall, p.purple);
+            }
+            if s.compacted_count > 0 {
+                canvas.draw_text(
+                    card.x + card.w - 34,
+                    card.y + 23,
+                    &format!("c{}", s.compacted_count),
+                    FontRole::UiSmall,
+                    p.warning,
+                );
+            }
+            self.push_hit(card, UiAction::SelectSession(s.id.clone()));
+        }
+        canvas.pop_clip();
+    }
+
+    fn draw_extensions_panel(
+        &mut self,
+        canvas: &mut dyn SurfaceCanvas,
+        mut y: i32,
+        bottom: i32,
+        w: i32,
+    ) {
+        let p = self.palette.clone();
+        let x = RAIL_W;
+        let avail_total = (bottom - y).max(120);
+        let row_h = 34;
+        let avail_rows = ((avail_total - 40) / row_h).max(4) as usize;
+
+        // ---- Skills -------------------------------------------------------
+        self.draw_section_title(
+            canvas,
+            x + PAD,
+            y,
+            w - 24,
+            &format!("SKILLS ({}) — toggle to enable", self.skills.len()),
+        );
+        y += 18;
+        let skill_rows = avail_rows.min(self.skills.len().max(1));
+        for i in 0..skill_rows {
+            let Some(skill) = self.skills.get(i).cloned() else { break };
+            let ry = y + i as i32 * row_h;
+            let card = UiRect::new(x + PAD - 2, ry, w - PAD * 2 + 4, row_h - 4);
+            let hovered = card.contains(self.mouse_x, self.mouse_y);
+            canvas.fill_rounded_rect(card.x, card.y, card.w, card.h, 6, if hovered { p.bg_card_hover } else { p.bg_card });
+            let dot = if skill.enabled { p.success } else { p.text_muted };
+            canvas.fill_rounded_rect(card.x + 8, card.y + 9, 10, 10, 5, dot);
+            canvas.draw_text_clipped(
+                card.x + 26,
+                card.y + 5,
+                card.w - 100,
+                &truncate_right(&skill.title, 30),
+                FontRole::UiSemibold,
+                p.text_primary,
+            );
+            canvas.draw_text_clipped(
+                card.x + 26,
+                card.y + 19,
+                card.w - 100,
+                &truncate_right(&skill.description, 34),
+                FontRole::UiSmall,
+                p.text_muted,
+            );
+            if skill.builtin {
+                canvas.draw_text(card.x + card.w - 68, card.y + 10, "builtin", FontRole::UiSmall, p.accent_secondary);
+            }
+            self.push_hit(card, UiAction::ToggleSkill(skill.slug.clone()));
+        }
+        y += skill_rows as i32 * row_h + 10;
+
+        // ---- Sub-agents ----------------------------------------------------
+        self.draw_section_title(
+            canvas,
+            x + PAD,
+            y,
+            w - 24,
+            &format!("SUB-AGENTS ({})", self.subagents.len()),
+        );
+        y += 18;
+        for (i, sa) in self.subagents.clone().into_iter().take(5).enumerate() {
+            let ry = y + i as i32 * 26;
+            let card = UiRect::new(x + PAD - 2, ry, w - PAD * 2 + 4, 22);
+            let hovered = card.contains(self.mouse_x, self.mouse_y);
+            if hovered {
+                canvas.fill_rounded_rect(card.x, card.y, card.w, card.h, 5, p.bg_card);
+            }
+            canvas.draw_text(card.x + 8, ry + 4, glyph("robot"), FontRole::UiSmall, p.purple);
+            canvas.draw_text_clipped(card.x + 28, ry + 4, card.w - 130, &truncate_right(&sa.title, 24), FontRole::UiSmall, p.text_secondary);
+            canvas.draw_text_clipped(
+                card.x + card.w - 96,
+                ry + 4,
+                52,
+                &sa.effort.to_uppercase(),
+                FontRole::UiSmall,
+                if sa.effort == "ultra" { p.danger } else { p.warning },
+            );
+            if sa.readonly {
+                canvas.draw_text(card.x + card.w - 40, ry + 4, "RO", FontRole::UiSmall, p.text_muted);
+            }
+        }
+        y += 5 * 26 + 8;
+
+        // ---- MCP servers ----------------------------------------------------
+        self.draw_section_title(
+            canvas,
+            x + PAD,
+            y,
+            w - 24,
+            &format!("MCP SERVERS ({})", self.mcp_servers.len()),
+        );
+        y += 18;
+        for (i, srv) in self.mcp_servers.clone().into_iter().take(6).enumerate() {
+            let ry = y + i as i32 * 26;
+            let card = UiRect::new(x + PAD - 2, ry, w - PAD * 2 + 4, 22);
+            let hovered = card.contains(self.mouse_x, self.mouse_y);
+            if hovered {
+                canvas.fill_rounded_rect(card.x, card.y, card.w, card.h, 5, p.bg_card);
+            }
+            let status_col = if srv.status.starts_with("online") {
+                p.success
+            } else if srv.status.starts_with("error") {
+                p.danger
+            } else {
+                p.text_muted
+            };
+            canvas.fill_rounded_rect(card.x + 8, ry + 7, 8, 8, 4, status_col);
+            canvas.draw_text_clipped(card.x + 24, ry + 4, card.w - 150, &truncate_right(&srv.name, 18), FontRole::UiSmall, p.text_secondary);
+            canvas.draw_text_clipped(
+                card.x + card.w - 122,
+                ry + 4,
+                50,
+                &format!("{} tools", srv.discovered_tools.len()),
+                FontRole::UiSmall,
+                p.accent_secondary,
+            );
+            let toggle = UiRect::new(card.x + card.w - 62, ry + 2, 52, 18);
+            self.draw_button(
+                canvas,
+                toggle,
+                if srv.enabled { "ON" } else { "OFF" },
+                if srv.enabled { p.success } else { p.bg_button },
+                if srv.enabled { p.on_accent_text(p.success) } else { p.text_muted },
+                p.border_subtle,
+                Some(UiAction::ToggleMcpServer(i)),
+            );
+        }
+        y += 6 * 26 + 12;
+
+        if self.show_mcp_add {
+            let card = UiRect::new(x + PAD, y, w - PAD * 2, 92);
+            canvas.fill_rounded_rect(card.x, card.y, card.w, card.h, CARD_RADIUS, p.bg_card);
+            canvas.stroke_rounded_rect(card.x, card.y, card.w, card.h, CARD_RADIUS, p.accent);
+            canvas.draw_text(card.x + 10, card.y + 8, "Add MCP server", FontRole::UiSemibold, p.accent);
+            let name_rect = UiRect::new(card.x + 8, card.y + 28, (card.w - 24) / 2, 24);
+            self.draw_text_input(
+                canvas,
+                name_rect,
+                self.new_mcp_name.clone().as_str(),
+                "name",
+                self.focus == FocusTarget::McpNameInput,
+                FontRole::UiSmall,
+                UiAction::Focus(FocusTarget::McpNameInput),
+            );
+            let tgt_rect = UiRect::new(name_rect.x + name_rect.w + 8, card.y + 28, (card.w - 24) / 2, 24);
+            self.draw_text_input(
+                canvas,
+                tgt_rect,
+                self.new_mcp_target.clone().as_str(),
+                "cmd args | https://url",
+                self.focus == FocusTarget::McpTargetInput,
+                FontRole::UiSmall,
+                UiAction::Focus(FocusTarget::McpTargetInput),
             );
             self.draw_button(
                 canvas,
-                UiRect::new(w - 78, y + 2, 36, row_h - 6),
-                "Diff",
-                Theme::BG_BUTTON,
-                Theme::ACCENT_CYAN,
-                Theme::BORDER,
-                Some(UiAction::GitOpenDiff(f.path.clone())),
+                UiRect::new(card.x + 8, card.y + 58, 86, 26),
+                "Add",
+                p.success,
+                p.on_accent_text(p.success),
+                p.success,
+                Some(UiAction::AddQuickMcpServer),
             );
             self.draw_button(
                 canvas,
-                UiRect::new(w - 38, y + 2, 28, row_h - 6),
-                if f.staged { "-" } else { "+" },
-                if f.staged { 0x3B2F14 } else { 0x123526 },
-                if f.staged {
-                    Theme::ACCENT_AMBER
-                } else {
-                    Theme::ACCENT_GREEN
-                },
-                Theme::BORDER,
-                Some(UiAction::GitStageFile {
-                    path: f.path,
-                    currently_staged: f.staged,
-                }),
+                UiRect::new(card.x + 100, card.y + 58, 86, 26),
+                "Cancel",
+                p.bg_button,
+                p.text_secondary,
+                p.border_subtle,
+                Some(UiAction::CloseModal),
             );
-            y += row_h;
         }
 
-        let log_y = (bottom - 94).max(y + 6);
-        canvas.draw_hline(6, log_y - 4, w - 12, Theme::BORDER);
-        canvas.draw_text(8, log_y, "Recent Commits", FontRole::UiSemibold, Theme::TEXT_MUTED);
-        let mut cy = log_y + 18;
-        for c in self.git_snapshot.commits.iter().take(4) {
-            if cy + 16 > bottom {
-                break;
-            }
-            canvas.draw_text(8, cy, &c.hash, FontRole::TerminalMono, Theme::ACCENT_PURPLE);
-            canvas.draw_text_clipped(
-                64,
-                cy,
-                w - 72,
-                &c.subject,
-                FontRole::UiSmall,
-                Theme::TEXT_SECONDARY,
-            );
-            cy += 18;
+        // Action row
+        let bw = (w - PAD * 2 - 8) / 2;
+        self.draw_button(
+            canvas,
+            UiRect::new(x + PAD, bottom - 36, bw, 28),
+            "Probe MCP",
+            p.bg_card,
+            p.accent_secondary,
+            p.border_subtle,
+            Some(UiAction::ProbeAllMcpServers),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(x + PAD + bw + 8, bottom - 36, bw, 28),
+            "+ MCP Server",
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
+            Some(UiAction::ExecuteCommandId("mcp:add".to_string())),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Center: native code editor / diff viewer + agentic browser viewport
+// ---------------------------------------------------------------------------
+impl StudioApp {
+    fn draw_center(&mut self, canvas: &mut dyn SurfaceCanvas, x: i32, top: i32, w: i32, h: i32) {
+        match self.center_view {
+            CenterView::Editor => self.draw_center_editor(canvas, x, top, w, h),
+            CenterView::Browser => self.draw_browser_viewport(canvas, x, top, w, h),
         }
     }
 
-    fn draw_center_editor_and_diff(
-        &mut self,
-        canvas: &mut dyn SurfaceCanvas,
-        x: i32,
-        top: i32,
-        w: i32,
-        h: i32,
-    ) {
-        canvas.fill_rect(x, top, w, h, Theme::BG_EDITOR);
+    fn draw_center_editor(&mut self, canvas: &mut dyn SurfaceCanvas, x: i32, top: i32, w: i32, h: i32) {
+        let p = self.palette.clone();
+        canvas.fill_rect(x, top, w, h, p.bg_editor);
 
-        let strip_h = 34;
-        canvas.fill_rect(x, top, w, strip_h, Theme::BG_SIDEBAR);
-        canvas.draw_hline(x, top + strip_h - 1, w, Theme::BORDER);
+        // ---- Tab strip ------------------------------------------------------
+        let strip_h = 36;
+        canvas.fill_rect(x, top, w, strip_h, p.bg_sidebar);
+        canvas.draw_hline(x, top + strip_h - 1, w, p.border_subtle);
 
-        let mut tx = x + 4;
-        let max_tab_x = x + w - 168;
+        let mut tx = x + PAD;
+        let max_tab_x = x + w - 200;
         let tab_summaries: Vec<(String, bool, bool)> = self
             .tabs
             .iter()
@@ -2201,148 +3676,133 @@ impl StudioApp {
                 (t.title.clone(), t.is_dirty(), is_diff)
             })
             .collect();
-
         for (idx, (title, dirty, is_diff)) in tab_summaries.into_iter().enumerate() {
-            if tx + 90 > max_tab_x {
+            if tx + 96 > max_tab_x {
                 break;
             }
-            let tw = ((title.len() as i32 * 7) + 46).clamp(108, 195);
+            let tw = ((title.chars().count() as i32) * 7 + 44).clamp(104, 190);
             let active = idx == self.active_tab;
-            let tab_rect = UiRect::new(tx, top + 4, tw, strip_h - 5);
+            let tab_rect = UiRect::new(tx, top + 5, tw, strip_h - 10);
             canvas.fill_rounded_rect(
                 tab_rect.x,
                 tab_rect.y,
                 tab_rect.w,
                 tab_rect.h,
-                4,
-                if active {
-                    Theme::BG_EDITOR
-                } else {
-                    Theme::BG_CARD
-                },
+                6,
+                if active { mix(p.accent, p.bg_editor, 0.14) } else { p.bg_card },
             );
             if active {
-                canvas.fill_rect(tab_rect.x, tab_rect.y, tab_rect.w, 2, Theme::ACCENT_CYAN);
+                canvas.fill_rect(tab_rect.x + 8, tab_rect.y + 6, 3, tab_rect.h - 12, p.accent);
             }
-            let label = if dirty {
-                format!("* {}", title)
-            } else {
-                title
-            };
+            let label = if dirty { format!("* {}", title) } else { title };
             canvas.draw_text_clipped(
-                tx + 8,
-                top + 9,
-                tw - 30,
+                tx + 18,
+                top + 11,
+                tw - 38,
                 &label,
-                if active {
-                    FontRole::UiSemibold
-                } else {
-                    FontRole::UiSmall
-                },
+                if active { FontRole::UiSemibold } else { FontRole::UiSmall },
                 if is_diff {
-                    Theme::ACCENT_AMBER
+                    p.warning
                 } else if active {
-                    Theme::TEXT_PRIMARY
+                    p.text_primary
                 } else {
-                    Theme::TEXT_SECONDARY
+                    p.text_secondary
                 },
             );
-            let close_rect = UiRect::new(tx + tw - 22, top + 8, 18, 18);
-            canvas.draw_text(
-                close_rect.x + 5,
-                close_rect.y + 1,
-                "x",
-                FontRole::UiSmall,
-                Theme::TEXT_MUTED,
-            );
-            self.push_hit(
-                UiRect::new(tx, top + 4, tw - 24, strip_h - 5),
-                UiAction::SelectEditorTab(idx),
-            );
+            let close_rect = UiRect::new(tx + tw - 22, top + 9, 18, 18);
+            canvas.draw_text(close_rect.x + 5, close_rect.y + 1, "x", FontRole::UiSmall, p.text_muted);
+            self.push_hit(UiRect::new(tx, top + 5, tw - 26, strip_h - 10), UiAction::SelectEditorTab(idx));
             self.push_hit(close_rect, UiAction::CloseEditorTab(idx));
-            tx += tw + 4;
+            tx += tw + 6;
         }
 
         self.draw_button(
             canvas,
-            UiRect::new(x + w - 160, top + 5, 50, 24),
+            UiRect::new(x + w - 158, top + 6, 46, 24),
             "+ New",
-            Theme::BG_BUTTON,
-            Theme::TEXT_SECONDARY,
-            Theme::BORDER,
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
             Some(UiAction::NewScratchTab),
         );
         self.draw_button(
             canvas,
-            UiRect::new(x + w - 106, top + 5, 48, 24),
+            UiRect::new(x + w - 108, top + 6, 50, 24),
             "Find",
-            if self.show_find_bar {
-                Theme::ACCENT_BLUE
-            } else {
-                Theme::BG_BUTTON
-            },
-            Theme::TEXT_PRIMARY,
-            Theme::BORDER,
+            if self.show_find_bar { p.accent } else { p.bg_card },
+            if self.show_find_bar { p.on_accent_text(p.accent) } else { p.text_secondary },
+            p.border_subtle,
             Some(UiAction::ToggleFindBar),
         );
         self.draw_button(
             canvas,
-            UiRect::new(x + w - 54, top + 5, 48, 24),
+            UiRect::new(x + w - 54, top + 6, 46, 24),
             "Save",
-            Theme::ACCENT_BLUE,
-            0xFFFFFF,
-            Theme::ACCENT_BLUE,
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
             Some(UiAction::SaveActiveTab),
         );
 
         let mut content_y = top + strip_h;
 
+        // ---- Find / Go-To-Line bars -----------------------------------------
         if self.show_find_bar {
-            canvas.fill_rect(x, content_y, w, 32, Theme::BG_CARD);
-            canvas.draw_hline(x, content_y + 31, w, Theme::BORDER);
-            canvas.draw_text(
-                x + 10,
-                content_y + 8,
-                "Find:",
-                FontRole::UiSmall,
-                Theme::TEXT_SECONDARY,
-            );
-            let f_inp = UiRect::new(x + 48, content_y + 4, 240.min(w - 150), 24);
-            let focused = self.focus == FocusTarget::FindInput;
-            canvas.fill_rect(f_inp.x, f_inp.y, f_inp.w, f_inp.h, Theme::BG_INPUT);
-            canvas.stroke_rect(
-                f_inp.x,
-                f_inp.y,
-                f_inp.w,
-                f_inp.h,
-                if focused {
-                    Theme::BORDER_FOCUS
-                } else {
-                    Theme::BORDER
-                },
-            );
-            let shown = if focused && self.blink_phase {
-                format!("{}|", self.find_query)
-            } else {
-                self.find_query.clone()
-            };
-            canvas.draw_text_clipped(
-                f_inp.x + 6,
-                f_inp.y + 4,
-                f_inp.w - 10,
-                &shown,
+            canvas.fill_rect(x, content_y, w, 32, p.bg_card);
+            canvas.draw_hline(x, content_y + 31, w, p.border_subtle);
+            canvas.draw_text(x + 12, content_y + 9, "Find", FontRole::UiSmall, p.text_muted);
+            let f_inp = UiRect::new(x + 52, content_y + 4, 260.min(w - 200), 24);
+            self.draw_text_input(
+                canvas,
+                f_inp,
+                self.find_query.clone().as_str(),
+                "Search in file...",
+                self.focus == FocusTarget::FindInput,
                 FontRole::TerminalMono,
-                Theme::TEXT_PRIMARY,
+                UiAction::Focus(FocusTarget::FindInput),
             );
-            self.push_hit(f_inp, UiAction::Focus(FocusTarget::FindInput));
             self.draw_button(
                 canvas,
-                UiRect::new(f_inp.x + f_inp.w + 6, content_y + 4, 56, 24),
+                UiRect::new(f_inp.x + f_inp.w + 8, content_y + 4, 58, 24),
                 "Next",
-                Theme::ACCENT_BLUE,
-                0xFFFFFF,
-                Theme::ACCENT_BLUE,
+                p.accent,
+                p.on_accent_text(p.accent),
+                p.accent,
                 Some(UiAction::FindNext),
+            );
+            self.draw_button(
+                canvas,
+                UiRect::new(f_inp.x + f_inp.w + 72, content_y + 4, 74, 24),
+                "Go to line",
+                p.bg_button,
+                p.text_secondary,
+                p.border_subtle,
+                Some(UiAction::ToggleGotoLine),
+            );
+            content_y += 32;
+        }
+        if self.show_goto_line {
+            canvas.fill_rect(x, content_y, w, 32, p.bg_card);
+            canvas.draw_hline(x, content_y + 31, w, p.border_subtle);
+            canvas.draw_text(x + 12, content_y + 9, "Line", FontRole::UiSmall, p.text_muted);
+            let g_inp = UiRect::new(x + 52, content_y + 4, 140, 24);
+            self.draw_text_input(
+                canvas,
+                g_inp,
+                self.goto_line_buf.clone().as_str(),
+                "e.g. 128",
+                self.focus == FocusTarget::GotoLineInput,
+                FontRole::TerminalMono,
+                UiAction::Focus(FocusTarget::GotoLineInput),
+            );
+            self.draw_button(
+                canvas,
+                UiRect::new(g_inp.x + g_inp.w + 8, content_y + 4, 74, 24),
+                "Jump",
+                p.accent,
+                p.on_accent_text(p.accent),
+                p.accent,
+                Some(UiAction::ConfirmGotoLine),
             );
             content_y += 32;
         }
@@ -2351,63 +3811,7 @@ impl StudioApp {
         self.editor_rect = UiRect::new(x, content_y, w, body_h);
 
         if self.tabs.is_empty() {
-            let cw = 430.min(w - 30);
-            let cx = x + ((w - cw) / 2).max(12);
-            let cy = content_y + (body_h / 2 - 105).max(16);
-            canvas.fill_rounded_rect(cx, cy, cw, 206, 8, Theme::BG_CARD);
-            canvas.stroke_rounded_rect(cx, cy, cw, 206, 8, Theme::BORDER);
-            canvas.draw_text(
-                cx + 22,
-                cy + 20,
-                "AI Coding Agent — 100% Pure Rust Native GUI",
-                FontRole::UiTitle,
-                Theme::TEXT_PRIMARY,
-            );
-            canvas.draw_text(
-                cx + 22,
-                cy + 46,
-                "Zero WebView. Native ClearType Editor, Side-by-Side Diff & ConPTY.",
-                FontRole::UiSmall,
-                Theme::TEXT_SECONDARY,
-            );
-            self.draw_button(
-                canvas,
-                UiRect::new(cx + 22, cy + 82, 182, 32),
-                "Open Project Folder",
-                Theme::ACCENT_BLUE,
-                0xFFFFFF,
-                Theme::ACCENT_BLUE,
-                Some(UiAction::PickFolder),
-            );
-            self.draw_button(
-                canvas,
-                UiRect::new(cx + 216, cy + 82, 182, 32),
-                "New Scratch Buffer",
-                Theme::BG_BUTTON,
-                Theme::TEXT_PRIMARY,
-                Theme::BORDER,
-                Some(UiAction::NewScratchTab),
-            );
-            self.draw_button(
-                canvas,
-                UiRect::new(cx + 22, cy + 126, 182, 32),
-                "Configure AI Keys",
-                Theme::BG_BUTTON,
-                Theme::ACCENT_CYAN,
-                Theme::BORDER,
-                Some(UiAction::OpenSettings(SettingsTab::Providers)),
-            );
-            self.draw_button(
-                canvas,
-                UiRect::new(cx + 216, cy + 126, 182, 32),
-                "Explain This Repo",
-                Theme::BG_BUTTON,
-                Theme::ACCENT_GREEN,
-                Theme::BORDER,
-                Some(UiAction::QuickPrompt(
-                    "Inspect the workspace architecture and summarize key modules.",
-                )),
-            );
+            self.draw_editor_empty_state(canvas, x, content_y, w, body_h);
             return;
         }
 
@@ -2418,6 +3822,8 @@ impl StudioApp {
         let (char_w_raw, line_h_raw) = canvas.mono_cell_size(FontRole::CodeMono);
         let char_w = char_w_raw.max(7);
         let line_h = line_h_raw.max(19);
+        let gutter_w = 58;
+        let minimap_w = if self.show_minimap { 74 } else { 0 };
 
         canvas.push_clip(x, content_y, w, body_h);
         match &tab.content {
@@ -2429,15 +3835,15 @@ impl StudioApp {
                 scroll_x,
                 ..
             } => {
-                let gutter_w = 56;
-                canvas.fill_rect(x, content_y, gutter_w, body_h, Theme::BG_EDITOR_GUTTER);
-                canvas.draw_vline(x + gutter_w - 1, content_y, body_h, Theme::BORDER);
+                canvas.fill_rect(x, content_y, gutter_w, body_h, p.bg_gutter);
+                canvas.draw_vline(x + gutter_w - 1, content_y, body_h, p.border_subtle);
 
                 let vis_rows = (body_h / line_h) as usize + 1;
                 let sel = tab.ordered_selection();
                 let lang = tab.lang;
-                let editor_focused =
-                    self.focus == FocusTarget::Editor && self.settings_modal.is_none();
+                let editor_focused = self.focus == FocusTarget::Editor && self.modal == ModalDialog::None;
+                let bracket = tab.matching_bracket();
+                let text_w = w - gutter_w - 8 - minimap_w;
 
                 for idx in 0..vis_rows {
                     let row = *scroll_y + idx;
@@ -2446,32 +3852,19 @@ impl StudioApp {
                     }
                     let ry = content_y + 6 + idx as i32 * line_h;
                     if row == *cursor_line {
-                        canvas.fill_rect(
-                            x + gutter_w,
-                            ry - 2,
-                            w - gutter_w,
-                            line_h,
-                            Theme::BG_ACTIVE_LINE,
-                        );
+                        canvas.fill_rect(x + gutter_w, ry - 2, text_w, line_h, p.bg_active_line);
                     }
-
-                    let ln_str = format!("{:>4}", row + 1);
                     canvas.draw_text(
-                        x + 8,
+                        x + 10,
                         ry,
-                        &ln_str,
+                        &format!("{:>4}", row + 1),
                         FontRole::CodeMono,
-                        if row == *cursor_line {
-                            Theme::ACCENT_CYAN
-                        } else {
-                            Theme::TEXT_MUTED
-                        },
+                        if row == *cursor_line { p.accent } else { p.text_muted },
                     );
 
                     let line = &lines[row];
                     let total_chars = char_len(line);
 
-                    // Selection highlight
                     if let Some(((sr, sc), (er, ec))) = sel {
                         if row >= sr && row <= er {
                             let s_c = if row == sr { sc } else { 0 };
@@ -2481,12 +3874,21 @@ impl StudioApp {
                                 let vis_e = e_c.saturating_sub(*scroll_x);
                                 let sx = x + gutter_w + 8 + (vis_s as i32) * char_w;
                                 let sw = ((vis_e - vis_s) as i32 * char_w).max(6);
-                                canvas.fill_rect(sx, ry - 2, sw, line_h, Theme::BG_SELECTION);
+                                canvas.fill_rect(sx, ry - 2, sw, line_h, p.bg_selection);
                             }
                         }
                     }
 
-                    // Lexical syntax-highlighted spans
+                    // Matching-bracket highlight
+                    if let Some((bl, bc)) = bracket {
+                        if bl == row {
+                            let bx = x + gutter_w + 8 + ((bc.saturating_sub(*scroll_x)) as i32) * char_w;
+                            if bx > x + gutter_w {
+                                canvas.stroke_rect(bx, ry - 2, char_w, line_h, p.accent_secondary);
+                            }
+                        }
+                    }
+
                     let spans = tokenize_line(lang, line);
                     let mut col_cursor = 0usize;
                     for sp in spans {
@@ -2503,88 +3905,92 @@ impl StudioApp {
                                     ry,
                                     &visible_piece,
                                     FontRole::CodeMono,
-                                    sp.kind.rgb(),
+                                    sp.kind.themed_rgb(&p),
                                 );
                             }
                         }
                         col_cursor = sp_end;
                     }
 
-                    // Blinking caret
                     if editor_focused
                         && self.blink_phase
                         && row == *cursor_line
                         && *cursor_col >= *scroll_x
                     {
                         let cx = x + gutter_w + 8 + ((*cursor_col - *scroll_x) as i32) * char_w;
-                        canvas.fill_rect(cx, ry - 1, 2, line_h - 2, Theme::ACCENT_CYAN);
+                        canvas.fill_rect(cx, ry - 1, 2, line_h - 2, p.accent);
+                    }
+                }
+
+                // Vertical scrollbar
+                let total_lines = lines.len();
+                if total_lines > vis_rows {
+                    let track_h = body_h - 12;
+                    let thumb_h = (((track_h as usize * vis_rows) / total_lines) as i32).max(24);
+                    let max_scroll = total_lines.saturating_sub(vis_rows);
+                    let ratio = if max_scroll == 0 { 0.0 } else { *scroll_y as f32 / max_scroll as f32 };
+                    let thumb_y = content_y + 6 + ((track_h - thumb_h) as f32 * ratio) as i32;
+                    let sb_x = x + w - 10;
+                    canvas.fill_rounded_rect(sb_x, content_y + 6, 5, track_h, 2, p.bg_input);
+                    canvas.fill_rounded_rect(sb_x, thumb_y, 5, thumb_h, 2, mix(p.accent, p.bg_editor, 0.4));
+                }
+
+                // Minimap
+                if self.show_minimap {
+                    let mm_x = x + w - minimap_w;
+                    canvas.fill_rect(mm_x, content_y, minimap_w, body_h, mix(p.bg_gutter, p.bg_editor, 0.5));
+                    canvas.draw_vline(mm_x, content_y, body_h, p.border_subtle);
+                    let mm_rows = ((body_h - 12) / 3).max(1) as usize;
+                    let mm_total = mm_rows * 12;
+                    for (i, line) in lines.iter().enumerate().take(mm_total) {
+                        let ry = content_y + 6 + (i as i32) * 3;
+                        let indent = line.len() - line.trim_start().len();
+                        let width = ((line.trim().chars().count().min(60) as i32) * 1).max(1);
+                        let col = if line.trim_start().starts_with("//") {
+                            p.syn_comment
+                        } else if i == *cursor_line {
+                            p.accent
+                        } else {
+                            mix(p.text_muted, p.bg_editor, 0.35)
+                        };
+                        canvas.fill_rect(mm_x + 4 + (indent as i32).min(20), ry, width.min(minimap_w - 10), 2, col);
                     }
                 }
             }
             TabContent::Diff { rows, scroll_y } => {
                 let half_w = w / 2;
-                canvas.fill_rect(x, content_y, w, 24, Theme::BG_CARD);
+                canvas.fill_rect(x, content_y, w, 26, p.bg_card);
+                canvas.draw_text_clipped(x + 12, content_y + 5, half_w - 20, "HEAD (Original)", FontRole::UiSemibold, p.danger);
                 canvas.draw_text_clipped(
-                    x + 10,
-                    content_y + 4,
-                    half_w - 20,
-                    "HEAD (Original)",
-                    FontRole::UiSemibold,
-                    0xFCA5A5,
-                );
-                canvas.draw_text_clipped(
-                    x + half_w + 10,
-                    content_y + 4,
+                    x + half_w + 12,
+                    content_y + 5,
                     half_w - 20,
                     "Working Copy (Modified)",
                     FontRole::UiSemibold,
-                    0x6EE7B7,
+                    p.success,
                 );
-                canvas.draw_vline(x + half_w, content_y, body_h, Theme::BORDER);
+                canvas.draw_vline(x + half_w, content_y, body_h, p.border_subtle);
 
                 let d_line_h = 19;
-                let vis_rows = ((body_h - 26) / d_line_h) as usize + 1;
+                let vis_rows = ((body_h - 30) / d_line_h) as usize + 1;
                 for idx in 0..vis_rows {
                     let r_i = *scroll_y + idx;
-                    let Some(row) = rows.get(r_i) else {
-                        break;
-                    };
-                    let ry = content_y + 26 + idx as i32 * d_line_h;
+                    let Some(row) = rows.get(r_i) else { break };
+                    let ry = content_y + 30 + idx as i32 * d_line_h;
                     let (l_bg, r_bg) = match row.kind {
-                        DiffLineKind::Unchanged => (Theme::BG_EDITOR, Theme::BG_EDITOR),
-                        DiffLineKind::Removed => (Theme::DIFF_DEL_BG, 0x0B101B),
-                        DiffLineKind::Added => (0x0B101B, Theme::DIFF_ADD_BG),
-                        DiffLineKind::Changed => (Theme::DIFF_DEL_BG, Theme::DIFF_ADD_BG),
+                        DiffLineKind::Unchanged => (p.bg_editor, p.bg_editor),
+                        DiffLineKind::Removed => (p.diff_del_bg, p.bg_editor),
+                        DiffLineKind::Added => (p.bg_editor, p.diff_add_bg),
+                        DiffLineKind::Changed => (p.diff_del_bg, p.diff_add_bg),
                     };
                     canvas.fill_rect(x, ry, half_w, d_line_h, l_bg);
                     canvas.fill_rect(x + half_w + 1, ry, half_w - 1, d_line_h, r_bg);
-
                     if let Some(ln) = row.left_no {
-                        canvas.draw_text(
-                            x + 6,
-                            ry + 1,
-                            &format!("{:>4}", ln),
-                            FontRole::TerminalMono,
-                            Theme::TEXT_MUTED,
-                        );
+                        canvas.draw_text(x + 8, ry + 1, &format!("{:>4}", ln), FontRole::TerminalMono, p.text_muted);
                     }
-                    canvas.draw_text_clipped(
-                        x + 46,
-                        ry + 1,
-                        half_w - 52,
-                        &row.left_text,
-                        FontRole::TerminalMono,
-                        Theme::TEXT_PRIMARY,
-                    );
-
+                    canvas.draw_text_clipped(x + 46, ry + 1, half_w - 52, &row.left_text, FontRole::TerminalMono, p.text_primary);
                     if let Some(rn) = row.right_no {
-                        canvas.draw_text(
-                            x + half_w + 8,
-                            ry + 1,
-                            &format!("{:>4}", rn),
-                            FontRole::TerminalMono,
-                            Theme::TEXT_MUTED,
-                        );
+                        canvas.draw_text(x + half_w + 10, ry + 1, &format!("{:>4}", rn), FontRole::TerminalMono, p.text_muted);
                     }
                     canvas.draw_text_clipped(
                         x + half_w + 48,
@@ -2592,7 +3998,7 @@ impl StudioApp {
                         half_w - 54,
                         &row.right_text,
                         FontRole::TerminalMono,
-                        Theme::TEXT_PRIMARY,
+                        p.text_primary,
                     );
                 }
             }
@@ -2600,6 +4006,368 @@ impl StudioApp {
         canvas.pop_clip();
     }
 
+    fn draw_editor_empty_state(&mut self, canvas: &mut dyn SurfaceCanvas, x: i32, y: i32, w: i32, h: i32) {
+        let p = self.palette.clone();
+        let cw = 560.min(w - PAD * 3);
+        let cx = x + ((w - cw) / 2).max(PAD);
+        let cy = y + (h / 2 - 150).max(PAD);
+        let ch = 300.min((h - PAD * 2).max(160));
+        canvas.fill_rounded_rect(cx, cy, cw, ch, 12, p.bg_card);
+        canvas.stroke_rounded_rect(cx, cy, cw, ch, 12, p.border_subtle);
+        canvas.draw_text(cx + 28, cy + 26, "AirCode", FontRole::UiTitle, p.accent);
+        canvas.draw_text(
+            cx + 28,
+            cy + 52,
+            "100% Pure-Rust Native Desktop Studio & Agentic Browser",
+            FontRole::UiSemibold,
+            p.text_primary,
+        );
+        canvas.draw_text_clipped(
+            cx + 28,
+            cy + 74,
+            cw - 56,
+            "Zero WebView. Native editor, autonomous agent, MCP, sub-agents & inbuilt browser.",
+            FontRole::UiSmall,
+            p.text_secondary,
+        );
+
+        let bw = (cw - 56 - 12) / 2;
+        self.draw_button(
+            canvas,
+            UiRect::new(cx + 28, cy + 108, bw, 34),
+            "Open Project Folder",
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
+            Some(UiAction::PickFolder),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(cx + 28 + bw + 12, cy + 108, bw, 34),
+            "New Scratch Buffer",
+            p.bg_button,
+            p.text_primary,
+            p.border_subtle,
+            Some(UiAction::NewScratchTab),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(cx + 28, cy + 150, bw, 34),
+            "/ Connect AI Provider",
+            p.bg_button,
+            p.accent_secondary,
+            p.border_subtle,
+            Some(UiAction::OpenModal(ModalDialog::ConnectWizard)),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(cx + 28 + bw + 12, cy + 150, bw, 34),
+            "Agentic Browser",
+            p.bg_button,
+            p.purple,
+            p.border_subtle,
+            Some(UiAction::SwitchCenterView(CenterView::Browser)),
+        );
+        canvas.draw_text_clipped(
+            cx + 28,
+            cy + 204,
+            cw - 56,
+            "Tip: press Ctrl+K (or /) for the fuzzy command palette — themes, fork, compact, effort, skills, MCP.",
+            FontRole::UiSmall,
+            p.text_muted,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inbuilt Agentic Browser viewport (Playwright-style refs + user takeover)
+// ---------------------------------------------------------------------------
+impl StudioApp {
+    fn draw_browser_viewport(&mut self, canvas: &mut dyn SurfaceCanvas, x: i32, top: i32, w: i32, h: i32) {
+        let p = self.palette.clone();
+        canvas.fill_rect(x, top, w, h, p.bg_editor);
+        self.browser_rect = UiRect::new(x, top, w, h);
+
+        // ---- Navigation toolbar ---------------------------------------------
+        let bar_h = 40;
+        canvas.fill_rect(x, top, w, bar_h, p.bg_sidebar);
+        canvas.draw_hline(x, top + bar_h - 1, w, p.border_subtle);
+
+        self.draw_button(
+            canvas,
+            UiRect::new(x + PAD, top + 6, 34, 28),
+            glyph("arrow_l"),
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
+            Some(UiAction::BrowserBack),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(x + PAD + 38, top + 6, 34, 28),
+            glyph("arrow_r"),
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
+            Some(UiAction::BrowserForward),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(x + PAD + 76, top + 6, 34, 28),
+            glyph("reload"),
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
+            Some(UiAction::BrowserReload),
+        );
+
+        let url_x = x + PAD + 118;
+        let url_w = (w - PAD * 2 - 118 - 190).max(120);
+        let url_rect = UiRect::new(url_x, top + 6, url_w, 28);
+        self.draw_text_input(
+            canvas,
+            url_rect,
+            self.browser_url_buf.clone().as_str(),
+            "https://localhost:3000  ·  press Enter to navigate",
+            self.focus == FocusTarget::BrowserUrlInput,
+            FontRole::TerminalMono,
+            UiAction::Focus(FocusTarget::BrowserUrlInput),
+        );
+
+        let mut rx = x + w - PAD;
+        rx -= 88;
+        self.draw_button(
+            canvas,
+            UiRect::new(rx, top + 6, 88, 28),
+            "Engine: JS",
+            p.bg_card,
+            p.accent_secondary,
+            p.border_subtle,
+            Some(UiAction::BrowserToggleEngine),
+        );
+        rx -= 88;
+        self.draw_button(
+            canvas,
+            UiRect::new(rx, top + 6, 88, 28),
+            "Pop Out",
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
+            Some(UiAction::BrowserPopOutExternal),
+        );
+
+        let content_y = top + bar_h;
+
+        // ---- Page state + takeover controls ---------------------------------
+        let (url, title, status, owner_label, owner_col, engine_label, inspector) = {
+            let g = self.browser.inner.lock().unwrap();
+            let owner_label = match &g.owner {
+                BrowserOwner::Idle => "IDLE".to_string(),
+                BrowserOwner::AiDriving(a) => format!("AI DRIVING · {}", truncate_right(a, 26)),
+                BrowserOwner::UserTakeover => "YOU ARE IN CONTROL".to_string(),
+            };
+            let owner_col = match &g.owner {
+                BrowserOwner::UserTakeover => p.success,
+                BrowserOwner::AiDriving(_) => p.purple,
+                BrowserOwner::Idle => p.text_muted,
+            };
+            (
+                g.current_url.clone(),
+                g.title.clone(),
+                g.http_status,
+                owner_label,
+                owner_col,
+                match g.engine {
+                    BrowserJsEngine::NativeFast => "NativeFast".to_string(),
+                    BrowserJsEngine::HeadlessDomJs => "Headless DOM+JS".to_string(),
+                },
+                g.show_dom_inspector,
+            )
+        };
+        if self.browser_url_buf.is_empty() {
+            self.browser_url_buf = url.clone();
+        }
+
+        let state_h = 32;
+        canvas.fill_rect(x, content_y, w, state_h, p.bg_card);
+        canvas.draw_hline(x, content_y + state_h - 1, w, p.border_subtle);
+        canvas.fill_rounded_rect(x + PAD, content_y + 8, 8, 8, 4, owner_col);
+        canvas.draw_text_clipped(x + PAD + 14, content_y + 8, (w / 3).max(80), &owner_label, FontRole::UiSemibold, owner_col);
+        canvas.draw_text_clipped(
+            x + PAD + 14 + (w / 3).max(80) + 8,
+            content_y + 8,
+            (w / 3).max(80),
+            &format!("{} · HTTP {} · {}", truncate_right(&title, 30), status, engine_label),
+            FontRole::UiSmall,
+            p.text_muted,
+        );
+        let mut bx = x + w - PAD;
+        bx -= 104;
+        self.draw_button(
+            canvas,
+            UiRect::new(bx, content_y + 4, 104, 24),
+            "Take Over",
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
+            Some(UiAction::BrowserInterruptTakeover),
+        );
+        bx -= 104;
+        self.draw_button(
+            canvas,
+            UiRect::new(bx, content_y + 4, 100, 24),
+            "Resume AI",
+            p.bg_button,
+            p.purple,
+            p.border_subtle,
+            Some(UiAction::BrowserHandBackToAi),
+        );
+
+        let page_y = content_y + state_h;
+        let page_h = (top + h - page_y).max(20);
+
+        // ---- DOM inspector pane ---------------------------------------------
+        let inspector_w = if inspector { 250 } else { 0 };
+        if inspector {
+            let ix = x + w - inspector_w;
+            canvas.fill_rect(ix, page_y, inspector_w, page_h, p.bg_card);
+            canvas.draw_vline(ix, page_y, page_h, p.border_subtle);
+            self.draw_section_title(canvas, ix + 10, page_y + 8, inspector_w - 20, "PLAYWRIGHT REFS");
+            let els: Vec<crate::browser::InteractiveElement> = {
+                let g = self.browser.inner.lock().unwrap();
+                g.elements.clone()
+            };
+            let mut ey = page_y + 28;
+            for el in els.iter().take(40) {
+                let row = UiRect::new(ix + 6, ey, inspector_w - 12, 24);
+                let hovered = row.contains(self.mouse_x, self.mouse_y);
+                if hovered {
+                    canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 4, p.bg_card_hover);
+                }
+                canvas.draw_text(row.x + 6, ey + 3, &format!("[e{}]", el.ref_id), FontRole::TerminalMono, p.accent_secondary);
+                canvas.draw_text_clipped(row.x + 46, ey + 3, row.w - 52, &truncate_right(&el.label, 26), FontRole::UiSmall, p.text_secondary);
+                if el.kind == "input" {
+                    let input_rect = UiRect::new(ix + 6, ey + 24, inspector_w - 12, 22);
+                    self.push_hit(input_rect, UiAction::BrowserClickRef(el.ref_id));
+                    ey += 26;
+                }
+                ey += 26;
+            }
+        }
+
+        let page_w = w - inspector_w;
+
+        // ---- Page content ----------------------------------------------------
+        canvas.push_clip(x, page_y, page_w, page_h);
+        let blocks: Vec<crate::browser::PageBlock> = {
+            let g = self.browser.inner.lock().unwrap();
+            g.blocks.clone()
+        };
+        let mut by = page_y + PAD - self.browser_scroll;
+        let text_w = page_w - PAD * 2 - 20;
+        for blk in blocks.iter().take(300) {
+            match blk {
+                crate::browser::PageBlock::Heading { level, text } => {
+                    let font = match level {
+                        1 => FontRole::UiTitle,
+                        2 => FontRole::UiSemibold,
+                        _ => FontRole::UiRegular,
+                    };
+                    let lh = if *level <= 1 { 26 } else { 22 };
+                    by += 6;
+                    if by > page_y - 30 && by < page_y + page_h + 30 {
+                        canvas.draw_text_clipped(x + PAD, by, text_w, text, font, p.text_primary);
+                    }
+                    by += lh;
+                }
+                crate::browser::PageBlock::Paragraph { text } | crate::browser::PageBlock::Banner { text } => {
+                    for line in wrap_text(text, ((text_w / 7).max(20)) as usize).into_iter().take(24) {
+                        if by > page_y - 20 && by < page_y + page_h + 20 {
+                            canvas.draw_text_clipped(x + PAD, by, text_w, &line, FontRole::UiSmall, p.text_secondary);
+                        }
+                        by += 17;
+                    }
+                    by += 6;
+                }
+                crate::browser::PageBlock::ListItem { text } => {
+                    if by > page_y - 20 && by < page_y + page_h + 20 {
+                        canvas.draw_text(x + PAD, by, "•", FontRole::UiSmall, p.accent);
+                        canvas.draw_text_clipped(x + PAD + 12, by, text_w - 12, text, FontRole::UiSmall, p.text_secondary);
+                    }
+                    by += 18;
+                }
+                crate::browser::PageBlock::CodeBlock { text } => {
+                    let bh = (text.lines().count() as i32 * 17 + 12).min(220);
+                    let card = UiRect::new(x + PAD, by, page_w - PAD * 2, bh);
+                    if by > page_y - bh && by < page_y + page_h + bh {
+                        canvas.fill_rounded_rect(card.x, card.y, card.w, card.h, 6, p.bg_input);
+                        for (i, line) in text.lines().take(12).enumerate() {
+                            canvas.draw_text_clipped(
+                                card.x + 8,
+                                card.y + 6 + i as i32 * 17,
+                                card.w - 16,
+                                line,
+                                FontRole::TerminalMono,
+                                p.syn_string,
+                            );
+                        }
+                    }
+                    by += bh + 8;
+                }
+                crate::browser::PageBlock::Link { ref_id, label, .. } => {
+                    let row = UiRect::new(x + PAD - 4, by - 2, page_w - PAD * 2 + 8, 22);
+                    let hovered = row.contains(self.mouse_x, self.mouse_y);
+                    if hovered {
+                        canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 5, p.bg_card_hover);
+                    }
+                    if by > page_y - 20 && by < page_y + page_h + 20 {
+                        canvas.draw_text(x + PAD, by, &format!("[e{}]", ref_id), FontRole::TerminalMono, p.accent_secondary);
+                        canvas.draw_text_clipped(x + PAD + 42, by, text_w - 42, label, FontRole::UiSmall, p.accent);
+                    }
+                    self.push_hit(row, UiAction::BrowserClickRef(*ref_id));
+                    by += 24;
+                }
+                crate::browser::PageBlock::Button { ref_id, label, .. } => {
+                    let btn_w = (canvas.measure_text_width(label, FontRole::UiSemibold) + 56).min(page_w - PAD * 3);
+                    let row = UiRect::new(x + PAD, by, btn_w, 28);
+                    let hovered = row.contains(self.mouse_x, self.mouse_y);
+                    canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 6, if hovered { lighten(p.accent, 14) } else { mix(p.accent, p.bg_editor, 0.18) });
+                    canvas.stroke_rounded_rect(row.x, row.y, row.w, row.h, 6, p.accent);
+                    canvas.draw_text(row.x + 14, by + 6, &format!("[e{}]", ref_id), FontRole::TerminalMono, p.accent_secondary);
+                    canvas.draw_text_clipped(row.x + 46, by + 6, row.w - 54, label, FontRole::UiSemibold, p.text_primary);
+                    self.push_hit(row, UiAction::BrowserClickRef(*ref_id));
+                    by += 34;
+                }
+                crate::browser::PageBlock::Input { ref_id, placeholder, value, .. } => {
+                    let row = UiRect::new(x + PAD, by, page_w - PAD * 2, 30);
+                    canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 6, p.bg_input);
+                    canvas.stroke_rounded_rect(row.x, row.y, row.w, row.h, 6, p.border_subtle);
+                    canvas.draw_text(row.x + 10, by + 8, &format!("[e{}]", ref_id), FontRole::TerminalMono, p.accent_secondary);
+                    let shown = if value.is_empty() { placeholder.clone() } else { value.clone() };
+                    canvas.draw_text_clipped(row.x + 50, by + 8, row.w - 60, &shown, FontRole::TerminalMono, if value.is_empty() { p.text_muted } else { p.text_primary });
+                    self.push_hit(row, UiAction::BrowserClickRef(*ref_id));
+                    by += 36;
+                }
+                crate::browser::PageBlock::Divider => {
+                    canvas.draw_hline(x + PAD, by + 8, page_w - PAD * 2, p.border_subtle);
+                    by += 18;
+                }
+            }
+        }
+        canvas.pop_clip();
+
+        // Vertical scrollbar for the page
+        canvas.fill_rounded_rect(x + w - 6, page_y + 4, 4, page_h - 8, 2, p.bg_input);
+        let thumb_h = 60.min(page_h - 8);
+        let thumb_y = page_y + 4 + ((self.browser_scroll as i32).clamp(0, 400) / 4).min(page_h - thumb_h - 8);
+        canvas.fill_rounded_rect(x + w - 6, thumb_y, 4, thumb_h, 2, mix(p.accent, p.bg_editor, 0.5));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Integrated terminal drawer
+// ---------------------------------------------------------------------------
+impl StudioApp {
     fn draw_bottom_terminal(
         &mut self,
         canvas: &mut dyn SurfaceCanvas,
@@ -2608,108 +4376,88 @@ impl StudioApp {
         w: i32,
         h: i32,
     ) {
-        canvas.fill_rect(x, top, w, h, Theme::BG_TERMINAL);
-        canvas.draw_hline(x, top, w, Theme::BORDER);
+        let p = self.palette.clone();
+        canvas.fill_rect(x, top, w, h, p.bg_terminal);
+        canvas.draw_hline(x, top, w, p.border_subtle);
 
-        let bar_h = 30;
-        canvas.fill_rect(x, top + 1, w, bar_h, Theme::BG_SIDEBAR);
-        canvas.draw_hline(x, top + bar_h, w, Theme::BORDER);
+        let bar_h = 32;
+        canvas.fill_rect(x, top + 1, w, bar_h, p.bg_sidebar);
+        canvas.draw_hline(x, top + bar_h, w, p.border_subtle);
 
-        let mut tx = x + 8;
+        let mut tx = x + PAD;
         let term_titles: Vec<String> = self.terminals.iter().map(|t| t.title.clone()).collect();
         for (idx, title) in term_titles.into_iter().enumerate() {
-            let tw = 128;
+            let tw = 132;
+            if tx + tw > x + w - 260 {
+                break;
+            }
             let active = idx == self.active_term;
             canvas.fill_rounded_rect(
                 tx,
-                top + 4,
+                top + 5,
                 tw,
-                22,
-                4,
-                if active {
-                    Theme::BG_TERMINAL
-                } else {
-                    Theme::BG_CARD
-                },
+                23,
+                5,
+                if active { p.bg_terminal } else { p.bg_card },
             );
             canvas.draw_text_clipped(
-                tx + 8,
-                top + 6,
-                tw - 28,
+                tx + 10,
+                top + 8,
+                tw - 30,
                 &title,
                 FontRole::UiSemibold,
-                if active {
-                    Theme::ACCENT_GREEN
-                } else {
-                    Theme::TEXT_SECONDARY
-                },
+                if active { p.success } else { p.text_secondary },
             );
-            canvas.draw_text(
-                tx + tw - 16,
-                top + 6,
-                "x",
-                FontRole::UiSmall,
-                Theme::TEXT_MUTED,
-            );
-            self.push_hit(
-                UiRect::new(tx, top + 4, tw - 20, 22),
-                UiAction::SelectPtyTab(idx),
-            );
-            self.push_hit(
-                UiRect::new(tx + tw - 20, top + 4, 20, 22),
-                UiAction::ClosePtyTab(idx),
-            );
-            tx += tw + 4;
+            canvas.draw_text(tx + tw - 18, top + 8, "x", FontRole::UiSmall, p.text_muted);
+            self.push_hit(UiRect::new(tx, top + 5, tw - 22, 23), UiAction::SelectPtyTab(idx));
+            self.push_hit(UiRect::new(tx + tw - 22, top + 5, 22, 23), UiAction::ClosePtyTab(idx));
+            tx += tw + 6;
         }
 
-        let ps_lbl = if cfg!(target_os = "windows") {
-            "+ PowerShell"
-        } else {
-            "+ Shell"
-        };
+        let ps_lbl = if cfg!(target_os = "windows") { "+ PS" } else { "+ Shell" };
         self.draw_button(
             canvas,
-            UiRect::new(x + w - 306, top + 4, 92, 22),
+            UiRect::new(x + w - 312, top + 5, 70, 23),
             ps_lbl,
-            Theme::BG_BUTTON,
-            Theme::ACCENT_CYAN,
-            Theme::BORDER,
-            Some(UiAction::SpawnPtyTab("powershell")),
+            p.bg_button,
+            p.success,
+            p.border_subtle,
+            Some(UiAction::SpawnPtyTab(if cfg!(target_os = "windows") { "powershell" } else { "sh" })),
         );
         self.draw_button(
             canvas,
-            UiRect::new(x + w - 210, top + 4, 58, 22),
+            UiRect::new(x + w - 238, top + 5, 62, 23),
             "+ CMD",
-            Theme::BG_BUTTON,
-            Theme::TEXT_SECONDARY,
-            Theme::BORDER,
+            p.bg_button,
+            p.text_secondary,
+            p.border_subtle,
             Some(UiAction::SpawnPtyTab("cmd")),
         );
         self.draw_button(
             canvas,
-            UiRect::new(x + w - 148, top + 4, 46, 22),
+            UiRect::new(x + w - 172, top + 5, 52, 23),
             "CWD",
-            Theme::BG_BUTTON,
-            Theme::TEXT_SECONDARY,
-            Theme::BORDER,
+            p.bg_button,
+            p.text_secondary,
+            p.border_subtle,
             Some(UiAction::PtySyncCwd),
         );
         self.draw_button(
             canvas,
-            UiRect::new(x + w - 98, top + 4, 46, 22),
+            UiRect::new(x + w - 116, top + 5, 46, 23),
             "^C",
-            0x3B1820,
-            0xFCA5A5,
-            Theme::BORDER,
+            mix(p.danger, p.bg_button, 0.4),
+            p.danger,
+            p.border_subtle,
             Some(UiAction::PtySendCtrlC),
         );
         self.draw_button(
             canvas,
-            UiRect::new(x + w - 48, top + 4, 42, 22),
-            "Clr",
-            Theme::BG_BUTTON,
-            Theme::TEXT_MUTED,
-            Theme::BORDER,
+            UiRect::new(x + w - 66, top + 5, 54, 23),
+            "Clear",
+            p.bg_button,
+            p.text_muted,
+            p.border_subtle,
             Some(UiAction::PtyClearScreen),
         );
 
@@ -2729,18 +4477,13 @@ impl StudioApp {
                 term.screen.resize(target_cols, target_rows);
                 term.pty.resize(target_cols as u16, target_rows as u16);
             }
-
             canvas.push_clip(x + 4, grid_y, w - 8, grid_h);
-            let focused = self.focus == FocusTarget::Terminal && self.settings_modal.is_none();
-
             for r in 0..term.screen.rows {
                 let ry = grid_y + r as i32 * row_h;
-                let Some(line) = term.screen.visible_row(r) else {
-                    continue;
-                };
+                let Some(line) = term.screen.visible_row(r) else { continue };
                 let mut col = 0usize;
                 while col < line.len() {
-                    let style = line[col];
+                    let style = line[col].clone();
                     let mut end = col + 1;
                     let mut run = String::new();
                     run.push(style.ch);
@@ -2750,7 +4493,7 @@ impl StudioApp {
                     }
                     let rx = self.term_grid_rect.x + col as i32 * char_w;
                     let rw = (end - col) as i32 * char_w;
-                    if style.bg != Theme::BG_TERMINAL {
+                    if style.bg != p.bg_terminal {
                         canvas.fill_rect(rx, ry, rw, row_h, style.bg);
                     }
                     if run.chars().any(|c| c != ' ') {
@@ -2759,201 +4502,430 @@ impl StudioApp {
                     col = end;
                 }
             }
-
-            if focused && term.screen.scroll_offset == 0 && self.blink_phase {
+            if self.focus == FocusTarget::Terminal
+                && self.modal == ModalDialog::None
+                && term.screen.scroll_offset == 0
+                && self.blink_phase
+            {
                 let cx = self.term_grid_rect.x + term.screen.cursor_col as i32 * char_w;
                 let cy = grid_y + term.screen.cursor_row as i32 * row_h;
-                canvas.fill_rect(cx, cy + 1, char_w, row_h - 2, Theme::ACCENT_GREEN);
+                canvas.fill_rect(cx, cy + 1, char_w, row_h - 2, p.success);
             }
             canvas.pop_clip();
         }
     }
+}
 
+// ---------------------------------------------------------------------------
+// Right panel: agent chat + interactive prompt timeline
+// ---------------------------------------------------------------------------
+impl StudioApp {
     fn draw_right_agent_panel(&mut self, canvas: &mut dyn SurfaceCanvas, top: i32, bottom: i32) {
+        if self.right_w <= 40 {
+            return;
+        }
+        let p = self.palette.clone();
         let x = self.width - self.right_w;
         let w = self.right_w;
         let h = bottom - top;
-        canvas.fill_rect(x, top, w, h, Theme::BG_AGENT);
-        canvas.draw_vline(x, top, h, Theme::BORDER);
+        canvas.fill_rect(x, top, w, h, p.bg_agent);
+        canvas.draw_vline(x, top, h, p.border_subtle);
 
-        canvas.fill_rect(x + 1, top, w - 1, 36, Theme::BG_SIDEBAR);
-        canvas.draw_hline(x + 1, top + 35, w - 1, Theme::BORDER);
+        // ---- Panel header ---------------------------------------------------
+        canvas.fill_rect(x + 1, top, w - 1, 40, p.bg_sidebar);
+        canvas.draw_hline(x + 1, top + 39, w - 1, p.border_subtle);
         canvas.draw_text_clipped(
-            x + 10,
-            top + 9,
+            x + PAD,
+            top + 8,
             w - 130,
-            &format!("Session: {}", self.active_session.title),
+            &truncate_right(&self.active_session.title, 26),
             FontRole::UiSemibold,
-            Theme::TEXT_PRIMARY,
+            p.text_primary,
+        );
+        canvas.draw_text(
+            x + PAD,
+            top + 25,
+            &format!(
+                "{} · {} · {}",
+                if self.active_mode == "plan" { "PLAN" } else { "BUILD" },
+                self.settings.agent_effort.to_uppercase(),
+                truncate_right(&self.settings.active_model, 16)
+            ),
+            FontRole::UiSmall,
+            p.text_muted,
         );
         self.draw_button(
             canvas,
-            UiRect::new(x + w - 114, top + 6, 56, 24),
+            UiRect::new(x + w - 118, top + 7, 54, 26),
             "+ New",
-            Theme::ACCENT_BLUE,
-            0xFFFFFF,
-            Theme::ACCENT_BLUE,
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
             Some(UiAction::NewSession),
         );
-        let cur_sid = self.active_session.id.clone();
         self.draw_button(
             canvas,
-            UiRect::new(x + w - 52, top + 6, 44, 24),
-            "Clear",
-            Theme::BG_BUTTON,
-            Theme::TEXT_SECONDARY,
-            Theme::BORDER,
-            Some(UiAction::DeleteSession(cur_sid)),
+            UiRect::new(x + w - 60, top + 7, 48, 26),
+            "Fork",
+            p.bg_button,
+            p.purple,
+            p.border_subtle,
+            Some(UiAction::ForkActiveSession),
         );
 
-        let mut sx = x + 8;
-        let sess_y = top + 40;
-        let sess_list: Vec<(String, String)> = self
-            .sessions
-            .iter()
-            .take(3)
-            .map(|s| (s.id.clone(), s.title.clone()))
-            .collect();
-        for (sid, stitle) in sess_list {
-            let pw = (w - 24) / 3;
-            let active = sid == self.active_session.id;
-            self.draw_button(
-                canvas,
-                UiRect::new(sx, sess_y, pw, 22),
-                &truncate_right(&stitle, 14),
-                if active {
-                    Theme::BG_CARD_ALT
-                } else {
-                    Theme::BG_CARD
-                },
-                if active {
-                    Theme::ACCENT_CYAN
-                } else {
-                    Theme::TEXT_MUTED
-                },
-                Theme::BORDER,
-                Some(UiAction::SelectSession(sid)),
-            );
-            sx += pw + 4;
+        // ---- Chat / Timeline tabs -------------------------------------------
+        let tabs_y = top + 40;
+        let tab_w = (w - PAD * 2 - 8) / 2;
+        self.draw_pill(
+            canvas,
+            UiRect::new(x + PAD, tabs_y + 4, tab_w, 24),
+            "Chat",
+            self.agent_panel_tab == AgentPanelTab::Chat,
+            Some(UiAction::ExecuteCommandId("panel:chat".to_string())),
+        );
+        self.draw_pill(
+            canvas,
+            UiRect::new(x + PAD + tab_w + 8, tabs_y + 4, tab_w, 24),
+            "Prompt Timeline",
+            self.agent_panel_tab == AgentPanelTab::Timeline,
+            Some(UiAction::ExecuteCommandId("panel:timeline".to_string())),
+        );
+
+        let comp_h = 148;
+        let comp_top = bottom - comp_h;
+        let feed_top = tabs_y + 34;
+        let feed_bottom = comp_top - 8;
+
+        match self.agent_panel_tab {
+            AgentPanelTab::Chat => self.draw_agent_chat(canvas, x, w, feed_top, feed_bottom),
+            AgentPanelTab::Timeline => self.draw_prompt_timeline(canvas, x, w, feed_top, feed_bottom),
         }
 
-        let comp_h = 128;
-        let comp_top = bottom - comp_h;
-        let feed_top = sess_y + 28;
-        let feed_bottom = comp_top - 26;
+        // ---- Composer ---------------------------------------------------------
+        canvas.fill_rect(x + 1, comp_top, w - 1, comp_h, p.bg_sidebar);
+        canvas.draw_hline(x + 1, comp_top, w - 1, p.border_subtle);
 
-        let wrap_cols = ((w - 36).max(160) / 7) as usize;
-        let mut rendered_blocks: Vec<(u32, u32, String, Option<String>)> = Vec::new();
+        let chip_w = (w - PAD * 2 - 16) / 3;
+        self.draw_button(
+            canvas,
+            UiRect::new(x + PAD, comp_top + 8, chip_w, 22),
+            "Explain",
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
+            Some(UiAction::QuickPrompt(
+                "Inspect the repository files and explain the architecture concisely.",
+            )),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(x + PAD + chip_w + 8, comp_top + 8, chip_w, 22),
+            "Diagnose",
+            p.bg_card,
+            p.warning,
+            p.border_subtle,
+            Some(UiAction::QuickPrompt(
+                "Run diagnose_errors on this workspace and fix any compiler or test issues found.",
+            )),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(x + PAD + (chip_w + 8) * 2, comp_top + 8, chip_w, 22),
+            "Git Summary",
+            p.bg_card,
+            p.accent_secondary,
+            p.border_subtle,
+            Some(UiAction::QuickPrompt(
+                "Check git status & diff and summarize all uncommitted changes.",
+            )),
+        );
+
+        let box_rect = UiRect::new(x + PAD, comp_top + 36, w - PAD * 2, 62);
+        let focused = self.focus == FocusTarget::AgentPrompt && self.modal == ModalDialog::None;
+        canvas.fill_rounded_rect(box_rect.x, box_rect.y, box_rect.w, box_rect.h, 8, p.bg_input);
+        canvas.stroke_rounded_rect(
+            box_rect.x,
+            box_rect.y,
+            box_rect.w,
+            box_rect.h,
+            8,
+            if focused { p.border_focus } else { p.border_subtle },
+        );
+        self.push_hit(box_rect, UiAction::Focus(FocusTarget::AgentPrompt));
+
+        let prompt_disp = if self.agent_prompt.is_empty() && !focused {
+            "Ask AirCode to build, refactor, or debug — type / for commands".to_string()
+        } else if focused && self.blink_phase {
+            format!("{}|", self.agent_prompt)
+        } else {
+            self.agent_prompt.clone()
+        };
+        let wrap_cols = (((box_rect.w - 20) / 7).max(20)) as usize;
+        let p_color = if self.agent_prompt.is_empty() && !focused {
+            p.text_muted
+        } else {
+            p.text_primary
+        };
+        for (idx, pl) in wrap_text(&prompt_disp, wrap_cols).into_iter().rev().take(3).rev().enumerate() {
+            canvas.draw_text_clipped(box_rect.x + 10, box_rect.y + 8 + idx as i32 * 17, box_rect.w - 20, &pl, FontRole::UiSmall, p_color);
+        }
+
+        canvas.draw_text(
+            x + PAD,
+            comp_top + 104,
+            "Enter: run · Shift+Enter: newline · /: commands",
+            FontRole::UiSmall,
+            p.text_muted,
+        );
+        let run_label = if self.agent_running {
+            "Stop"
+        } else if self.compacting {
+            "Compacting"
+        } else {
+            "Run"
+        };
+        self.draw_button(
+            canvas,
+            UiRect::new(x + w - PAD - 86, comp_top + 100, 86, 28),
+            run_label,
+            if self.agent_running { mix(p.danger, p.bg_button, 0.4) } else { p.accent },
+            if self.agent_running { p.danger } else { p.on_accent_text(p.accent) },
+            if self.agent_running { p.danger } else { p.accent },
+            Some(if self.agent_running {
+                UiAction::EmergencyStop
+            } else {
+                UiAction::SendAgentPrompt
+            }),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(x + PAD, comp_top + 100, 86, 28),
+            "Compact",
+            p.bg_card,
+            p.warning,
+            p.border_subtle,
+            Some(UiAction::CompactActiveSession),
+        );
+    }
+}
+
+impl StudioApp {
+    fn draw_agent_chat(
+        &mut self,
+        canvas: &mut dyn SurfaceCanvas,
+        x: i32,
+        w: i32,
+        feed_top: i32,
+        feed_bottom: i32,
+    ) {
+        let p = self.palette.clone();
+        let wrap_cols = ((w - 40).max(160) / 7) as usize;
+        let mut blocks: Vec<ChatBlock> = Vec::new();
+        self.msg_line_offsets.clear();
 
         if self.active_session.messages.is_empty() && self.live_tools.is_empty() {
-            rendered_blocks.push((
-                Theme::BG_CARD,
-                Theme::ACCENT_CYAN,
-                "Autonomous Coding Agent Ready".to_string(),
-                None,
-            ));
+            blocks.push(ChatBlock {
+                bg: p.bg_card,
+                fg: p.accent,
+                text: "AirCode Agent — ready".to_string(),
+                diff_rel: None,
+                msg_idx: None,
+            });
             for info in [
-                "Modes: Ask (approval-gated), Plan (read-only architect), Auto (multi-step edit + shell + verify).",
-                "9 Built-in Tools: read_file, write_file, edit_file, search_project, execute_command, install_dependencies, run_tests, diagnose_errors, git_operation.",
-                "Tip: Click a Quick Action chip below or type any coding task!",
+                "Plan mode researches & designs; Build mode edits files, runs shell & tests.",
+                "Type / for the command palette: /connect /theme /fork /compact /effort /skills /browser",
+                "Ctrl+K opens fuzzy search over every command and file in the workspace.",
             ] {
                 for wl in wrap_text(info, wrap_cols) {
-                    rendered_blocks.push((Theme::BG_CARD, Theme::TEXT_SECONDARY, wl, None));
+                    blocks.push(ChatBlock {
+                        bg: p.bg_card,
+                        fg: p.text_secondary,
+                        text: wl,
+                        diff_rel: None,
+                        msg_idx: None,
+                    });
                 }
             }
         }
 
-        for msg in &self.active_session.messages {
+        for (msg_idx, msg) in self.active_session.messages.iter().enumerate() {
+            self.msg_line_offsets.push(blocks.len());
             let is_user = msg.role == "user";
-            let role_hdr = if is_user { "YOU" } else { "AI AGENT" };
-            let bg = if is_user { 0x152542 } else { Theme::BG_CARD };
-            let hdr_fg = if is_user {
-                Theme::ACCENT_CYAN
-            } else {
-                Theme::ACCENT_GREEN
-            };
-            rendered_blocks.push((bg, hdr_fg, format!("[{}]", role_hdr), None));
+            let bg = if is_user { mix(p.accent, p.bg_agent, 0.10) } else { p.bg_card };
+            let hdr_fg = if is_user { p.accent } else { p.success };
+            let stamp = crate::sqlite::short_time_label(&msg.created_at);
+            blocks.push(ChatBlock {
+                bg,
+                fg: hdr_fg,
+                text: format!(
+                    "{} {}  [{}]",
+                    if is_user { glyph("user") } else { glyph("spark") },
+                    if is_user { "YOU" } else { "AIRCODE" },
+                    stamp
+                ),
+                diff_rel: None,
+                msg_idx: Some(msg_idx),
+            });
+
+            let thinking_hidden = !self.settings.show_thinking
+                || self.hidden_thinking_ids.iter().any(|m| *m == msg.id);
             if !msg.thinking.trim().is_empty() {
-                for rl in wrap_text(&format!("Thinking: {}", msg.thinking.trim()), wrap_cols)
-                    .into_iter()
-                    .take(4)
-                {
-                    rendered_blocks.push((bg, Theme::TEXT_MUTED, rl, None));
+                if thinking_hidden {
+                    blocks.push(ChatBlock {
+                        bg,
+                        fg: p.text_muted,
+                        text: format!("{} thinking hidden — /thinking to show", glyph("brain")),
+                        diff_rel: None,
+                        msg_idx: Some(msg_idx),
+                    });
+                } else {
+                    blocks.push(ChatBlock {
+                        bg,
+                        fg: p.purple,
+                        text: format!("{} thinking", glyph("brain")),
+                        diff_rel: None,
+                        msg_idx: Some(msg_idx),
+                    });
+                    for rl in wrap_text(&format!("    {}", msg.thinking.trim()), wrap_cols)
+                        .into_iter()
+                        .take(6)
+                    {
+                        blocks.push(ChatBlock {
+                            bg,
+                            fg: mix(p.purple, p.text_secondary, 0.35),
+                            text: rl,
+                            diff_rel: None,
+                            msg_idx: Some(msg_idx),
+                        });
+                    }
                 }
             }
+
             for tool in &msg.tools {
                 let st_col = if tool.status == "ok" {
-                    Theme::ACCENT_GREEN
+                    p.success
                 } else {
-                    Theme::ACCENT_RED
+                    p.danger
                 };
                 let diff_rel = if tool.file_path.is_empty() {
                     None
                 } else {
                     Some(tool.file_path.clone())
                 };
-                rendered_blocks.push((
-                    0x101A2C,
-                    st_col,
-                    format!(
-                        "TOOL {} [{} - {}ms]",
+                blocks.push(ChatBlock {
+                    bg: mix(p.bg_card, p.bg_agent, 0.5),
+                    fg: st_col,
+                    text: format!(
+                        "{} {} · {}ms",
+                        glyph("wrench"),
                         tool.tool_name,
-                        tool.status.to_uppercase(),
                         tool.duration_ms
                     ),
                     diff_rel,
-                ));
+                    msg_idx: Some(msg_idx),
+                });
                 if !tool.result_summary.is_empty() {
-                    for tl in wrap_text(&tool.result_summary, wrap_cols)
-                        .into_iter()
-                        .take(2)
-                    {
-                        rendered_blocks.push((0x101A2C, Theme::TEXT_SECONDARY, tl, None));
+                    for tl in wrap_text(&tool.result_summary, wrap_cols).into_iter().take(2) {
+                        blocks.push(ChatBlock {
+                            bg: mix(p.bg_card, p.bg_agent, 0.5),
+                            fg: p.text_secondary,
+                            text: tl,
+                            diff_rel: None,
+                            msg_idx: Some(msg_idx),
+                        });
                     }
                 }
             }
-            for wl in wrap_text(&msg.content, wrap_cols) {
-                rendered_blocks.push((bg, Theme::TEXT_PRIMARY, wl, None));
+
+            for wl in wrap_text(&msg.content, wrap_cols).into_iter().take(60) {
+                blocks.push(ChatBlock {
+                    bg,
+                    fg: p.text_primary,
+                    text: wl,
+                    diff_rel: None,
+                    msg_idx: Some(msg_idx),
+                });
             }
-            rendered_blocks.push((Theme::BG_AGENT, Theme::TEXT_MUTED, String::new(), None));
+            blocks.push(ChatBlock {
+                bg: p.bg_agent,
+                fg: p.text_muted,
+                text: String::new(),
+                diff_rel: None,
+                msg_idx: Some(msg_idx),
+            });
         }
 
-        // Live in-flight tools & streaming deltas
-        for rec in &self.live_tools {
-            let st_col = match rec.status.as_str() {
-                "ok" => Theme::ACCENT_GREEN,
-                "running" => Theme::ACCENT_AMBER,
-                _ => Theme::ACCENT_RED,
-            };
-            let diff_rel = if rec.file_path.is_empty() {
-                None
-            } else {
-                Some(rec.file_path.clone())
-            };
-            rendered_blocks.push((
-                0x101A2C,
-                st_col,
-                format!(
-                    "LIVE {} [{} - {}ms]",
-                    rec.tool_name,
-                    rec.status.to_uppercase(),
-                    rec.duration_ms
-                ),
-                diff_rel,
-            ));
-            for wl in wrap_text(&rec.result_summary, wrap_cols).into_iter().take(2) {
-                rendered_blocks.push((0x101A2C, Theme::TEXT_SECONDARY, wl, None));
+        // Live streaming state
+        if !self.live_tools.is_empty() || !self.streaming_text.is_empty() {
+            for rec in &self.live_tools {
+                let st_col = match rec.status.as_str() {
+                    "ok" => p.success,
+                    "running" => p.warning,
+                    _ => p.danger,
+                };
+                let diff_rel = if rec.file_path.is_empty() {
+                    None
+                } else {
+                    Some(rec.file_path.clone())
+                };
+                blocks.push(ChatBlock {
+                    bg: mix(p.bg_card, p.bg_agent, 0.5),
+                    fg: st_col,
+                    text: format!(
+                        "{} live {} · {}ms",
+                        glyph("wrench"),
+                        rec.tool_name,
+                        rec.duration_ms
+                    ),
+                    diff_rel,
+                    msg_idx: None,
+                });
+                if !rec.result_summary.is_empty() {
+                    for tl in wrap_text(&rec.result_summary, wrap_cols).into_iter().take(2) {
+                        blocks.push(ChatBlock {
+                            bg: mix(p.bg_card, p.bg_agent, 0.5),
+                            fg: p.text_secondary,
+                            text: tl,
+                            diff_rel: None,
+                            msg_idx: None,
+                        });
+                    }
+                }
             }
-        }
-        if !self.streaming_text.is_empty() {
-            for wl in wrap_text(&self.streaming_text, wrap_cols) {
-                rendered_blocks.push((Theme::BG_CARD, Theme::TEXT_PRIMARY, wl, None));
+            if !self.streaming_thinking.is_empty() && self.settings.show_thinking {
+                blocks.push(ChatBlock {
+                    bg: p.bg_card,
+                    fg: p.purple,
+                    text: format!("{} thinking...", glyph("brain")),
+                    diff_rel: None,
+                    msg_idx: None,
+                });
+                for rl in wrap_text(&self.streaming_thinking, wrap_cols).into_iter().take(6) {
+                    blocks.push(ChatBlock {
+                        bg: p.bg_card,
+                        fg: mix(p.purple, p.text_secondary, 0.35),
+                        text: rl,
+                        diff_rel: None,
+                        msg_idx: None,
+                    });
+                }
+            }
+            if !self.streaming_text.is_empty() {
+                for wl in wrap_text(&self.streaming_text, wrap_cols).into_iter().take(40) {
+                    blocks.push(ChatBlock {
+                        bg: p.bg_card,
+                        fg: p.text_primary,
+                        text: wl,
+                        diff_rel: None,
+                        msg_idx: None,
+                    });
+                }
             }
         }
 
-        let line_h = 19;
+        let line_h = 18;
         let vis_lines = ((feed_bottom - feed_top).max(20) / line_h) as usize;
-        let total = rendered_blocks.len();
+        let total = blocks.len();
         let max_off = total.saturating_sub(vis_lines);
         let start_idx = if self.agent_scroll_lines == 0 {
             max_off
@@ -2962,187 +4934,209 @@ impl StudioApp {
         };
 
         canvas.push_clip(x + 2, feed_top, w - 4, (feed_bottom - feed_top).max(10));
-        for (i, (bg, fg, text, diff_path)) in rendered_blocks
+        let mut cur_msg: Option<usize> = None;
+        for (i, blk) in blocks
             .into_iter()
             .skip(start_idx)
             .take(vis_lines)
             .enumerate()
         {
             let ly = feed_top + i as i32 * line_h;
-            if bg != Theme::BG_AGENT {
-                canvas.fill_rect(x + 8, ly, w - 16, line_h, bg);
+            if blk.msg_idx != cur_msg {
+                cur_msg = blk.msg_idx;
             }
-            let text_max_w = if diff_path.is_some() { w - 82 } else { w - 24 };
-            canvas.draw_text_clipped(x + 14, ly + 1, text_max_w, &text, FontRole::UiSmall, fg);
-            if let Some(rel) = diff_path {
+            if blk.bg != p.bg_agent {
+                canvas.fill_rect(x + 8, ly, w - 16, line_h, blk.bg);
+            }
+            let text_max_w = if blk.diff_rel.is_some() { w - 96 } else { w - 24 };
+            canvas.draw_text_clipped(x + 14, ly + 1, text_max_w, &blk.text, FontRole::UiSmall, blk.fg);
+            if let Some(rel) = blk.diff_rel {
                 self.draw_button(
                     canvas,
-                    UiRect::new(x + w - 64, ly + 1, 52, line_h - 2),
+                    UiRect::new(x + w - 78, ly + 1, 66, line_h - 3),
                     "Diff",
-                    Theme::BG_BUTTON,
-                    Theme::ACCENT_CYAN,
-                    Theme::BORDER,
+                    p.bg_button,
+                    p.accent_secondary,
+                    p.border_subtle,
                     Some(UiAction::GitOpenDiff(rel)),
                 );
+            }
+            if let Some(idx) = blk.msg_idx {
+                if i > 0 {
+                    let fork_rect = UiRect::new(x + w - 14, ly + 1, 12, line_h - 3);
+                    self.push_hit(fork_rect, UiAction::ForkFromMessage(idx));
+                }
             }
         }
         canvas.pop_clip();
 
-        canvas.fill_rect(x + 1, feed_bottom, w - 1, 24, Theme::BG_SIDEBAR);
+        // Status strip between feed and composer
         let st_col = if self.agent_running {
-            Theme::ACCENT_AMBER
+            p.warning
+        } else if self.compacting {
+            p.accent_secondary
         } else {
-            Theme::TEXT_MUTED
+            p.text_muted
         };
+        canvas.fill_rect(x + 1, feed_bottom, w - 1, 22, p.bg_sidebar);
         canvas.draw_text_clipped(
-            x + 10,
-            feed_bottom + 4,
-            w - 20,
-            &self.agent_status_line,
+            x + PAD,
+            feed_bottom + 3,
+            w - PAD * 2,
+            &truncate_right(&self.agent_status_line, (w - 24) as usize / 6),
             FontRole::UiSmall,
             st_col,
         );
+    }
 
-        canvas.fill_rect(x + 1, comp_top, w - 1, comp_h, Theme::BG_SIDEBAR);
-        canvas.draw_hline(x + 1, comp_top, w - 1, Theme::BORDER);
+    fn draw_prompt_timeline(
+        &mut self,
+        canvas: &mut dyn SurfaceCanvas,
+        x: i32,
+        w: i32,
+        feed_top: i32,
+        feed_bottom: i32,
+    ) {
+        let p = self.palette.clone();
+        canvas.fill_rect(x + 2, feed_top, w - 4, feed_bottom - feed_top, p.bg_agent);
 
-        let chip_w = (w - 24) / 3;
-        self.draw_button(
+        self.draw_section_title(
             canvas,
-            UiRect::new(x + 6, comp_top + 6, chip_w, 22),
-            "Explain Repo",
-            Theme::BG_CARD,
-            Theme::TEXT_SECONDARY,
-            Theme::BORDER,
-            Some(UiAction::QuickPrompt(
-                "Inspect the repository files and explain the architecture concisely.",
-            )),
-        );
-        self.draw_button(
-            canvas,
-            UiRect::new(x + 10 + chip_w, comp_top + 6, chip_w, 22),
-            "Diagnose",
-            Theme::BG_CARD,
-            Theme::ACCENT_AMBER,
-            Theme::BORDER,
-            Some(UiAction::QuickPrompt(
-                "Run diagnose_errors on this workspace and fix any compiler or test issues found.",
-            )),
-        );
-        self.draw_button(
-            canvas,
-            UiRect::new(x + 14 + chip_w * 2, comp_top + 6, chip_w, 22),
-            "Git Summary",
-            Theme::BG_CARD,
-            Theme::ACCENT_CYAN,
-            Theme::BORDER,
-            Some(UiAction::QuickPrompt(
-                "Check git status & diff and summarize all uncommitted changes.",
-            )),
+            x + PAD,
+            feed_top + 6,
+            w - 24,
+            &format!(
+                "PROMPT TIMELINE — {} turns · {} compacted",
+                self.active_session.messages.len(),
+                self.active_session.compacted_count
+            ),
         );
 
-        let box_rect = UiRect::new(x + 8, comp_top + 34, w - 16, 58);
-        let focused = self.focus == FocusTarget::AgentPrompt && self.settings_modal.is_none();
-        canvas.fill_rounded_rect(
-            box_rect.x,
-            box_rect.y,
-            box_rect.w,
-            box_rect.h,
-            6,
-            Theme::BG_INPUT,
-        );
-        canvas.stroke_rounded_rect(
-            box_rect.x,
-            box_rect.y,
-            box_rect.w,
-            box_rect.h,
-            6,
-            if focused {
-                Theme::BORDER_FOCUS
-            } else {
-                Theme::BORDER
-            },
-        );
-        self.push_hit(box_rect, UiAction::Focus(FocusTarget::AgentPrompt));
+        let row_h = 46;
+        let avail = ((feed_bottom - feed_top - 26).max(20) / row_h) as usize;
+        let total = self.active_session.messages.len();
+        let max_scroll = total.saturating_sub(avail.max(1));
+        if self.timeline_scroll > max_scroll {
+            self.timeline_scroll = max_scroll;
+        }
+        let msgs: Vec<(usize, crate::sqlite::ChatMessage)> = self
+            .active_session
+            .messages
+            .iter()
+            .enumerate()
+            .skip(self.timeline_scroll)
+            .take(avail)
+            .map(|(i, m)| (i, m.clone()))
+            .collect();
 
-        let prompt_disp = if self.agent_prompt.is_empty() && !focused {
-            "Ask AI Agent to build features, refactor files, or fix bugs...".to_string()
-        } else if focused && self.blink_phase {
-            format!("{}|", self.agent_prompt)
-        } else {
-            self.agent_prompt.clone()
-        };
-        let prompt_lines = wrap_text(&prompt_disp, wrap_cols);
-        let p_color = if self.agent_prompt.is_empty() && !focused {
-            Theme::TEXT_MUTED
-        } else {
-            Theme::TEXT_PRIMARY
-        };
-        for (idx, pl) in prompt_lines.iter().rev().take(3).rev().enumerate() {
+        canvas.push_clip(x + 2, feed_top + 22, w - 4, feed_bottom - feed_top - 22);
+        for (idx, msg) in msgs.into_iter() {
+            let ry = feed_top + 22 + idx as i32 * row_h - self.timeline_scroll as i32 * row_h;
+            let card = UiRect::new(x + PAD - 2, ry, w - PAD * 2 + 4, row_h - 6);
+            let is_user = msg.role == "user";
+            let hovered = card.contains(self.mouse_x, self.mouse_y);
+            canvas.fill_rounded_rect(
+                card.x,
+                card.y,
+                card.w,
+                card.h,
+                8,
+                if hovered { p.bg_card_hover } else { p.bg_card },
+            );
+            canvas.fill_rounded_rect(card.x + 8, card.y + 10, 22, 22, 6, if is_user { mix(p.accent, p.bg_card, 0.3) } else { p.bg_card_hover });
+            canvas.draw_text(
+                card.x + 12,
+                card.y + 14,
+                &format!("{}", idx + 1),
+                FontRole::UiSemibold,
+                if is_user { p.accent } else { p.success },
+            );
+            let stamp = crate::sqlite::short_time_label(&msg.created_at);
+            canvas.draw_text(card.x + 38, card.y + 5, &stamp, FontRole::UiSmall, p.accent_secondary);
+            let preview: String = msg.content.chars().take(64).collect();
             canvas.draw_text_clipped(
-                box_rect.x + 8,
-                box_rect.y + 6 + idx as i32 * 17,
-                box_rect.w - 16,
-                pl,
+                card.x + 38,
+                card.y + 20,
+                card.w - 48,
+                &if is_user {
+                    format!("{} {}", glyph("user"), preview)
+                } else {
+                    format!("{} {}", glyph("spark"), preview)
+                },
                 FontRole::UiSmall,
-                p_color,
+                p.text_secondary,
+            );
+            if !msg.tools.is_empty() {
+                canvas.draw_text(
+                    card.x + card.w - 78,
+                    card.y + 5,
+                    &format!("{} tools", msg.tools.len()),
+                    FontRole::UiSmall,
+                    p.warning,
+                );
+            }
+            // Jump to this turn in the chat
+            self.push_hit(card, UiAction::ScrollToMessage(idx));
+            // Fork from this prompt
+            let fork_rect = UiRect::new(card.x + card.w - 74, card.y + card.h - 20, 66, 17);
+            self.draw_button(
+                canvas,
+                fork_rect,
+                "Fork",
+                mix(p.purple, p.bg_card, 0.35),
+                p.purple,
+                p.border_subtle,
+                Some(UiAction::ForkFromMessage(idx)),
             );
         }
+        canvas.pop_clip();
 
-        canvas.draw_text(
-            x + 10,
-            comp_top + 98,
-            "Enter: Run  |  Shift+Enter: Newline",
-            FontRole::UiSmall,
-            Theme::TEXT_MUTED,
+        // Timeline action row
+        self.draw_button(
+            canvas,
+            UiRect::new(x + PAD, feed_bottom - 26, (w - PAD * 2 - 8) / 2, 22),
+            "Compact Session",
+            p.bg_card,
+            p.warning,
+            p.border_subtle,
+            Some(UiAction::CompactActiveSession),
         );
         self.draw_button(
             canvas,
-            UiRect::new(x + w - 104, comp_top + 96, 96, 26),
-            if self.agent_running {
-                "Running..."
-            } else {
-                "Run Agent"
-            },
-            if self.agent_running {
-                Theme::BG_BUTTON
-            } else {
-                Theme::ACCENT_BLUE
-            },
-            0xFFFFFF,
-            Theme::ACCENT_BLUE,
-            Some(UiAction::SendAgentPrompt),
+            UiRect::new(x + PAD + (w - PAD * 2 - 8) / 2 + 8, feed_bottom - 26, (w - PAD * 2 - 8) / 2, 22),
+            "Fork Whole Session",
+            p.bg_card,
+            p.purple,
+            p.border_subtle,
+            Some(UiAction::ForkActiveSession),
         );
     }
 
     fn draw_status_footer(&mut self, canvas: &mut dyn SurfaceCanvas) {
-        let h = 24;
+        let p = self.palette.clone();
+        let h = FOOTER_H;
         let y = self.height - h;
-        canvas.fill_rect(0, y, self.width, h, Theme::BG_TITLEBAR);
-        canvas.draw_hline(0, y, self.width, Theme::BORDER);
+        canvas.fill_rect(0, y, self.width, h, p.bg_header);
+        canvas.draw_hline(0, y, self.width, p.border_subtle);
 
         let left_info = format!(
-            "  Branch: {}   |   Mode: {}   |   Provider: {} ({})",
+            "  {} {}   ·   {} mode   ·   {} {}   ·   {} effort   ·   {}",
+            glyph("branch"),
             if self.git_snapshot.is_repo {
                 &self.git_snapshot.branch
             } else {
                 "no-git"
             },
-            self.settings.default_mode.to_uppercase(),
+            self.active_mode.to_uppercase(),
             self.settings.active_provider,
-            self.settings.active_model
+            self.settings.active_model,
+            self.settings.agent_effort.to_uppercase(),
+            self.palette.name,
         );
-        canvas.draw_text_clipped(
-            6,
-            y + 4,
-            self.width / 2,
-            &left_info,
-            FontRole::UiSmall,
-            Theme::TEXT_SECONDARY,
-        );
+        canvas.draw_text_clipped(6, y + 5, self.width / 2, &left_info, FontRole::UiSmall, p.text_secondary);
 
         let right_info = if self.toast_ticks > 0 {
-            self.toast_text.clone()
+            truncate_right(&self.toast_text, (self.width / 2 / 6) as usize)
         } else if let Some(tab) = self.tabs.get(self.active_tab) {
             if let TabContent::Code {
                 lines,
@@ -3152,615 +5146,604 @@ impl StudioApp {
             } = &tab.content
             {
                 format!(
-                    "Ln {}, Col {}  |  {} lines  |  UTF-8  |  Pure-Rust Native GUI",
+                    "Ln {}, Col {}  ·  {} lines  ·  {}",
                     cursor_line + 1,
                     cursor_col + 1,
-                    lines.len()
+                    lines.len(),
+                    tab.rel_path
                 )
             } else {
-                "Side-by-Side Diff Viewer  |  Pure-Rust Native GUI".to_string()
+                "Side-by-Side Diff Viewer  ·  Pure-Rust Native GUI".to_string()
             }
         } else {
-            "100% Pure Rust Native GUI (Win32 GDI + ConPTY + WinHTTP + SQLite)".to_string()
+            "100% Pure-Rust Native GUI — no WebView, no HTML/JS".to_string()
         };
         let tw = canvas.measure_text_width(&right_info, FontRole::UiSmall);
         canvas.draw_text_clipped(
             (self.width - tw - 14).max(self.width / 2),
-            y + 4,
+            y + 5,
             self.width / 2,
             &right_info,
             FontRole::UiSmall,
-            if self.toast_ticks > 0 {
-                Theme::ACCENT_CYAN
-            } else {
-                Theme::TEXT_MUTED
-            },
+            p.text_secondary,
         );
     }
+}
 
-    fn draw_settings_modal(&mut self, canvas: &mut dyn SurfaceCanvas, tab: SettingsTab) {
-        let mw = 760.min(self.width - 60);
-        let mh = 545.min(self.height - 50);
+// ---------------------------------------------------------------------------
+// Overlays: command palette, /connect wizard, theme picker, safety settings
+// ---------------------------------------------------------------------------
+impl StudioApp {
+    fn draw_command_palette(&mut self, canvas: &mut dyn SurfaceCanvas) {
+        let p = self.palette.clone();
+        let mw = 720.min(self.width - 80);
+        let mh = 460.min(self.height - 120);
         let mx = (self.width - mw) / 2;
-        let my = (self.height - mh) / 2;
+        let my = (self.height - mh) / 3;
+        canvas.fill_rect(0, 0, self.width, self.height, 0x40000000);
+        canvas.fill_rounded_rect(mx, my, mw, mh, 14, p.bg_modal);
+        canvas.stroke_rounded_rect(mx, my, mw, mh, 14, p.accent);
 
-        canvas.fill_rounded_rect(mx, my, mw, mh, 8, Theme::BG_MODAL);
-        canvas.stroke_rounded_rect(mx, my, mw, mh, 8, Theme::ACCENT_CYAN);
-
+        canvas.draw_text(mx + 20, my + 16, "Command Palette", FontRole::UiTitle, p.text_primary);
         canvas.draw_text(
             mx + 20,
-            my + 14,
-            "Settings & SQLite Audit Store",
-            FontRole::UiTitle,
-            Theme::TEXT_PRIMARY,
+            my + 38,
+            "Fuzzy search commands & files — ↑↓ to navigate, Enter to run, Esc to close",
+            FontRole::UiSmall,
+            p.text_muted,
+        );
+
+        let inp = UiRect::new(mx + 20, my + 58, mw - 40, 36);
+        self.draw_text_input(
+            canvas,
+            inp,
+            self.palette_query.clone().as_str(),
+            "> type a command, or a file name...",
+            true,
+            FontRole::UiRegular,
+            UiAction::Focus(FocusTarget::CommandPaletteInput),
+        );
+
+        let items = self.palette_entries();
+        let list_y = my + 108;
+        let row_h = 40;
+        let avail = ((mh - 130) / row_h).max(3) as usize;
+        canvas.push_clip(mx, list_y, mw, mh - 120);
+        for (i, item) in items.iter().take(avail).enumerate() {
+            let ry = list_y + i as i32 * row_h;
+            let row = UiRect::new(mx + 12, ry, mw - 24, row_h - 4);
+            let selected = i == self.palette_index;
+            let hovered = row.contains(self.mouse_x, self.mouse_y);
+            if selected {
+                canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 8, mix(p.accent, p.bg_modal, 0.18));
+                canvas.stroke_rounded_rect(row.x, row.y, row.w, row.h, 8, p.accent);
+            } else if hovered {
+                canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 8, p.bg_card);
+            }
+            let badge = if item.is_file { "FILE" } else { "CMD" };
+            canvas.fill_rounded_rect(row.x + 8, row.y + 8, 42, 18, 5, if item.is_file { p.bg_button } else { p.accent });
+            canvas.draw_text(
+                row.x + 14,
+                row.y + 10,
+                badge,
+                FontRole::UiSmall,
+                if item.is_file { p.text_muted } else { p.on_accent_text(p.accent) },
+            );
+            canvas.draw_text_clipped(
+                row.x + 58,
+                row.y + 5,
+                row.w - 150,
+                &truncate_right(&item.title, 52),
+                FontRole::UiSemibold,
+                p.text_primary,
+            );
+            canvas.draw_text_clipped(
+                row.x + 58,
+                row.y + 21,
+                row.w - 150,
+                &truncate_right(&item.subtitle, 62),
+                FontRole::UiSmall,
+                p.text_muted,
+            );
+            if !item.shortcut.is_empty() {
+                canvas.draw_text_clipped(
+                    row.x + row.w - 84,
+                    row.y + 12,
+                    78,
+                    &item.shortcut,
+                    FontRole::UiSmall,
+                    p.accent_secondary,
+                );
+            }
+            self.push_hit(row, UiAction::ExecuteCommandId(item.id.clone()));
+        }
+        canvas.pop_clip();
+    }
+
+    fn draw_connect_wizard(&mut self, canvas: &mut dyn SurfaceCanvas) {
+        let p = self.palette.clone();
+        let mw = 760.min(self.width - 60);
+        let mh = 520.min(self.height - 80);
+        let mx = (self.width - mw) / 2;
+        let my = (self.height - mh) / 2;
+        canvas.fill_rect(0, 0, self.width, self.height, 0x40000000);
+        canvas.fill_rounded_rect(mx, my, mw, mh, 14, p.bg_modal);
+        canvas.stroke_rounded_rect(mx, my, mw, mh, 14, p.accent);
+
+        canvas.draw_text(mx + 24, my + 18, "Connect AI Provider", FontRole::UiTitle, p.text_primary);
+        canvas.draw_text(
+            mx + 24,
+            my + 42,
+            "Guided setup — auto-detect local keys, paste from clipboard, or use the OpenCode auth workaround.",
+            FontRole::UiSmall,
+            p.text_secondary,
+        );
+
+        // Provider cards
+        let guides = PROVIDER_GUIDES;
+        let card_w = (mw - 48 - 12 * (guides.len() as i32 - 1)) / guides.len() as i32;
+        let card_h = 96;
+        for (i, g) in guides.iter().enumerate() {
+            let cx = mx + 24 + i as i32 * (card_w + 12);
+            let rect = UiRect::new(cx, my + 64, card_w, card_h);
+            let selected = self.connect.provider_id == g.id;
+            let hovered = rect.contains(self.mouse_x, self.mouse_y);
+            canvas.fill_rounded_rect(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                8,
+                if selected { mix(p.accent, p.bg_modal, 0.2) } else if hovered { p.bg_card_hover } else { p.bg_card },
+            );
+            canvas.stroke_rounded_rect(rect.x, rect.y, rect.w, rect.h, 8, if selected { p.accent } else { p.border_subtle });
+            canvas.draw_text_clipped(rect.x + 10, rect.y + 8, rect.w - 20, g.display_name, FontRole::UiSemibold, p.text_primary);
+            canvas.fill_rounded_rect(rect.x + 10, rect.y + 26, 78, 16, 5, p.bg_button);
+            canvas.draw_text(rect.x + 14, rect.y + 28, g.badge, FontRole::UiSmall, p.accent_secondary);
+            for (li, line) in wrap_text(g.tagline, (((rect.w - 20) / 6).max(14)) as usize).into_iter().take(3).enumerate() {
+                canvas.draw_text_clipped(rect.x + 10, rect.y + 48 + li as i32 * 14, rect.w - 20, &line, FontRole::UiSmall, p.text_muted);
+            }
+            self.push_hit(rect, UiAction::SelectConnectProvider(g.id));
+        }
+
+        let guide = self.connect_provider_guide();
+        let mut y = my + card_h + 82;
+
+        // Detected credentials
+        canvas.draw_text(mx + 24, y, "Auto-detected credentials", FontRole::UiSemibold, p.text_primary);
+        y += 20;
+        if self.connect.detected_summary.is_empty() {
+            canvas.draw_text(
+                mx + 24,
+                y,
+                "Nothing detected yet — env vars, ~/.local/share/opencode/auth.json and local servers are scanned.",
+                FontRole::UiSmall,
+                p.text_muted,
+            );
+        } else {
+            for s in self.connect.detected_summary.clone().into_iter().take(4) {
+                canvas.draw_text(mx + 24, y, &format!("{} {}", glyph("check"), s), FontRole::UiSmall, p.success);
+                y += 16;
+            }
+        }
+        y += 6;
+        let half = (mw - 48 - 12) / 2;
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + 24, y, half, 28),
+            "Import Detected Auth",
+            p.bg_card,
+            p.success,
+            p.border_subtle,
+            Some(UiAction::ImportDetectedAuth),
         );
         self.draw_button(
             canvas,
-            UiRect::new(mx + mw - 76, my + 10, 62, 26),
-            "Close",
-            Theme::BG_BUTTON,
-            Theme::TEXT_SECONDARY,
-            Theme::BORDER,
+            UiRect::new(mx + 24 + half + 12, y, half, 28),
+            "Spawn opencode serve (bridge)",
+            p.bg_card,
+            p.purple,
+            p.border_subtle,
+            Some(UiAction::SpawnLocalOpenCodeServe),
+        );
+        y += 40;
+
+        // Key entry row
+        canvas.draw_text(mx + 24, y, "API key / token", FontRole::UiSemibold, p.text_primary);
+        y += 20;
+        let key_w = mw - 48 - 120;
+        let key_rect = UiRect::new(mx + 24, y, key_w, 32);
+        self.draw_text_input(
+            canvas,
+            key_rect,
+            self.connect.key_input.clone().as_str(),
+            "sk-... (paste your key, or leave empty for OpenCode Zen public mode)",
+            self.focus == FocusTarget::ConnectKeyInput,
+            FontRole::TerminalMono,
+            UiAction::Focus(FocusTarget::ConnectKeyInput),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + 24 + key_w + 8, y, 112, 32),
+            "Paste",
+            p.bg_button,
+            p.text_secondary,
+            p.border_subtle,
+            Some(UiAction::PasteKeyFromClipboard),
+        );
+        y += 44;
+
+        // Model + URL row
+        let model_rect = UiRect::new(mx + 24, y, (mw - 60) / 2, 30);
+        self.draw_text_input(
+            canvas,
+            model_rect,
+            self.connect.model.clone().as_str(),
+            "model id",
+            self.focus == FocusTarget::ConnectModelInput,
+            FontRole::TerminalMono,
+            UiAction::Focus(FocusTarget::ConnectModelInput),
+        );
+        let url_rect = UiRect::new(mx + 24 + (mw - 60) / 2 + 12, y, (mw - 60) / 2, 30);
+        self.draw_text_input(
+            canvas,
+            url_rect,
+            self.connect.url_input.clone().as_str(),
+            "http://127.0.0.1:4096",
+            self.focus == FocusTarget::ConnectUrlInput,
+            FontRole::TerminalMono,
+            UiAction::Focus(FocusTarget::ConnectUrlInput),
+        );
+        y += 42;
+
+        // OpenCode auth mode
+        canvas.draw_text(mx + 24, y, "OpenCode auth mode", FontRole::UiSemibold, p.text_primary);
+        y += 22;
+        let mode_w = (mw - 48 - 24) / 3;
+        self.draw_pill(
+            canvas,
+            UiRect::new(mx + 24, y, mode_w, 28),
+            "Zen (public key)",
+            self.connect.opencode_auth_mode == "zen",
+            Some(UiAction::SetOpenCodeAuthMode("zen")),
+        );
+        self.draw_pill(
+            canvas,
+            UiRect::new(mx + 24 + mode_w + 12, y, mode_w, 28),
+            "opencode serve",
+            self.connect.opencode_auth_mode == "local-serve",
+            Some(UiAction::SetOpenCodeAuthMode("local-serve")),
+        );
+        self.draw_pill(
+            canvas,
+            UiRect::new(mx + 24 + (mode_w + 12) * 2, y, mode_w, 28),
+            "Ollama local",
+            self.connect.provider_id == "ollama",
+            Some(UiAction::SelectConnectProvider("ollama")),
+        );
+        y += 40;
+
+        // Footer actions
+        let help = format!(
+            "{} {} — {}. Keys are stored in your local SQLite settings only.",
+            glyph("lock"),
+            guide.display_name,
+            guide.tagline
+        );
+        canvas.draw_text_clipped(mx + 24, y, mw - 48, &help, FontRole::UiSmall, p.text_muted);
+        let fy = my + mh - 52;
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + 24, fy, 200, 34),
+            &format!("Open {}", guide.display_name),
+            p.bg_card,
+            p.accent_secondary,
+            p.border_subtle,
+            Some(UiAction::OpenProviderKeyUrl(guide.key_url, true)),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + 232, fy, 170, 34),
+            "Preview in Browser",
+            p.bg_card,
+            p.purple,
+            p.border_subtle,
+            Some(UiAction::OpenProviderKeyUrl(guide.key_url, false)),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + mw - 240, fy, 100, 34),
+            "Cancel",
+            p.bg_button,
+            p.text_secondary,
+            p.border_subtle,
             Some(UiAction::CloseModal),
         );
-
-        let tabs = [
-            (SettingsTab::Providers, "AI Providers & Keys"),
-            (SettingsTab::Permissions, "Safety & Shell"),
-            (SettingsTab::ToolAudit, "SQLite Tool History"),
-        ];
-        for (i, (st, label)) in tabs.iter().enumerate() {
-            self.draw_button(
-                canvas,
-                UiRect::new(mx + 20 + i as i32 * 184, my + 44, 176, 28),
-                label,
-                if *st == tab {
-                    Theme::ACCENT_BLUE
-                } else {
-                    Theme::BG_CARD
-                },
-                0xFFFFFF,
-                Theme::BORDER,
-                Some(UiAction::SwitchSettingsTab(*st)),
-            );
-        }
-
-        let mut y = my + 84;
-        match tab {
-            SettingsTab::Providers => {
-                canvas.draw_text(
-                    mx + 20,
-                    y,
-                    "Active Provider:",
-                    FontRole::UiSemibold,
-                    Theme::TEXT_SECONDARY,
-                );
-                let provs: [&'static str; 6] = [
-                    "ollama",
-                    "openai",
-                    "anthropic",
-                    "gemini",
-                    "openrouter",
-                    "custom",
-                ];
-                for (i, p) in provs.iter().enumerate() {
-                    let active = self.settings_draft.active_provider == *p;
-                    self.draw_button(
-                        canvas,
-                        UiRect::new(mx + 140 + i as i32 * 96, y - 4, 90, 26),
-                        &p.to_uppercase(),
-                        if active {
-                            Theme::ACCENT_CYAN
-                        } else {
-                            Theme::BG_CARD
-                        },
-                        if active { 0x041019 } else { Theme::TEXT_PRIMARY },
-                        Theme::BORDER,
-                        Some(UiAction::SelectSettingsProvider(p)),
-                    );
-                }
-                y += 36;
-
-                let model_val = self.settings_draft.active_model.clone();
-                self.draw_modal_input_row(
-                    canvas,
-                    mx + 20,
-                    y,
-                    mw - 170,
-                    "Active Model:",
-                    &model_val,
-                    false,
-                    FocusTarget::SettingsModel,
-                );
-                self.draw_button(
-                    canvas,
-                    UiRect::new(mx + mw - 140, y, 120, 26),
-                    "Probe Ollama",
-                    Theme::BG_BUTTON,
-                    Theme::ACCENT_GREEN,
-                    Theme::BORDER,
-                    Some(UiAction::ProbeOllama),
-                );
-                y += 34;
-
-                if !self.ollama_models.is_empty() {
-                    let mut ox = mx + 150;
-                    let models = self.ollama_models.clone();
-                    for m in models.into_iter().take(4) {
-                        let short = truncate_right(&m, 16);
-                        self.draw_button(
-                            canvas,
-                            UiRect::new(ox, y - 2, 136, 22),
-                            &short,
-                            Theme::BG_CARD,
-                            Theme::ACCENT_CYAN,
-                            Theme::BORDER,
-                            Some(UiAction::SelectPresetModel(m)),
-                        );
-                        ox += 142;
-                    }
-                    y += 28;
-                }
-
-                let oai = self.settings_draft.openai_api_key.clone();
-                self.draw_modal_input_row(
-                    canvas,
-                    mx + 20,
-                    y,
-                    mw - 40,
-                    "OpenAI API Key:",
-                    &oai,
-                    true,
-                    FocusTarget::SettingsOpenAiKey,
-                );
-                y += 34;
-
-                let ant = self.settings_draft.anthropic_api_key.clone();
-                self.draw_modal_input_row(
-                    canvas,
-                    mx + 20,
-                    y,
-                    mw - 40,
-                    "Anthropic Key:",
-                    &ant,
-                    true,
-                    FocusTarget::SettingsAnthropicKey,
-                );
-                y += 34;
-
-                let gem = self.settings_draft.gemini_api_key.clone();
-                self.draw_modal_input_row(
-                    canvas,
-                    mx + 20,
-                    y,
-                    mw - 40,
-                    "Gemini API Key:",
-                    &gem,
-                    true,
-                    FocusTarget::SettingsGeminiKey,
-                );
-                y += 34;
-
-                let or_key = self.settings_draft.openrouter_api_key.clone();
-                self.draw_modal_input_row(
-                    canvas,
-                    mx + 20,
-                    y,
-                    mw - 40,
-                    "OpenRouter Key:",
-                    &or_key,
-                    true,
-                    FocusTarget::SettingsOpenRouterKey,
-                );
-                y += 34;
-
-                let oll_url = self.settings_draft.ollama_base_url.clone();
-                self.draw_modal_input_row(
-                    canvas,
-                    mx + 20,
-                    y,
-                    mw - 40,
-                    "Ollama Base URL:",
-                    &oll_url,
-                    false,
-                    FocusTarget::SettingsOllamaUrl,
-                );
-                y += 34;
-
-                let cust_url = self.settings_draft.custom_base_url.clone();
-                self.draw_modal_input_row(
-                    canvas,
-                    mx + 20,
-                    y,
-                    mw - 40,
-                    "Custom API URL:",
-                    &cust_url,
-                    false,
-                    FocusTarget::SettingsCustomUrl,
-                );
-                y += 34;
-
-                let cust_key = self.settings_draft.custom_api_key.clone();
-                self.draw_modal_input_row(
-                    canvas,
-                    mx + 20,
-                    y,
-                    mw - 40,
-                    "Custom API Key:",
-                    &cust_key,
-                    true,
-                    FocusTarget::SettingsCustomKey,
-                );
-            }
-            SettingsTab::Permissions => {
-                let toggles: [(&'static str, &str, bool); 3] = [
-                    (
-                        "require_shell_approval",
-                        "Require explicit approval before Agent runs shell/PowerShell commands",
-                        self.settings_draft.require_shell_approval,
-                    ),
-                    (
-                        "require_delete_confirmation",
-                        "Require confirmation dialog before deleting workspace files",
-                        self.settings_draft.require_delete_confirmation,
-                    ),
-                    (
-                        "restrict_to_workspace",
-                        "Strict Workspace Sandbox (prevent file writes outside active folder)",
-                        self.settings_draft.restrict_to_workspace,
-                    ),
-                ];
-                for (field, desc, val) in toggles {
-                    canvas.fill_rounded_rect(mx + 20, y, mw - 40, 38, 6, Theme::BG_CARD);
-                    canvas.draw_text(mx + 32, y + 10, desc, FontRole::UiSmall, Theme::TEXT_PRIMARY);
-                    self.draw_button(
-                        canvas,
-                        UiRect::new(mx + mw - 104, y + 6, 72, 26),
-                        if val { "ENABLED" } else { "OFF" },
-                        if val {
-                            Theme::ACCENT_GREEN
-                        } else {
-                            Theme::BG_BUTTON
-                        },
-                        if val { 0x04120B } else { Theme::TEXT_SECONDARY },
-                        Theme::BORDER,
-                        Some(UiAction::ToggleSettingBool(field)),
-                    );
-                    y += 46;
-                }
-
-                canvas.fill_rounded_rect(mx + 20, y, mw - 40, 38, 6, Theme::BG_CARD);
-                canvas.draw_text(
-                    mx + 32,
-                    y + 10,
-                    &format!(
-                        "Max Autonomous Loop Iterations per Turn: {}",
-                        self.settings_draft.max_agent_iterations
-                    ),
-                    FontRole::UiSmall,
-                    Theme::TEXT_PRIMARY,
-                );
-                self.draw_button(
-                    canvas,
-                    UiRect::new(mx + mw - 116, y + 6, 38, 26),
-                    "-",
-                    Theme::BG_BUTTON,
-                    Theme::TEXT_PRIMARY,
-                    Theme::BORDER,
-                    Some(UiAction::AdjustMaxIters(-2)),
-                );
-                self.draw_button(
-                    canvas,
-                    UiRect::new(mx + mw - 72, y + 6, 38, 26),
-                    "+",
-                    Theme::BG_BUTTON,
-                    Theme::TEXT_PRIMARY,
-                    Theme::BORDER,
-                    Some(UiAction::AdjustMaxIters(2)),
-                );
-                y += 46;
-
-                canvas.fill_rounded_rect(mx + 20, y, mw - 40, 38, 6, Theme::BG_CARD);
-                canvas.draw_text(
-                    mx + 32,
-                    y + 10,
-                    &format!(
-                        "Code Editor Font Size: {} pt",
-                        self.settings_draft.editor_font_size
-                    ),
-                    FontRole::UiSmall,
-                    Theme::TEXT_PRIMARY,
-                );
-                self.draw_button(
-                    canvas,
-                    UiRect::new(mx + mw - 116, y + 6, 38, 26),
-                    "-",
-                    Theme::BG_BUTTON,
-                    Theme::TEXT_PRIMARY,
-                    Theme::BORDER,
-                    Some(UiAction::AdjustFontSize(-1)),
-                );
-                self.draw_button(
-                    canvas,
-                    UiRect::new(mx + mw - 72, y + 6, 38, 26),
-                    "+",
-                    Theme::BG_BUTTON,
-                    Theme::TEXT_PRIMARY,
-                    Theme::BORDER,
-                    Some(UiAction::AdjustFontSize(1)),
-                );
-                y += 46;
-
-                canvas.fill_rounded_rect(mx + 20, y, mw - 40, 38, 6, Theme::BG_CARD);
-                canvas.draw_text(
-                    mx + 32,
-                    y + 10,
-                    "Default Windows ConPTY Terminal Shell:",
-                    FontRole::UiSmall,
-                    Theme::TEXT_PRIMARY,
-                );
-                let sh_lbl = self.settings_draft.default_shell.to_uppercase();
-                self.draw_button(
-                    canvas,
-                    UiRect::new(mx + mw - 134, y + 6, 102, 26),
-                    &sh_lbl,
-                    Theme::BG_BUTTON,
-                    Theme::ACCENT_CYAN,
-                    Theme::BORDER,
-                    Some(UiAction::ToggleDefaultShell),
-                );
-            }
-            SettingsTab::ToolAudit => {
-                canvas.draw_text(
-                    mx + 20,
-                    y,
-                    "Recent Autonomous Tool Executions (persisted in local SQLite agent.db):",
-                    FontRole::UiSmall,
-                    Theme::TEXT_SECONDARY,
-                );
-                y += 24;
-                let max_rows = ((mh - 170) / 26) as usize;
-                let audit_rows = self.tool_audit_log.clone();
-                for rec in audit_rows.into_iter().take(max_rows) {
-                    canvas.fill_rounded_rect(mx + 20, y, mw - 40, 23, 4, Theme::BG_CARD);
-                    let st_col = if rec.status == "ok" {
-                        Theme::ACCENT_GREEN
-                    } else {
-                        Theme::ACCENT_RED
-                    };
-                    canvas.draw_text(
-                        mx + 28,
-                        y + 3,
-                        &rec.status.to_uppercase(),
-                        FontRole::TerminalMono,
-                        st_col,
-                    );
-                    canvas.draw_text(
-                        mx + 74,
-                        y + 3,
-                        &rec.tool_name,
-                        FontRole::TerminalMono,
-                        Theme::ACCENT_CYAN,
-                    );
-                    canvas.draw_text_clipped(
-                        mx + 210,
-                        y + 3,
-                        mw - 310,
-                        &rec.result_summary,
-                        FontRole::UiSmall,
-                        Theme::TEXT_SECONDARY,
-                    );
-                    canvas.draw_text(
-                        mx + mw - 84,
-                        y + 3,
-                        &format!("{}ms", rec.duration_ms),
-                        FontRole::TerminalMono,
-                        Theme::TEXT_MUTED,
-                    );
-                    y += 26;
-                }
-            }
-        }
-
         self.draw_button(
             canvas,
-            UiRect::new(mx + mw - 176, my + mh - 42, 156, 30),
-            "Save to SQLite",
-            Theme::ACCENT_GREEN,
-            0x04120B,
-            Theme::ACCENT_GREEN,
-            Some(UiAction::SaveSettingsModal),
+            UiRect::new(mx + mw - 132, fy, 108, 34),
+            "Connect",
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
+            Some(UiAction::SaveConnectWizard),
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn draw_modal_input_row(
-        &mut self,
-        canvas: &mut dyn SurfaceCanvas,
-        x: i32,
-        y: i32,
-        total_w: i32,
-        label: &str,
-        value: &str,
-        secret: bool,
-        target: FocusTarget,
-    ) {
-        canvas.draw_text(x, y + 5, label, FontRole::UiSmall, Theme::TEXT_SECONDARY);
-        let inp = UiRect::new(x + 130, y, total_w - 130, 26);
-        let focused = self.focus == target;
-        canvas.fill_rounded_rect(inp.x, inp.y, inp.w, inp.h, 4, Theme::BG_INPUT);
-        canvas.stroke_rounded_rect(
-            inp.x,
-            inp.y,
-            inp.w,
-            inp.h,
-            4,
-            if focused {
-                Theme::BORDER_FOCUS
-            } else {
-                Theme::BORDER
-            },
+    fn draw_theme_picker(&mut self, canvas: &mut dyn SurfaceCanvas) {
+        let p = self.palette.clone();
+        let mw = 620.min(self.width - 60);
+        let mh = 400.min(self.height - 80);
+        let mx = (self.width - mw) / 2;
+        let my = (self.height - mh) / 2;
+        canvas.fill_rect(0, 0, self.width, self.height, 0x40000000);
+        canvas.fill_rounded_rect(mx, my, mw, mh, 14, p.bg_modal);
+        canvas.stroke_rounded_rect(mx, my, mw, mh, 14, p.accent);
+        canvas.draw_text(mx + 24, my + 18, "Color Theme", FontRole::UiTitle, p.text_primary);
+        canvas.draw_text(
+            mx + 24,
+            my + 42,
+            "Pick a built-in theme, or drop a custom .aircode/theme.json into your workspace.",
+            FontRole::UiSmall,
+            p.text_secondary,
         );
-        let masked = if secret && !focused && !value.is_empty() {
-            let tail: String = value
-                .chars()
-                .rev()
-                .take(4)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            format!("****************{}", tail)
-        } else if focused && self.blink_phase {
-            format!("{}|", value)
-        } else if value.is_empty() {
-            "(click to type or Ctrl+V to paste)".to_string()
-        } else {
-            value.to_string()
-        };
+
+        let themes = ThemePalette::builtin_list();
+        let row_h = 46;
+        for (i, (id, name)) in themes.iter().enumerate() {
+            let ry = my + 68 + i as i32 * row_h;
+            let rect = UiRect::new(mx + 24, ry, mw - 48, row_h - 8);
+            let selected = self.settings.theme == *id;
+            let hovered = rect.contains(self.mouse_x, self.mouse_y);
+            canvas.fill_rounded_rect(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                8,
+                if selected { mix(p.accent, p.bg_modal, 0.18) } else if hovered { p.bg_card_hover } else { p.bg_card },
+            );
+            canvas.stroke_rounded_rect(rect.x, rect.y, rect.w, rect.h, 8, if selected { p.accent } else { p.border_subtle });
+
+            // Live color preview swatches
+            let swatch = ThemePalette::by_id(id, Some(&self.workspace));
+            let mut sx = rect.x + 12;
+            for col in [swatch.bg_app, swatch.bg_editor, swatch.accent, swatch.success, swatch.warning, swatch.purple] {
+                canvas.fill_rounded_rect(sx, rect.y + 12, 16, 16, 4, col);
+                sx += 20;
+            }
+            canvas.draw_text(rect.x + 150, rect.y + 12, name, FontRole::UiSemibold, p.text_primary);
+            if *id == "custom" {
+                canvas.draw_text(rect.x + 330, rect.y + 13, ".aircode/theme.json", FontRole::UiSmall, p.text_muted);
+            }
+            if selected {
+                canvas.draw_text(rect.x + rect.w - 76, rect.y + 12, "ACTIVE", FontRole::UiSmall, p.accent);
+            }
+            self.push_hit(rect, UiAction::ApplyTheme(id.to_string()));
+        }
+
+        let fy = my + mh - 52;
         canvas.draw_text_clipped(
-            inp.x + 8,
-            inp.y + 5,
-            inp.w - 16,
-            &masked,
-            FontRole::TerminalMono,
-            if value.is_empty() && !focused {
-                Theme::TEXT_MUTED
-            } else {
-                Theme::TEXT_PRIMARY
-            },
+            mx + 24,
+            fy + 10,
+            mw - 190,
+            "Themes apply instantly to the editor, terminal, agent panel & browser.",
+            FontRole::UiSmall,
+            p.text_muted,
         );
-        self.push_hit(inp, UiAction::Focus(target));
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + mw - 150, fy, 126, 34),
+            "Done",
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
+            Some(UiAction::CloseModal),
+        );
+    }
+
+    fn draw_safety_modal(&mut self, canvas: &mut dyn SurfaceCanvas) {
+        let p = self.palette.clone();
+        let mw = 560.min(self.width - 60);
+        let mh = 400.min(self.height - 80);
+        let mx = (self.width - mw) / 2;
+        let my = (self.height - mh) / 2;
+        canvas.fill_rect(0, 0, self.width, self.height, 0x40000000);
+        canvas.fill_rounded_rect(mx, my, mw, mh, 14, p.bg_modal);
+        canvas.stroke_rounded_rect(mx, my, mw, mh, 14, p.accent);
+        canvas.draw_text(mx + 24, my + 18, "Safety & Editor Preferences", FontRole::UiTitle, p.text_primary);
+        canvas.draw_text(
+            mx + 24,
+            my + 42,
+            "Permission gates, sandbox scope and editor typography.",
+            FontRole::UiSmall,
+            p.text_secondary,
+        );
+
+        let toggles: Vec<(&str, &str, bool)> = vec![
+            ("require_shell_approval", "Require approval before shell commands", self.settings.require_shell_approval),
+            ("require_delete_confirmation", "Confirm before deleting files", self.settings.require_delete_confirmation),
+            ("restrict_to_workspace", "Restrict file tools to the workspace", self.settings.restrict_to_workspace),
+            ("show_thinking", "Show AI thinking blocks", self.settings.show_thinking),
+            ("minimap", "Show editor minimap", self.show_minimap),
+        ];
+        let mut y = my + 72;
+        for (field, label, on) in toggles {
+            let rect = UiRect::new(mx + 24, y, mw - 48, 34);
+            let hovered = rect.contains(self.mouse_x, self.mouse_y);
+            if hovered {
+                canvas.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 6, p.bg_card);
+            }
+            canvas.draw_text(rect.x + 12, rect.y + 9, label, FontRole::UiSmall, p.text_primary);
+            let sw = UiRect::new(rect.x + rect.w - 62, rect.y + 6, 50, 22);
+            canvas.fill_rounded_rect(sw.x, sw.y, sw.w, sw.h, 11, if on { p.success } else { p.bg_button });
+            canvas.fill_rounded_rect(
+                sw.x + if on { 28 } else { 4 },
+                sw.y + 3,
+                16,
+                16,
+                8,
+                if on { p.on_accent_text(p.success) } else { p.text_muted },
+            );
+            canvas.draw_text(sw.x + 6, sw.y + 4, if on { "ON" } else { "OFF" }, FontRole::UiSmall, if on { p.on_accent_text(p.success) } else { p.text_muted });
+            self.push_hit(rect, UiAction::ToggleSettingBool(field));
+            y += 38;
+        }
+
+        // Font size
+        y += 6;
+        canvas.draw_text(mx + 24, y + 6, "Editor font size", FontRole::UiSemibold, p.text_primary);
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + 190, y, 40, 28),
+            "-",
+            p.bg_button,
+            p.text_primary,
+            p.border_subtle,
+            Some(UiAction::AdjustFontSize(-1)),
+        );
+        canvas.draw_text(mx + 240, y + 6, &format!("{} px", self.settings.editor_font_size), FontRole::UiSemibold, p.accent);
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + 300, y, 40, 28),
+            "+",
+            p.bg_button,
+            p.text_primary,
+            p.border_subtle,
+            Some(UiAction::AdjustFontSize(1)),
+        );
+
+        let fy = my + mh - 52;
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + 24, fy, 160, 34),
+            "Open /connect",
+            p.bg_card,
+            p.accent_secondary,
+            p.border_subtle,
+            Some(UiAction::OpenModal(ModalDialog::ConnectWizard)),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + mw - 150, fy, 126, 34),
+            "Done",
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
+            Some(UiAction::CloseModal),
+        );
     }
 
     fn draw_approval_modal(&mut self, canvas: &mut dyn SurfaceCanvas, req: &PermissionPrompt) {
-        let mw = 580.min(self.width - 40);
-        let mh = 230;
+        let p = self.palette.clone();
+        let mw = 520.min(self.width - 60);
+        let mh = 240;
         let mx = (self.width - mw) / 2;
         let my = (self.height - mh) / 2;
-
-        canvas.fill_rounded_rect(mx, my, mw, mh, 8, Theme::BG_MODAL);
-        canvas.stroke_rounded_rect(mx, my, mw, mh, 8, Theme::ACCENT_AMBER);
-        canvas.draw_text(
-            mx + 20,
-            my + 16,
-            &req.title,
-            FontRole::UiTitle,
-            Theme::ACCENT_AMBER,
-        );
-        canvas.draw_text_clipped(
-            mx + 20,
-            my + 44,
-            mw - 40,
-            &req.detail,
-            FontRole::UiSmall,
-            Theme::TEXT_SECONDARY,
-        );
-
-        canvas.fill_rounded_rect(mx + 20, my + 70, mw - 40, 86, 6, Theme::BG_INPUT);
-        for (i, line) in wrap_text(&req.command_or_path, ((mw - 60) / 8) as usize)
-            .into_iter()
-            .take(4)
-            .enumerate()
-        {
-            canvas.draw_text_clipped(
-                mx + 28,
-                my + 76 + i as i32 * 18,
-                mw - 56,
-                &line,
-                FontRole::TerminalMono,
-                Theme::TEXT_PRIMARY,
-            );
+        canvas.fill_rect(0, 0, self.width, self.height, 0x50000000);
+        canvas.fill_rounded_rect(mx, my, mw, mh, 14, p.bg_modal);
+        canvas.stroke_rounded_rect(mx, my, mw, mh, 14, p.warning);
+        canvas.draw_text(mx + 24, my + 20, "Permission Required", FontRole::UiTitle, p.warning);
+        canvas.draw_text_clipped(mx + 24, my + 48, mw - 48, &req.title, FontRole::UiSemibold, p.text_primary);
+        for (i, line) in wrap_text(&req.detail, ((mw - 60) / 7).max(20) as usize).into_iter().take(3).enumerate() {
+            canvas.draw_text_clipped(mx + 24, my + 72 + i as i32 * 17, mw - 48, &line, FontRole::UiSmall, p.text_secondary);
         }
-
-        self.draw_button(
-            canvas,
-            UiRect::new(mx + 20, my + mh - 46, 130, 30),
-            "Allow Once",
-            Theme::ACCENT_GREEN,
-            0x04120B,
-            Theme::ACCENT_GREEN,
-            Some(UiAction::ApprovePermission {
-                approved: true,
-                remember: false,
-            }),
+        canvas.fill_rounded_rect(mx + 24, my + 128, mw - 48, 30, 6, p.bg_input);
+        canvas.draw_text_clipped(
+            mx + 32,
+            my + 135,
+            mw - 64,
+            &truncate_right(&req.command_or_path, 66),
+            FontRole::TerminalMono,
+            p.accent_secondary,
         );
+        let bw = 120;
         self.draw_button(
             canvas,
-            UiRect::new(mx + 160, my + mh - 46, 170, 30),
-            "Allow for Session",
-            Theme::ACCENT_BLUE,
-            0xFFFFFF,
-            Theme::ACCENT_BLUE,
-            Some(UiAction::ApprovePermission {
-                approved: true,
-                remember: true,
-            }),
-        );
-        self.draw_button(
-            canvas,
-            UiRect::new(mx + mw - 120, my + mh - 46, 100, 30),
+            UiRect::new(mx + 24, my + mh - 52, bw, 34),
             "Deny",
-            Theme::ACCENT_RED,
-            0xFFFFFF,
-            Theme::ACCENT_RED,
+            p.bg_button,
+            p.danger,
+            p.border_subtle,
             Some(UiAction::ApprovePermission {
                 approved: false,
                 remember: false,
             }),
         );
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + 24 + bw + 12, my + mh - 52, bw, 34),
+            "Allow Once",
+            p.accent,
+            p.on_accent_text(p.accent),
+            p.accent,
+            Some(UiAction::ApprovePermission {
+                approved: true,
+                remember: false,
+            }),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + 24 + (bw + 12) * 2, my + mh - 52, bw, 34),
+            "Allow Always",
+            mix(p.success, p.bg_button, 0.5),
+            p.success,
+            p.border_subtle,
+            Some(UiAction::ApprovePermission {
+                approved: true,
+                remember: true,
+            }),
+        );
     }
 
     fn draw_delete_modal(&mut self, canvas: &mut dyn SurfaceCanvas, del: &DeleteConfirmState) {
-        let mw = 460.min(self.width - 40);
-        let mh = 165;
+        let p = self.palette.clone();
+        let mw = 460.min(self.width - 60);
+        let mh = 176;
         let mx = (self.width - mw) / 2;
         let my = (self.height - mh) / 2;
-
-        canvas.fill_rounded_rect(mx, my, mw, mh, 8, Theme::BG_MODAL);
-        canvas.stroke_rounded_rect(mx, my, mw, mh, 8, Theme::ACCENT_RED);
-        canvas.draw_text(
-            mx + 20,
-            my + 18,
-            "Confirm File Deletion",
-            FontRole::UiTitle,
-            Theme::ACCENT_RED,
-        );
+        canvas.fill_rect(0, 0, self.width, self.height, 0x50000000);
+        canvas.fill_rounded_rect(mx, my, mw, mh, 14, p.bg_modal);
+        canvas.stroke_rounded_rect(mx, my, mw, mh, 14, p.danger);
+        canvas.draw_text(mx + 24, my + 20, "Confirm Delete", FontRole::UiTitle, p.danger);
         canvas.draw_text_clipped(
-            mx + 20,
-            my + 52,
-            mw - 40,
-            &format!("Permanently delete '{}'?", del.rel_path),
-            FontRole::UiRegular,
-            Theme::TEXT_PRIMARY,
+            mx + 24,
+            my + 48,
+            mw - 48,
+            &format!("Delete '{}'? This cannot be undone.", del.rel_path),
+            FontRole::UiSmall,
+            p.text_secondary,
         );
         self.draw_button(
             canvas,
-            UiRect::new(mx + 20, my + mh - 46, 160, 30),
-            "Delete Permanently",
-            Theme::ACCENT_RED,
-            0xFFFFFF,
-            Theme::ACCENT_RED,
-            Some(UiAction::ConfirmFileDelete { confirmed: true }),
-        );
-        self.draw_button(
-            canvas,
-            UiRect::new(mx + mw - 120, my + mh - 46, 100, 30),
+            UiRect::new(mx + 24, my + mh - 56, 110, 34),
             "Cancel",
-            Theme::BG_BUTTON,
-            Theme::TEXT_PRIMARY,
-            Theme::BORDER,
+            p.bg_button,
+            p.text_secondary,
+            p.border_subtle,
             Some(UiAction::ConfirmFileDelete { confirmed: false }),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(mx + mw - 134, my + mh - 56, 110, 34),
+            "Delete",
+            mix(p.danger, p.bg_button, 0.5),
+            p.danger,
+            p.border_subtle,
+            Some(UiAction::ConfirmFileDelete { confirmed: true }),
         );
     }
 }
 
-impl DesktopAppHandler for StudioApp {
+// ---------------------------------------------------------------------------
+// Window event loop + top-level render
+// ---------------------------------------------------------------------------
+impl StudioApp {
     fn on_event(&mut self, event: WindowEvent) -> CursorShape {
         match event {
             WindowEvent::Resize { width, height } => {
-                self.width = width.max(640);
-                self.height = height.max(420);
+                self.width = width.max(760);
+                self.height = height.max(520);
             }
             WindowEvent::Tick => {
                 self.tick_counter = self.tick_counter.wrapping_add(1);
@@ -3778,16 +5761,17 @@ impl DesktopAppHandler for StudioApp {
 
                 if let Some(sp) = &self.active_splitter {
                     match sp {
-                        DragSplitter::LeftSidebar => {
-                            self.left_w = x.clamp(190, (self.width - self.right_w - 320).max(200));
+                        DragSplitter::LeftPanel => {
+                            let max_left = (self.width - self.right_w - 320).max(220);
+                            self.left_w = (x - RAIL_W).clamp(200, max_left);
                         }
                         DragSplitter::RightAgent => {
                             self.right_w = (self.width - x)
-                                .clamp(290, (self.width - self.left_w - 320).max(300));
+                                .clamp(300, (self.width - RAIL_W - self.left_w - 320).max(320));
                         }
                         DragSplitter::BottomTerminal => {
-                            let bottom = self.height - 24;
-                            self.term_h = (bottom - y).clamp(110, (self.height - 220).max(120));
+                            let bottom = self.height - FOOTER_H;
+                            self.term_h = (bottom - y).clamp(120, (self.height - 240).max(140));
                         }
                     }
                 } else if self.editor_dragging_selection {
@@ -3806,9 +5790,7 @@ impl DesktopAppHandler for StudioApp {
                     } else {
                         None
                     };
-                    if let (Some((row, col)), Some(tab)) =
-                        (hit, self.tabs.get_mut(self.active_tab))
-                    {
+                    if let (Some((row, col)), Some(tab)) = (hit, self.tabs.get_mut(self.active_tab)) {
                         if let TabContent::Code {
                             cursor_line,
                             cursor_col,
@@ -3829,6 +5811,7 @@ impl DesktopAppHandler for StudioApp {
             } => {
                 self.mouse_x = x;
                 self.mouse_y = y;
+                self.blink_phase = true;
 
                 let mut clicked_action = None;
                 for zone in self.hit_zones.iter().rev() {
@@ -3842,35 +5825,43 @@ impl DesktopAppHandler for StudioApp {
                     return self.compute_cursor();
                 }
 
-                if self.settings_modal.is_some()
+                if self.modal != ModalDialog::None
                     || self.pending_approval.is_some()
                     || self.pending_delete.is_some()
                 {
                     return self.compute_cursor();
                 }
 
-                let top = 44;
-                let bottom = self.height - 24;
+                let top = HEADER_H;
+                let bottom = self.height - FOOTER_H;
                 if y >= top && y < bottom {
-                    if (x - self.left_w).abs() <= 4 {
-                        self.active_splitter = Some(DragSplitter::LeftSidebar);
+                    let panel_x = if self.left_panel_open {
+                        RAIL_W + self.left_w
+                    } else {
+                        RAIL_W
+                    };
+                    if self.left_panel_open && (x - panel_x).abs() <= 4 {
+                        self.active_splitter = Some(DragSplitter::LeftPanel);
                         return CursorShape::ResizeH;
                     }
                     if (x - (self.width - self.right_w)).abs() <= 4 {
                         self.active_splitter = Some(DragSplitter::RightAgent);
                         return CursorShape::ResizeH;
                     }
-                    let term_top = bottom - self.term_h;
-                    if x > self.left_w
-                        && x < self.width - self.right_w
-                        && (y - term_top).abs() <= 4
-                    {
-                        self.active_splitter = Some(DragSplitter::BottomTerminal);
-                        return CursorShape::ResizeV;
+                    if self.terminal_open {
+                        let term_top = bottom - self.term_h;
+                        if x > panel_x
+                            && x < self.width - self.right_w
+                            && (y - term_top).abs() <= 4
+                        {
+                            self.active_splitter = Some(DragSplitter::BottomTerminal);
+                            return CursorShape::ResizeV;
+                        }
                     }
                 }
 
-                if self.editor_rect.contains(x, y) {
+                // Center editor click-to-caret
+                if self.center_view == CenterView::Editor && self.editor_rect.contains(x, y) {
                     self.focus = FocusTarget::Editor;
                     let hit = if let Some(tab) = self.tabs.get(self.active_tab) {
                         if let TabContent::Code {
@@ -3887,9 +5878,7 @@ impl DesktopAppHandler for StudioApp {
                     } else {
                         None
                     };
-                    if let (Some((row, col)), Some(tab)) =
-                        (hit, self.tabs.get_mut(self.active_tab))
-                    {
+                    if let (Some((row, col)), Some(tab)) = (hit, self.tabs.get_mut(self.active_tab)) {
                         if let TabContent::Code {
                             cursor_line,
                             cursor_col,
@@ -3917,7 +5906,7 @@ impl DesktopAppHandler for StudioApp {
                 button: MouseBtn::Right,
                 ..
             } => {
-                if x < self.left_w && self.left_tab == LeftTab::Explorer {
+                if x < RAIL_W + self.left_w && self.left_tab == LeftTab::Explorer {
                     let mut reveal = None;
                     for zone in self.hit_zones.iter().rev() {
                         if zone.rect.contains(x, y) {
@@ -3958,9 +5947,12 @@ impl DesktopAppHandler for StudioApp {
                 delta_lines,
                 shift,
             } => {
-                if self.settings_modal.is_none() {
+                if self.modal == ModalDialog::None {
                     let steps = (delta_lines as isize) * 3;
-                    if x < self.left_w {
+                    if x < RAIL_W {
+                        return self.compute_cursor();
+                    }
+                    if self.left_panel_open && x < RAIL_W + self.left_w {
                         match self.left_tab {
                             LeftTab::Explorer => {
                                 self.explorer_scroll =
@@ -3971,21 +5963,38 @@ impl DesktopAppHandler for StudioApp {
                                     (self.search_scroll as isize - steps).max(0) as usize;
                             }
                             LeftTab::Git => {
-                                self.git_scroll =
-                                    (self.git_scroll as isize - steps).max(0) as usize;
+                                self.git_scroll = (self.git_scroll as isize - steps).max(0) as usize;
+                            }
+                            LeftTab::Sessions => {
+                                self.sessions_scroll =
+                                    (self.sessions_scroll as isize - steps).max(0) as usize;
+                            }
+                            LeftTab::Extensions => {
+                                self.extensions_scroll =
+                                    (self.extensions_scroll as isize - steps).max(0) as usize;
                             }
                         }
                     } else if x >= self.width - self.right_w {
-                        self.agent_scroll_lines =
-                            (self.agent_scroll_lines as isize + steps).max(0) as usize;
-                    } else if self.term_grid_rect.contains(x, y) {
+                        match self.agent_panel_tab {
+                            AgentPanelTab::Chat => {
+                                self.agent_scroll_lines =
+                                    (self.agent_scroll_lines as isize + steps).max(0) as usize;
+                            }
+                            AgentPanelTab::Timeline => {
+                                self.timeline_scroll =
+                                    (self.timeline_scroll as isize - steps).max(0) as usize;
+                            }
+                        }
+                    } else if self.terminal_open && self.term_grid_rect.contains(x, y) {
                         if let Some(term) = self.terminals.get_mut(self.active_term) {
                             let max_sb = term.screen.scrollback.len();
-                            term.screen.scroll_offset = (term.screen.scroll_offset as isize
-                                + steps)
-                                .clamp(0, max_sb as isize)
-                                as usize;
+                            term.screen.scroll_offset = (term.screen.scroll_offset as isize + steps)
+                                .clamp(0, max_sb as isize) as usize;
                         }
+                    } else if self.center_view == CenterView::Browser
+                        && self.browser_rect.contains(x, y)
+                    {
+                        self.browser_scroll = (self.browser_scroll - (steps * 12) as i32).max(0);
                     } else if self.editor_rect.contains(x, y) {
                         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                             match &mut tab.content {
@@ -3996,8 +6005,7 @@ impl DesktopAppHandler for StudioApp {
                                     ..
                                 } => {
                                     if shift {
-                                        *scroll_x =
-                                            (*scroll_x as isize - steps * 2).max(0) as usize;
+                                        *scroll_x = (*scroll_x as isize - steps * 2).max(0) as usize;
                                     } else {
                                         let max_y = lines.len().saturating_sub(1);
                                         *scroll_y = (*scroll_y as isize - steps)
@@ -4024,26 +6032,41 @@ impl DesktopAppHandler for StudioApp {
     }
 
     fn render(&mut self, canvas: &mut dyn SurfaceCanvas) {
-        self.width = canvas.width().max(640);
-        self.height = canvas.height().max(420);
+        self.width = canvas.width().max(760);
+        self.height = canvas.height().max(520);
         self.hit_zones.clear();
 
-        canvas.clear(Theme::BG_APP);
+        canvas.clear(self.palette.bg_app);
 
-        let modal_open = self.settings_modal.is_some()
+        let modal_open = self.modal != ModalDialog::None
             || self.pending_approval.is_some()
             || self.pending_delete.is_some();
 
-        let top = 44;
-        let bottom = self.height - 24;
-        let center_x = self.left_w;
-        let center_w = (self.width - self.left_w - self.right_w).max(220);
-        let editor_h = (bottom - top - self.term_h).max(120);
+        let top = HEADER_H;
+        let bottom = self.height - FOOTER_H;
+        let panel_x = if self.left_panel_open {
+            RAIL_W + self.left_w
+        } else {
+            RAIL_W
+        };
+        let center_x = panel_x;
+        let center_w = (self.width - panel_x - self.right_w).max(220);
+        let term_h = if self.terminal_open {
+            self.term_h.min((bottom - top - 140).max(90))
+        } else {
+            0
+        };
+        let center_h = (bottom - top - term_h).max(120);
 
         self.draw_top_header(canvas, self.width);
-        self.draw_left_sidebar(canvas, top, bottom);
-        self.draw_center_editor_and_diff(canvas, center_x, top, center_w, editor_h);
-        self.draw_bottom_terminal(canvas, center_x, top + editor_h, center_w, self.term_h);
+        self.draw_left_rail(canvas, top, bottom);
+        if self.left_panel_open {
+            self.draw_left_panel(canvas, top, bottom);
+        }
+        self.draw_center(canvas, center_x, top, center_w, center_h);
+        if self.terminal_open {
+            self.draw_bottom_terminal(canvas, center_x, top + center_h, center_w, term_h);
+        }
         self.draw_right_agent_panel(canvas, top, bottom);
         self.draw_status_footer(canvas);
 
@@ -4053,17 +6076,23 @@ impl DesktopAppHandler for StudioApp {
                 self.draw_approval_modal(canvas, &req);
             } else if let Some(del) = self.pending_delete.clone() {
                 self.draw_delete_modal(canvas, &del);
-            } else if let Some(tab) = self.settings_modal {
-                self.draw_settings_modal(canvas, tab);
+            } else {
+                match self.modal {
+                    ModalDialog::CommandPalette => self.draw_command_palette(canvas),
+                    ModalDialog::ConnectWizard => self.draw_connect_wizard(canvas),
+                    ModalDialog::ThemePicker => self.draw_theme_picker(canvas),
+                    ModalDialog::SafetySettings => self.draw_safety_modal(canvas),
+                    ModalDialog::None => {}
+                }
             }
         }
     }
 
-    fn set_code_font_size(&self) -> i32 {
-        self.settings.editor_font_size
-    }
 }
 
+// ---------------------------------------------------------------------------
+// Free helpers
+// ---------------------------------------------------------------------------
 fn clean_win_verbatim(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
     if let Some(stripped) = s.strip_prefix(r"\\?\") {
@@ -4078,6 +6107,21 @@ fn lighten(rgb: u32, delta: u32) -> u32 {
     let g = (((rgb >> 8) & 0xFF) + delta).min(255);
     let b = ((rgb & 0xFF) + delta).min(255);
     (r << 16) | (g << 8) | b
+}
+
+/// Blends two RGB colors (t = 0 -> a, t = 1 -> b).
+fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let ar = ((a >> 16) & 0xFF) as f32;
+    let ag = ((a >> 8) & 0xFF) as f32;
+    let ab = (a & 0xFF) as f32;
+    let br = ((b >> 16) & 0xFF) as f32;
+    let bg = ((b >> 8) & 0xFF) as f32;
+    let bb = (b & 0xFF) as f32;
+    let r = (ar + (br - ar) * t).round() as u32;
+    let g = (ag + (bg - ag) * t).round() as u32;
+    let bl = (ab + (bb - ab) * t).round() as u32;
+    (r << 16) | (g << 8) | bl
 }
 
 fn truncate_right(s: &str, max_chars: usize) -> String {
@@ -4095,11 +6139,14 @@ fn truncate_left(s: &str, max_chars: usize) -> String {
     if chars.len() <= max_chars {
         s.to_string()
     } else {
-        let tail: String = chars[chars.len() - max_chars.saturating_sub(2)..]
-            .iter()
-            .collect();
+        let tail: String = chars[chars.len() - max_chars.saturating_sub(2)..].iter().collect();
         format!("..{}", tail)
     }
+}
+
+/// Shortens a status string for compact badges.
+pub fn truncate_for_status(s: &str) -> String {
+    truncate_right(s, 44)
 }
 
 fn wrap_text(text: &str, max_cols: usize) -> Vec<String> {
@@ -4142,4 +6189,62 @@ fn wrap_text(text: &str, max_cols: usize) -> Vec<String> {
         out.push(String::new());
     }
     out
+}
+
+fn fam_color(fam: crate::syntax::LangFamily, p: &ThemePalette) -> u32 {
+    match fam {
+        crate::syntax::LangFamily::Rust => 0xF97316,
+        crate::syntax::LangFamily::TypeScript => p.accent,
+        crate::syntax::LangFamily::Python => 0xFACC15,
+        crate::syntax::LangFamily::CFamily => 0x60A5FA,
+        crate::syntax::LangFamily::Go => 0x22D3EE,
+        crate::syntax::LangFamily::Json | crate::syntax::LangFamily::TomlYaml => p.purple,
+        crate::syntax::LangFamily::Markdown => p.success,
+        _ => p.text_muted,
+    }
+}
+
+/// Compact unicode-ish glyph set used across the native chrome (ASCII-safe fallbacks).
+fn glyph(name: &str) -> &'static str {
+    match name {
+        "folder" => "[d]",
+        "search" => "[?]",
+        "plug" => "[p]",
+        "chip" => "[m]",
+        "bolt" => "[!]",
+        "brush" => "[t]",
+        "chev_r" => ">",
+        "chev_d" => "v",
+        "branch" => "~",
+        "term" => ">_",
+        "globe" => "@",
+        "arrow_l" => "<",
+        "arrow_r" => ">",
+        "reload" => "o",
+        "user" => ">",
+        "spark" => "*",
+        "brain" => "#",
+        "wrench" => "+",
+        "robot" => "&",
+        "check" => "v",
+        "lock" => "#",
+        _ => "-",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native platform handler bridge (Win32 / X11 message pump)
+// ---------------------------------------------------------------------------
+impl DesktopAppHandler for StudioApp {
+    fn on_event(&mut self, event: WindowEvent) -> CursorShape {
+        StudioApp::on_event(self, event)
+    }
+
+    fn render(&mut self, canvas: &mut dyn SurfaceCanvas) {
+        StudioApp::render(self, canvas);
+    }
+
+    fn set_code_font_size(&self) -> i32 {
+        self.settings.editor_font_size
+    }
 }

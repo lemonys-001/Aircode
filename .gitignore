@@ -13,3 +13,9 @@
 !dist/AI-Coding-Agent.exe
 !dist/AI-Coding-Agent-Setup.exe
 !dist/SHA256SUMS.txt
+
+# Pre-built Linux (DE) binaries
+!dist/AI-Coding-Agent-linux-amd64
+!dist/AI-Coding-Agent-linux-arm64
+!dist/AI-Coding-Agent-linux-arm32
+!dist/AI-Coding-Agent-linux-x86

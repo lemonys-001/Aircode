@@ -1,46 +1,9 @@
-//! Pure-Rust Native Studio UI theme, hit-testing primitives, focus state, and modals.
+//! Pure-Rust Native Studio UI primitives, clean navigation state, hit zones, and modals.
 
+pub mod commands;
 pub mod studio;
 
 use std::path::PathBuf;
-
-pub struct Theme;
-
-impl Theme {
-    pub const BG_APP: u32 = 0x090D16;
-    pub const BG_TITLEBAR: u32 = 0x060911;
-    pub const BG_SIDEBAR: u32 = 0x0C121E;
-    pub const BG_EDITOR: u32 = 0x0E1524;
-    pub const BG_EDITOR_GUTTER: u32 = 0x0B111D;
-    pub const BG_ACTIVE_LINE: u32 = 0x152036;
-    pub const BG_SELECTION: u32 = 0x1E3A5F;
-    pub const BG_TERMINAL: u32 = 0x070B12;
-    pub const BG_AGENT: u32 = 0x0B101B;
-    pub const BG_CARD: u32 = 0x131C2E;
-    pub const BG_CARD_ALT: u32 = 0x172238;
-    pub const BG_INPUT: u32 = 0x080D16;
-    pub const BG_MODAL: u32 = 0x101827;
-    pub const BG_BUTTON: u32 = 0x1B2840;
-    pub const BG_BUTTON_HOVER: u32 = 0x243554;
-
-    pub const BORDER: u32 = 0x1E293B;
-    pub const BORDER_FOCUS: u32 = 0x38BDF8;
-
-    pub const TEXT_PRIMARY: u32 = 0xF1F5F9;
-    pub const TEXT_SECONDARY: u32 = 0x94A3B8;
-    pub const TEXT_MUTED: u32 = 0x64748B;
-
-    pub const ACCENT_BLUE: u32 = 0x2563EB;
-    pub const ACCENT_CYAN: u32 = 0x38BDF8;
-    pub const ACCENT_GREEN: u32 = 0x10B981;
-    pub const ACCENT_AMBER: u32 = 0xF59E0B;
-    pub const ACCENT_RED: u32 = 0xEF4444;
-    pub const ACCENT_PURPLE: u32 = 0xA855F7;
-
-    pub const DIFF_ADD_BG: u32 = 0x0D281E;
-    pub const DIFF_DEL_BG: u32 = 0x2D1218;
-    pub const DIFF_MOD_BG: u32 = 0x272011;
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct UiRect {
@@ -65,13 +28,23 @@ pub enum LeftTab {
     Explorer,
     Search,
     Git,
+    Sessions,
+    Extensions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SettingsTab {
-    Providers,
-    Permissions,
-    ToolAudit,
+pub enum CenterView {
+    Editor,
+    Browser,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModalDialog {
+    None,
+    CommandPalette,
+    ConnectWizard,
+    ThemePicker,
+    SafetySettings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,14 +56,15 @@ pub enum FocusTarget {
     NewEntryInput,
     CommitInput,
     FindInput,
-    SettingsModel,
-    SettingsOpenAiKey,
-    SettingsAnthropicKey,
-    SettingsGeminiKey,
-    SettingsOpenRouterKey,
-    SettingsOllamaUrl,
-    SettingsCustomUrl,
-    SettingsCustomKey,
+    GotoLineInput,
+    CommandPaletteInput,
+    BrowserUrlInput,
+    BrowserPageInput,
+    ConnectKeyInput,
+    ConnectModelInput,
+    ConnectUrlInput,
+    McpNameInput,
+    McpTargetInput,
 }
 
 #[derive(Clone, Debug)]
@@ -98,7 +72,10 @@ pub enum UiAction {
     Focus(FocusTarget),
     PickFolder,
     SwitchDrive(String),
-    SelectLeftTab(LeftTab),
+    ToggleRailTab(LeftTab),
+    ToggleTerminalDrawer,
+    ToggleAgentPane,
+    SwitchCenterView(CenterView),
     RefreshWorkspace,
     StartCreateEntry { is_dir: bool },
     CancelCreateEntry,
@@ -122,6 +99,8 @@ pub enum UiAction {
     NewScratchTab,
     ToggleFindBar,
     FindNext,
+    ToggleGotoLine,
+    ConfirmGotoLine,
 
     SelectPtyTab(usize),
     ClosePtyTab(usize),
@@ -130,27 +109,63 @@ pub enum UiAction {
     PtySyncCwd,
     PtyClearScreen,
 
-    CycleProvider,
-    CycleModel,
     SetMode(&'static str),
+    CycleEffort,
+    SetEffort(&'static str),
+    ToggleThinkingVisibility,
+    ToggleMessageThinking(String),
     SendAgentPrompt,
     QuickPrompt(&'static str),
     EmergencyStop,
+
     NewSession,
     SelectSession(String),
     DeleteSession(String),
+    ForkActiveSession,
+    ForkFromMessage(usize),
+    CompactActiveSession,
+    ScrollToMessage(usize),
+    OpenDiffPreview { title: String, diff: String },
 
-    OpenSettings(SettingsTab),
+    OpenModal(ModalDialog),
     CloseModal,
-    SwitchSettingsTab(SettingsTab),
-    SelectSettingsProvider(&'static str),
-    SelectPresetModel(String),
-    ProbeOllama,
+    ExecuteCommandId(String),
+
+    // Guided /connect OpenCode-style Wizard actions
+    SelectConnectProvider(&'static str),
+    SelectConnectModel(String),
+    SetOpenCodeAuthMode(&'static str),
+    PasteKeyFromClipboard,
+    OpenProviderKeyUrl(&'static str, bool),
+    ImportDetectedAuth,
+    SpawnLocalOpenCodeServe,
+    SaveConnectWizard,
+
+    // Theme Picker
+    ApplyTheme(String),
+
+    // Skills, Sub-Agents & MCP Hub
+    ToggleSkill(String),
+    OpenCustomizerGuide,
+    ProbeAllMcpServers,
+    AddQuickMcpServer,
+    ToggleMcpServer(usize),
+
+    // Safety / Preferences Modal
     ToggleSettingBool(&'static str),
-    AdjustMaxIters(isize),
     AdjustFontSize(i32),
-    ToggleDefaultShell,
-    SaveSettingsModal,
+
+    // Inbuilt Agentic Browser Actions
+    BrowserBack,
+    BrowserForward,
+    BrowserReload,
+    BrowserGoUrl,
+    BrowserClickRef(usize),
+    BrowserInterruptTakeover,
+    BrowserHandBackToAi,
+    BrowserToggleEngine,
+    BrowserToggleDomInspector,
+    BrowserPopOutExternal,
 
     ApprovePermission { approved: bool, remember: bool },
     ConfirmFileDelete { confirmed: bool },

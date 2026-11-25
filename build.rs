@@ -108,7 +108,8 @@ fn main() {
             fs::copy(&prebuilt, &dst_lib).expect("Failed copying PREBUILT_SQLITE3_LIB");
         } else {
             let obj = out_dir.join("sqlite3.o");
-            let status = Command::new("cc")
+            let cc = env::var("CC").unwrap_or_else(|_| "cc".to_string());
+            let status = Command::new(&cc)
                 .args([
                     "-O2",
                     "-DSQLITE_THREADSAFE=1",
@@ -123,7 +124,8 @@ fn main() {
                 .expect("Failed compiling sqlite3.c with cc");
             assert!(status.success(), "cc failed on sqlite3.c");
 
-            let ar_status = Command::new("ar")
+            let ar = env::var("AR").unwrap_or_else(|_| "ar".to_string());
+            let ar_status = Command::new(&ar)
                 .args(["rcs"])
                 .arg(&dst_lib)
                 .arg(&obj)

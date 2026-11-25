@@ -418,21 +418,389 @@ impl EditorTab {
         }
     }
 
+    pub fn insert_smart_char(&mut self, ch: char) {
+        let is_ro = matches!(
+            &self.content,
+            TabContent::Code { readonly: true, .. } | TabContent::Diff { .. }
+        );
+        if is_ro {
+            return;
+        }
+        let pair_close = match ch {
+            '(' => Some(')'),
+            '[' => Some(']'),
+            '{' => Some('}'),
+            '"' => Some('"'),
+            '\'' => Some('\''),
+            _ => None,
+        };
+
+        // Wrap selection if user typed an opening delimiter while text is selected
+        if let Some(close_ch) = pair_close {
+            if let Some(sel) = self.selected_text() {
+                self.insert_str(&format!("{}{}{}", ch, sel, close_ch));
+                return;
+            }
+        }
+
+        // Skip over closing delimiter if already right under cursor
+        if matches!(ch, ')' | ']' | '}' | '"' | '\'') {
+            if let TabContent::Code {
+                lines,
+                cursor_line,
+                cursor_col,
+                sel_anchor,
+                ..
+            } = &mut self.content
+            {
+                if sel_anchor.is_none() {
+                    if let Some(next_c) = lines[*cursor_line].chars().nth(*cursor_col) {
+                        if next_c == ch {
+                            *cursor_col += 1;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(close_ch) = pair_close {
+            let should_pair = if let TabContent::Code {
+                lines,
+                cursor_line,
+                cursor_col,
+                ..
+            } = &self.content
+            {
+                let next_opt = lines[*cursor_line].chars().nth(*cursor_col);
+                match next_opt {
+                    None => true,
+                    Some(nc) => nc.is_whitespace() || matches!(nc, ')' | ']' | '}' | ',' | ';'),
+                }
+            } else {
+                false
+            };
+
+            if should_pair {
+                self.insert_str(&format!("{}{}", ch, close_ch));
+                if let TabContent::Code { cursor_col, .. } = &mut self.content {
+                    *cursor_col = cursor_col.saturating_sub(1);
+                }
+                return;
+            }
+        }
+
+        self.insert_str(&ch.to_string());
+    }
+
     pub fn insert_newline_auto_indent(&mut self) {
-        let indent = if let TabContent::Code {
-            lines, cursor_line, ..
+        let (indent, prev_ch, next_ch) = if let TabContent::Code {
+            lines,
+            cursor_line,
+            cursor_col,
+            ..
         } = &self.content
         {
-            lines[*cursor_line]
+            let line = &lines[*cursor_line];
+            let ind = line
                 .chars()
                 .take_while(|c| *c == ' ' || *c == '\t')
-                .collect::<String>()
+                .collect::<String>();
+            let prev = if *cursor_col > 0 {
+                line.chars().nth(*cursor_col - 1)
+            } else {
+                None
+            };
+            let next = line.chars().nth(*cursor_col);
+            (ind, prev, next)
         } else {
             return;
         };
-        let mut s = String::from("\n");
-        s.push_str(&indent);
-        self.insert_str(&s);
+
+        let opens_block = matches!(prev_ch, Some('{') | Some('(') | Some('[') | Some(':'));
+        let between_braces = matches!(
+            (prev_ch, next_ch),
+            (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
+        );
+
+        if between_braces {
+            let inner_indent = format!("{}    ", indent);
+            let inserted = format!("\n{}\n{}", inner_indent, indent);
+            self.insert_str(&inserted);
+            if let TabContent::Code {
+                cursor_line,
+                cursor_col,
+                ..
+            } = &mut self.content
+            {
+                *cursor_line = cursor_line.saturating_sub(1);
+                *cursor_col = char_len(&inner_indent);
+            }
+        } else if opens_block {
+            self.insert_str(&format!("\n{}    ", indent));
+        } else {
+            self.insert_str(&format!("\n{}", indent));
+        }
+    }
+
+    pub fn indent_block(&mut self, unindent: bool) {
+        if matches!(
+            &self.content,
+            TabContent::Code { readonly: true, .. } | TabContent::Diff { .. }
+        ) {
+            return;
+        }
+        let sel = self.ordered_selection();
+        if sel.is_none() && !unindent {
+            self.insert_str("    ");
+            return;
+        }
+        self.push_undo();
+        if let TabContent::Code {
+            lines,
+            cursor_line,
+            cursor_col,
+            ..
+        } = &mut self.content
+        {
+            let (sl, el) = sel
+                .map(|((a, _), (b, _))| (a, b))
+                .unwrap_or((*cursor_line, *cursor_line));
+            for row in sl..=el.min(lines.len().saturating_sub(1)) {
+                if unindent {
+                    let remove_spaces = lines[row]
+                        .chars()
+                        .take(4)
+                        .take_while(|c| *c == ' ')
+                        .count();
+                    if remove_spaces > 0 {
+                        lines[row] = slice_chars(&lines[row], remove_spaces, char_len(&lines[row]));
+                        if row == *cursor_line {
+                            *cursor_col = cursor_col.saturating_sub(remove_spaces);
+                        }
+                    } else if lines[row].starts_with('\t') {
+                        lines[row] = slice_chars(&lines[row], 1, char_len(&lines[row]));
+                        if row == *cursor_line {
+                            *cursor_col = cursor_col.saturating_sub(1);
+                        }
+                    }
+                } else {
+                    lines[row].insert_str(0, "    ");
+                    if row == *cursor_line {
+                        *cursor_col += 4;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn toggle_comment(&mut self) {
+        if matches!(
+            &self.content,
+            TabContent::Code { readonly: true, .. } | TabContent::Diff { .. }
+        ) {
+            return;
+        }
+        let sel = self.ordered_selection();
+        let comment_prefix = match self.lang {
+            LangFamily::Python | LangFamily::ShellPs1 | LangFamily::TomlYaml => "#",
+            _ => "//",
+        };
+        self.push_undo();
+        if let TabContent::Code {
+            lines, cursor_line, ..
+        } = &mut self.content
+        {
+            let (sl, el) = sel
+                .map(|((a, _), (b, _))| (a, b))
+                .unwrap_or((*cursor_line, *cursor_line));
+            let all_commented = (sl..=el).all(|r| {
+                let t = lines[r].trim_start();
+                t.is_empty() || t.starts_with(comment_prefix)
+            });
+            for r in sl..=el {
+                if lines[r].trim().is_empty() {
+                    continue;
+                }
+                if all_commented {
+                    if let Some(idx) = lines[r].find(comment_prefix) {
+                        let after = idx + comment_prefix.len();
+                        let strip_extra = usize::from(lines[r].as_bytes().get(after) == Some(&b' '));
+                        lines[r].replace_range(idx..(after + strip_extra), "");
+                    }
+                } else {
+                    let lead = lines[r]
+                        .chars()
+                        .take_while(|c| *c == ' ' || *c == '\t')
+                        .count();
+                    let pfx = slice_chars(&lines[r], 0, lead);
+                    let rest = slice_chars(&lines[r], lead, char_len(&lines[r]));
+                    lines[r] = format!("{}{} {}", pfx, comment_prefix, rest);
+                }
+            }
+        }
+    }
+
+    pub fn move_line_vertical(&mut self, delta: isize, visible_rows: usize) {
+        if matches!(
+            &self.content,
+            TabContent::Code { readonly: true, .. } | TabContent::Diff { .. }
+        ) {
+            return;
+        }
+        self.push_undo();
+        if let TabContent::Code {
+            lines,
+            cursor_line,
+            scroll_y,
+            ..
+        } = &mut self.content
+        {
+            let target = *cursor_line as isize + delta;
+            if target >= 0 && (target as usize) < lines.len() {
+                let tgt = target as usize;
+                lines.swap(*cursor_line, tgt);
+                *cursor_line = tgt;
+                ensure_cursor_visible(*cursor_line, scroll_y, visible_rows);
+            }
+        }
+    }
+
+    pub fn goto_line(&mut self, one_based: usize, visible_rows: usize) {
+        if let TabContent::Code {
+            lines,
+            cursor_line,
+            cursor_col,
+            sel_anchor,
+            scroll_y,
+            ..
+        } = &mut self.content
+        {
+            let target = one_based.saturating_sub(1).min(lines.len().saturating_sub(1));
+            *cursor_line = target;
+            *cursor_col = 0;
+            *sel_anchor = None;
+            ensure_cursor_visible(*cursor_line, scroll_y, visible_rows);
+        }
+    }
+
+    pub fn select_word_or_next_match(&mut self, visible_rows: usize) {
+        if let Some(sel) = self.selected_text() {
+            if !sel.contains('\n') && !sel.is_empty() {
+                let _ = self.find_next(&sel, visible_rows);
+                return;
+            }
+        }
+        if let TabContent::Code {
+            lines,
+            cursor_line,
+            cursor_col,
+            sel_anchor,
+            ..
+        } = &mut self.content
+        {
+            let chars: Vec<char> = lines[*cursor_line].chars().collect();
+            if chars.is_empty() {
+                return;
+            }
+            let pos = (*cursor_col).min(chars.len() - 1);
+            let is_word = |c: char| c.is_alphanumeric() || c == '_';
+            if !is_word(chars[pos]) {
+                return;
+            }
+            let mut start = pos;
+            while start > 0 && is_word(chars[start - 1]) {
+                start -= 1;
+            }
+            let mut end = pos + 1;
+            while end < chars.len() && is_word(chars[end]) {
+                end += 1;
+            }
+            *sel_anchor = Some((*cursor_line, start));
+            *cursor_col = end;
+        }
+    }
+
+    pub fn matching_bracket(&self) -> Option<(usize, usize)> {
+        let TabContent::Code {
+            lines,
+            cursor_line,
+            cursor_col,
+            ..
+        } = &self.content
+        else {
+            return None;
+        };
+        let line_chars: Vec<char> = lines.get(*cursor_line)?.chars().collect();
+        let (check_col, ch) = if let Some(&c) = line_chars.get(*cursor_col) {
+            if matches!(c, '(' | ')' | '[' | ']' | '{' | '}') {
+                (*cursor_col, c)
+            } else if *cursor_col > 0
+                && matches!(line_chars[*cursor_col - 1], '(' | ')' | '[' | ']' | '{' | '}')
+            {
+                (*cursor_col - 1, line_chars[*cursor_col - 1])
+            } else {
+                return None;
+            }
+        } else if *cursor_col > 0
+            && matches!(
+                line_chars.get(*cursor_col - 1),
+                Some('(' | ')' | '[' | ']' | '{' | '}')
+            )
+        {
+            (*cursor_col - 1, line_chars[*cursor_col - 1])
+        } else {
+            return None;
+        };
+
+        let (open_c, close_c, forward) = match ch {
+            '(' => ('(', ')', true),
+            '[' => ('[', ']', true),
+            '{' => ('{', '}', true),
+            ')' => ('(', ')', false),
+            ']' => ('[', ']', false),
+            '}' => ('{', '}', false),
+            _ => return None,
+        };
+
+        let mut depth = 0i32;
+        if forward {
+            for (r, l) in lines.iter().enumerate().skip(*cursor_line) {
+                let cs: Vec<char> = l.chars().collect();
+                let start = if r == *cursor_line { check_col } else { 0 };
+                for (c, &cur) in cs.iter().enumerate().skip(start) {
+                    if cur == open_c {
+                        depth += 1;
+                    } else if cur == close_c {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some((r, c));
+                        }
+                    }
+                }
+            }
+        } else {
+            for r in (0..=*cursor_line).rev() {
+                let cs: Vec<char> = lines[r].chars().collect();
+                let end = if r == *cursor_line {
+                    check_col + 1
+                } else {
+                    cs.len()
+                };
+                for c in (0..end).rev() {
+                    let cur = cs[c];
+                    if cur == close_c {
+                        depth += 1;
+                    } else if cur == open_c {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some((r, c));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn backspace(&mut self) {

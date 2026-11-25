@@ -27,6 +27,20 @@ impl TokenKind {
             TokenKind::Operator => 0x94A3B8,  // Cool Gray
         }
     }
+
+    pub fn themed_rgb(self, pal: &crate::themes::ThemePalette) -> u32 {
+        match self {
+            TokenKind::Plain => pal.text_primary,
+            TokenKind::Keyword => pal.syn_keyword,
+            TokenKind::TypeName => pal.syn_type,
+            TokenKind::StringLit => pal.syn_string,
+            TokenKind::NumberLit => pal.syn_number,
+            TokenKind::Comment => pal.syn_comment,
+            TokenKind::MacroAttr => pal.accent_secondary,
+            TokenKind::Function => pal.syn_func,
+            TokenKind::Operator => pal.text_secondary,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
