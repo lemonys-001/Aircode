@@ -13,6 +13,22 @@ pub struct PaletteItem {
 pub fn builtin_palette_commands(show_thinking: bool, mode: &str, effort: &str, theme: &str) -> Vec<PaletteItem> {
     vec![
         PaletteItem {
+            id: "cmd:zen_free".into(),
+            slash: "/zen".into(),
+            title: "OpenCode Zen Free Lane (no API key)".into(),
+            subtitle: "Authenticate like the official OpenCode client and use the anonymous public free models".into(),
+            shortcut: "/zen".into(),
+            is_file: false,
+        },
+        PaletteItem {
+            id: "cmd:zen_models".into(),
+            slash: "/models".into(),
+            title: "Refresh OpenCode Zen Free Model Catalog".into(),
+            subtitle: "Fetch the live anonymous catalog from opencode.ai/zen/v1/models".into(),
+            shortcut: "/models".into(),
+            is_file: false,
+        },
+        PaletteItem {
             id: "cmd:connect".into(),
             slash: "/connect".into(),
             title: "Connect AI Provider & OpenCode Auth".into(),

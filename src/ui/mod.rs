@@ -140,6 +140,9 @@ pub enum UiAction {
     ImportDetectedAuth,
     SpawnLocalOpenCodeServe,
     SaveConnectWizard,
+    // OpenCode Zen free lane (OpenCode-client emulation, zero key)
+    UseZenFreeLane,
+    FetchZenFreeModels,
 
     // Theme Picker
     ApplyTheme(String),

@@ -213,10 +213,155 @@ mod tests {
         assert_eq!(app.active_mode, "build");
         app.execute_slash_command("/theme rose-pine");
         assert_eq!(app.settings.theme, "rose-pine");
+        // The quiet daylight theme is the shipped default.
+        app.execute_slash_command("/theme low-cortisol");
+        assert_eq!(app.settings.theme, "low-cortisol");
+        assert!(app.palette.is_light);
+
+        // OpenCode Zen free lane: one slash command, no key anywhere.
+        app.execute_slash_command("/zen");
+        assert_eq!(app.settings.active_provider, "opencode");
+        assert_eq!(app.settings.opencode_auth_mode, "zen");
+        assert!(app.settings.opencode_api_key.is_empty());
+        assert!(app
+            .settings
+            .active_model
+            .ends_with("-free")
+            .then_some(true)
+            .unwrap_or_else(|| app.settings.active_model == "big-pickle"));
 
         let mut surf = TestSurface::new(1440, 900);
         app.render(&mut surf);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_opencode_zen_client_emulation() {
+        use crate::opencode_auth::{
+            is_zen_free_model, new_zen_session_id, zen_client_headers, zen_tool_name_in,
+            zen_tool_name_out, ZEN_CLIENT_USER_AGENT, ZEN_PUBLIC_KEY,
+        };
+
+        // Session ids must match the shape the gateway fingerprints:
+        //   ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$  with the 12 hex being ^[0-9a-f]{9}f[c-f][0-9a-f]$
+        for _ in 0..64 {
+            let sid = new_zen_session_id();
+            assert!(sid.starts_with("ses_"), "bad prefix: {}", sid);
+            let rest = &sid[4..];
+            assert_eq!(rest.len(), 26, "bad length: {}", sid);
+            let (hex12, tail) = rest.split_at(12);
+            assert!(
+                hex12.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "non-lowercase-hex: {}",
+                sid
+            );
+            assert_eq!(&hex12[9..10], "f", "10th hex char must be 'f': {}", sid);
+            assert!(
+                "cdef".contains(&hex12[10..11]),
+                "11th hex char must be c/d/e/f: {}",
+                sid
+            );
+            assert!(
+                tail.chars().all(|c| c.is_ascii_alphanumeric()),
+                "tail must be alphanumeric: {}",
+                sid
+            );
+        }
+        // Two calls must not collide.
+        assert_ne!(new_zen_session_id(), new_zen_session_id());
+
+        // The header quartet the gateway requires - and nothing it rejects.
+        let sid = new_zen_session_id();
+        let hdrs = zen_client_headers(&sid, ZEN_PUBLIC_KEY);
+        let keys: Vec<&str> = hdrs.iter().map(|(k, _)| *k).collect();
+        for required in [
+            "Authorization",
+            "x-api-key",
+            "User-Agent",
+            "x-opencode-client",
+            "x-opencode-project",
+            "x-opencode-session",
+            "x-opencode-session-id",
+        ] {
+            assert!(keys.contains(&required), "missing header {}", required);
+        }
+        assert!(
+            !keys.contains(&"x-opencode-request"),
+            "x-opencode-request makes the gateway answer 403"
+        );
+        assert_eq!(
+            hdrs.iter().find(|(k, _)| *k == "User-Agent").unwrap().1,
+            ZEN_CLIENT_USER_AGENT
+        );
+        assert_eq!(
+            hdrs.iter().find(|(k, _)| *k == "x-opencode-session").unwrap().1,
+            sid
+        );
+        assert_eq!(
+            hdrs.iter().find(|(k, _)| *k == "x-opencode-session-id").unwrap().1,
+            sid
+        );
+
+        // Free-lane tool remap round-trips.
+        assert_eq!(zen_tool_name_out("execute_command"), "bash");
+        assert_eq!(zen_tool_name_out("read_file"), "read");
+        assert_eq!(zen_tool_name_in("bash"), "execute_command");
+        assert_eq!(zen_tool_name_in("read"), "read_file");
+        for name in ["execute_command", "read_file", "write_file", "search_project"] {
+            assert_eq!(zen_tool_name_in(zen_tool_name_out(name)), name);
+        }
+
+        assert!(is_zen_free_model("big-pickle"));
+        assert!(is_zen_free_model("deepseek-v4.1-flash-free"));
+        assert!(!is_zen_free_model("claude-sonnet-4-5"));
+    }
+
+    #[test]
+    fn test_opencode_zen_sse_and_tool_remap() {
+        // A Zen-shaped SSE body: reasoning delta, two content deltas, and one tool
+        // call split across two chunks (name first, arguments second).
+        let body = r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"think "}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"Hello "}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"world"}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\": \"ls\"}"}}]}}]}
+
+data: [DONE]
+
+"#;
+        let (text, reasoning, calls) = crate::agent::parse_openai_sse(body);
+        assert_eq!(text, "Hello world");
+        assert_eq!(reasoning, "think ");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "call_1");
+        assert_eq!(calls[0].1, "bash");
+        assert_eq!(calls[0].2.string_or("cmd", ""), "ls");
+
+        // A plain (non-streamed) JSON body must still parse.
+        let json_body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"hi","tool_calls":[{"id":"c2","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]}}]}"#;
+        let (t2, r2, c2) = crate::agent::parse_openai_sse(json_body);
+        assert_eq!(t2, "hi");
+        assert_eq!(r2, "");
+        assert_eq!(c2.len(), 1);
+        assert_eq!(c2[0].1, "read");
+        assert_eq!(c2[0].2.string_or("path", ""), "a.rs");
+
+        // Tool schemas get remapped onto the free-lane names; unknown ones are dropped.
+        let tools = crate::agent::tool_schemas_openai();
+        let remapped = crate::agent::remap_tools_for_zen(&tools);
+        let names: Vec<String> = remapped
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("function").map(|f| f.string_or("name", "")))
+            .collect();
+        assert!(names.contains(&"bash".to_string()), "{:?}", names);
+        assert!(names.contains(&"read".to_string()), "{:?}", names);
+        assert!(!names.contains(&"execute_command".to_string()));
     }
 
     /// Minimal in-memory software canvas used by headless UI smoke tests (all platforms).

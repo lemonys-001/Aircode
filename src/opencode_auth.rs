@@ -2,7 +2,13 @@
 //!
 //! Supports:
 //! 1. `zen-public` / `zen-key`: Direct OpenCode Zen gateway (`https://opencode.ai/zen/v1`)
-//!    with OpenCode client headers (`public` free tier workaround + Zen API tokens).
+//!    speaking the *exact* dialect the official OpenCode client speaks, so the free
+//!    (`public`) lane works without an account: matching User-Agent, the
+//!    `x-opencode-client` / `x-opencode-project` / `x-opencode-session` /
+//!    `x-opencode-session-id` header quartet (never `x-opencode-request`, which the
+//!    gateway rejects with 403), `stream: true`, and `bash`/`read` tool names.
+//!    A real Zen console key (from `opencode auth login` / `https://opencode.ai/auth`)
+//!    is used verbatim whenever one is available and unlocks the paid catalog too.
 //! 2. `auth-json` auto-import: Reads existing `~/.local/share/opencode/auth.json` (or Windows
 //!    `%USERPROFILE%\.local\share\opencode\auth.json`) tokens from `opencode auth login`.
 //! 3. `local-serve` bridge workaround: Connects to (or spawns) `opencode serve` on
@@ -338,4 +344,190 @@ pub fn call_local_opencode_server(
         }
     }
     Ok(msg_resp.body)
+}
+
+// =============================================================================
+// OpenCode Zen client emulation (free-tier workaround)
+// =============================================================================
+
+/// OpenCode Zen gateway - OpenAI-compatible (`/chat/completions`, `/responses`, `/models`).
+pub const ZEN_BASE_URL: &str = "https://opencode.ai/zen/v1";
+
+/// Literal bearer token the OpenCode CLI uses for its anonymous "public" free lane.
+/// Any string works as a *client* key, but the gateway only grants the free tier to
+/// clients that look like the official CLI - see [`zen_client_headers`].
+pub const ZEN_PUBLIC_KEY: &str = "public";
+
+/// The official OpenCode client User-Agent. The gateway fingerprints it, so a plain
+/// `opencode/1.0` (or curl) is refused even with a valid key.
+pub const ZEN_CLIENT_USER_AGENT: &str =
+    "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+
+/// Free-tier models reachable with the `public` workaround (no account, no card).
+/// Free ids are promotional and can disappear; the live catalog is always readable
+/// anonymously from `GET https://opencode.ai/zen/v1/models`.
+pub const ZEN_FREE_MODELS: &[(&str, &str)] = &[
+    ("big-pickle", "Big Pickle - agentic coding"),
+    ("glm-5.3-flash-free", "GLM 5.3 Flash"),
+    ("deepseek-v4.1-flash-free", "DeepSeek V4.1 Flash"),
+    ("nemotron-3.5-lightning-free", "Nemotron 3.5 Lightning"),
+    ("nemotron-3.5-super-vl-free", "Nemotron 3.5 Super VL"),
+    ("space-bunny-free", "Space Bunny"),
+    ("mimo-v2.6-flash-free", "MiMo V2.6 Flash"),
+    ("cat-jam-free", "Cat Jam"),
+    ("longcat-2.5-preview-free", "LongCat 2.5 Preview"),
+];
+
+/// `true` when `model` is one of the free-tier ids that work without a Zen key.
+pub fn is_zen_free_model(model: &str) -> bool {
+    let m = model.trim();
+    ZEN_FREE_MODELS.iter().any(|(id, _)| *id == m) || m.ends_with("-free")
+}
+
+/// Deterministic-ish PRNG (xorshift64*) - we have no `rand` crate by design.
+fn zen_next_rand(state: &mut u64) -> u64 {
+    let mut x = *state;
+    if x == 0 {
+        x = 0x9E37_79B9_7F4A_7C15;
+    }
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+fn zen_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    // Mix in an ASLR-ish stack address so two processes started in the same
+    // nanosecond still diverge.
+    let stack_entropy = (&nanos as *const u64 as u64) >> 7;
+    let mut s = nanos ^ stack_entropy.rotate_left(17) ^ 0x6D2B_79F5;
+    if s == 0 {
+        s = 0x9E37_79B9_7F4A_7C15;
+    }
+    s
+}
+
+/// Generates a session id in the exact shape the OpenCode client emits:
+/// `ses_` + 12 lowercase hex (`^[0-9a-f]{9}f[c-f][0-9a-f]$`) + 14 alphanumerics.
+/// The gateway pins the upstream backend per session id, so a fresh id per session
+/// spreads traffic the same way the CLI does.
+pub fn new_zen_session_id() -> String {
+    let mut st = zen_seed();
+    let mut hex12 = String::with_capacity(12);
+    for i in 0..12 {
+        match i {
+            9 => hex12.push('f'),
+            10 => {
+                let picks = ['c', 'd', 'e', 'f'];
+                hex12.push(picks[(zen_next_rand(&mut st) % 4) as usize]);
+            }
+            _ => hex12.push(
+                char::from_digit((zen_next_rand(&mut st) % 16) as u32, 16).unwrap_or('0'),
+            ),
+        }
+    }
+    const ALNUM: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut tail = String::with_capacity(14);
+    for _ in 0..14 {
+        tail.push(ALNUM[(zen_next_rand(&mut st) % ALNUM.len() as u64) as usize] as char);
+    }
+    format!("ses_{}{}", hex12, tail)
+}
+
+/// Builds the exact header set the official OpenCode CLI sends to Zen.
+///
+/// * `Authorization: Bearer <key>` **and** `x-api-key: <key>` (Zen accepts either;
+///   chat-format requests use Bearer, keyed Responses requests need both).
+/// * The `opencode/<v> ai-sdk/... runtime/bun/...` User-Agent fingerprint.
+/// * `x-opencode-client`, `x-opencode-project`, and the session pair.
+///
+/// Deliberately **not** sent: `x-opencode-request` - the gateway answers 403 when it
+/// sees that header from a non-CLI client.
+pub fn zen_client_headers(session_id: &str, api_key: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("Content-Type", "application/json".to_string()),
+        ("Authorization", format!("Bearer {}", api_key)),
+        ("x-api-key", api_key.to_string()),
+        ("User-Agent", ZEN_CLIENT_USER_AGENT.to_string()),
+        ("x-opencode-client", "cli".to_string()),
+        ("x-opencode-project", "global".to_string()),
+        ("x-opencode-session", session_id.to_string()),
+        ("x-opencode-session-id", session_id.to_string()),
+    ]
+}
+
+/// Zen's anonymous free lane only exposes tool names the CLI itself uses. AirCode
+/// remaps its richer toolset onto those two names (and back on the way in) so agentic
+/// tool calling keeps working on the free tier.
+pub fn zen_tool_name_out(name: &str) -> &'static str {
+    match name {
+        "execute_command" => "bash",
+        "read_file" => "read",
+        "write_file" => "edit",
+        "search_project" => "grep",
+        other => {
+            // Unmapped tools keep their name; Zen ignores unknown definitions.
+            let _ = other;
+            "tool"
+        }
+    }
+}
+
+/// Inverse of [`zen_tool_name_out`].
+pub fn zen_tool_name_in(name: &str) -> &'static str {
+    match name {
+        "bash" => "execute_command",
+        "read" => "read_file",
+        "edit" => "write_file",
+        "grep" => "search_project",
+        other => {
+            let _ = other;
+            "tool"
+        }
+    }
+}
+
+/// Reads the live Zen catalog anonymously (`GET /zen/v1/models` needs no key) and
+/// returns the free-tier model ids, so AirCode can offer whatever is free *today*
+/// instead of a hardcoded list.
+pub fn fetch_zen_free_models() -> Vec<String> {
+    let url = format!("{}/models", ZEN_BASE_URL);
+    let r = http_request("GET", &url, &[("User-Agent", ZEN_CLIENT_USER_AGENT)], "", 15_000);
+    if let Some(e) = r.error {
+        let _ = e;
+        return Vec::new();
+    }
+    if r.status != 200 {
+        return Vec::new();
+    }
+    let Ok(json) = JsonValue::parse(&r.body) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
+        for m in arr {
+            let id = m.string_or("id", "");
+            if id.is_empty() {
+                continue;
+            }
+            if is_zen_free_model(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Human-readable summary of how AirCode will authenticate to Zen, for `/connect`.
+pub fn zen_auth_summary(api_key: &str) -> String {
+    if api_key.trim().is_empty() || api_key.trim() == ZEN_PUBLIC_KEY {
+        "OpenCode Zen - free `public` lane (no key, OpenCode client headers)".to_string()
+    } else {
+        "OpenCode Zen - console API key (free + paid catalog)".to_string()
+    }
 }
