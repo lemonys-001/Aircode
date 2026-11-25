@@ -1,6 +1,6 @@
 [package]
 name = "ai-coding-agent-setup"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 description = "Pure-Rust Native Windows x64 Setup Wizard & Uninstaller for AI Coding Agent"
 build = "build.rs"

@@ -1,6 +1,7 @@
 //! Pure-Rust Native Studio UI primitives, clean navigation state, hit zones, and modals.
 
 pub mod commands;
+pub mod shell;
 pub mod studio;
 
 use std::path::PathBuf;
@@ -136,7 +137,7 @@ pub enum UiAction {
     SelectConnectModel(String),
     SetOpenCodeAuthMode(&'static str),
     PasteKeyFromClipboard,
-    OpenProviderKeyUrl(&'static str, bool),
+    OpenProviderKeyUrl(String, bool),
     ImportDetectedAuth,
     SpawnLocalOpenCodeServe,
     SaveConnectWizard,
@@ -172,6 +173,32 @@ pub enum UiAction {
 
     ApprovePermission { approved: bool, remember: bool },
     ConfirmFileDelete { confirmed: bool },
+
+    // ---- OpenCode-style shell -------------------------------------------
+    /// Switch between the conversation view and the workspace IDE.
+    ToggleShellView,
+    /// Open the provider setup screen.
+    ShowConnect,
+    /// Select a session tab in the top strip.
+    SelectSessionTab(usize),
+    /// Expand / collapse a `+ Thought` / `+ Tool` block in the transcript.
+    ToggleChatBlock(String),
+    /// Expand / collapse a right-sidebar section.
+    ToggleSidebarSection(String),
+    /// Jump to a workspace file from the sidebar's modified-files list.
+    OpenWorkspaceFile(String),
+    /// Pick the highlighted row in the command palette.
+    PaletteSelect(usize),
+    /// Put the caret in the prompt.
+    FocusPrompt,
+    /// Scroll the transcript by `delta` rows (negative = up).
+    ScrollChat(i32),
+    /// Show / hide the right context sidebar.
+    ToggleSidebar,
+    /// Toggle visibility of `+ Tool` blocks in the transcript.
+    ToggleToolBlocks,
+    /// Cycle the active model (status-bar model box).
+    CycleModel,
 }
 
 #[derive(Clone, Debug)]

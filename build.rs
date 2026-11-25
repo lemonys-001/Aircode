@@ -1,13 +1,25 @@
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+
+#[path = "src/winres.rs"]
+mod winres;
 
 fn main() {
     println!("cargo:rerun-if-changed=vendor/sqlite3/sqlite3.c");
     println!("cargo:rerun-if-changed=resources/app.rc");
     println!("cargo:rerun-if-changed=resources/icon.ico");
     println!("cargo:rerun-if-changed=resources/app.manifest");
+    // The vendored SQLite amalgamation is compiled by $CC, so switching to a
+    // cross compiler (or a different one) MUST invalidate the cached object.
+    // Without this, a host-built sqlite3.o gets reused for a foreign target and
+    // the link fails with "sqlite3.o is incompatible with <arch>".
+    println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=AR");
+    println!("cargo:rerun-if-env-changed=PREBUILT_SQLITE3_LIB");
+    println!("cargo:rerun-if-env-changed=PREBUILT_WIN32_RES");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
@@ -78,20 +90,47 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", out_dir.display());
         println!("cargo:rustc-link-lib=static=sqlite3");
 
-        // Optional resource embedding (.ico + PerMonitorV2 DPI manifest + VERSIONINFO)
+        // Windows resource embedding (.ico + PerMonitorV2 DPI manifest + VERSIONINFO).
+        //
+        // rc.exe / windres / llvm-rc are absent from most cross toolchains (zig
+        // ships no `rc` subcommand), which silently produced icon-less binaries.
+        // We therefore generate the COFF `.res` ourselves in pure Rust and hand
+        // it straight to the linker. `PREBUILT_WIN32_RES` still wins if set.
+        let machine: u16 = if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+            0xAA64
+        } else {
+            0x8664
+        };
         if let Ok(res_file) = env::var("PREBUILT_WIN32_RES") {
             println!("cargo:rustc-link-arg-bin=AI-Coding-Agent={}", res_file);
-        } else if target_env == "msvc" {
-            let res_out = out_dir.join("app.res");
-            if let Ok(st) = Command::new("rc.exe")
-                .args(["/nologo", "/fo"])
-                .arg(&res_out)
-                .arg("resources/app.rc")
-                .status()
-            {
-                if st.success() {
-                    println!("cargo:rustc-link-arg-bin=AI-Coding-Agent={}", res_out.display());
+        } else {
+            let version = winres::VersionInfo::from_crate_version(
+                &env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string()),
+                "AI-Coding-Agent",
+                "AI Coding Agent — 100% Pure-Rust Native Windows x64 Desktop Studio",
+            );
+            match winres::generate_from_paths(
+                machine,
+                Path::new("resources/icon.ico"),
+                Some(Path::new("resources/app.manifest")),
+                &version,
+            ) {
+                Ok(bytes) => {
+                    let res_out = out_dir.join("app.res");
+                    if fs::write(&res_out, &bytes).is_ok() {
+                        println!(
+                            "cargo:rustc-link-arg-bin=AI-Coding-Agent={}",
+                            res_out.display()
+                        );
+                        println!("cargo:warning=embedded win32 resources (icon+version+manifest)");
+                    } else {
+                        println!("cargo:warning=could not write app.res; icon will be missing");
+                    }
                 }
+                Err(e) => println!(
+                    "cargo:warning=win32 resource generation failed ({}); icon will be missing",
+                    e
+                ),
             }
         }
 

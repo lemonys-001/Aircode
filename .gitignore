@@ -19,3 +19,6 @@
 !dist/AI-Coding-Agent-linux-arm64
 !dist/AI-Coding-Agent-linux-arm32
 !dist/AI-Coding-Agent-linux-x86
+
+# Scratch research assets (screenshots used while designing the UI)
+/image-search/

@@ -26,7 +26,7 @@ APP_NAME="AirCode"
 APP_ID="aircode"
 BIN_NAME="AI-Coding-Agent"
 REPO_SLUG="${AIRCODE_REPO:-lemonys-001/Aircode}"
-VERSION="2.1.0"
+VERSION="2.2.0"
 PREFIX="${PREFIX:-/usr/local}"
 BINDIR="${PREFIX}/bin"
 DATADIR="${PREFIX}/share/${APP_ID}"
@@ -48,7 +48,7 @@ while [ $# -gt 0 ]; do
     --prefix=*)         PREFIX="${1#*=}"; BINDIR="${PREFIX}/bin"; DATADIR="${PREFIX}/share/${APP_ID}" ;;
     --arch)             shift; ARCH="${1:?--arch needs a value}" ;;
     --version)          shift; VERSION="${1:?--version needs a value}" ;;
-      -h|--help)          grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '3,24p'; exit 0 ;;
+      -h|--help)          awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *)                  die "Unknown option: $1 (try --help)" ;;
   esac
   shift
