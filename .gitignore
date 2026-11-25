@@ -1,12 +1,11 @@
-# Build caches & dependencies
-node_modules/
-ui-dist/
-src-tauri/target/
-src-tauri/gen/
+# Rust Cargo build artifacts
+/target/
+/installer/target/
 *.log
 *.lib
 *.res
 *.o
+*.a
 .DS_Store
 
 # Explicitly retain Windows x64 deliverables in dist/
