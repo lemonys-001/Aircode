@@ -1,4 +1,6 @@
 //! Safe Pure-Rust persistent SQLite3 database engine (statically linked via vendor/sqlite3/sqlite3.c).
+//! Stores AppSettings, Themes, OpenCode Auth, Sessions, Session Forks, Compaction Checkpoints,
+//! Prompt Timestamps, and Tool Execution Audit History.
 
 use crate::json::JsonValue;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
@@ -63,14 +65,12 @@ pub fn now_timestamp_label() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Convert epoch seconds to YYYY-MM-DD HH:MM:SS UTC
     let days = (secs / 86400) as i64;
     let rem = secs % 86400;
     let hh = rem / 3600;
     let mm = (rem % 3600) / 60;
     let ss = rem % 60;
 
-    // Civil date from days since 1970-01-01 (Howard Hinnant algorithm)
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as u64;
@@ -83,6 +83,14 @@ pub fn now_timestamp_label() -> String {
     let year = if m <= 2 { y + 1 } else { y };
 
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z", year, m, d, hh, mm, ss)
+}
+
+pub fn short_time_label(ts: &str) -> String {
+    // Extracts "HH:MM:SS" from "YYYY-MM-DD HH:MM:SSZ"
+    if let Some((_, time_part)) = ts.split_once(' ') {
+        return time_part.trim_end_matches('Z').to_string();
+    }
+    ts.to_string()
 }
 
 pub fn make_unique_id(prefix: &str) -> String {
@@ -100,7 +108,13 @@ pub fn make_unique_id(prefix: &str) -> String {
 pub struct AppSettings {
     pub active_provider: String,
     pub active_model: String,
-    pub default_mode: String,
+    pub default_mode: String,   // "plan" | "build"
+    pub agent_effort: String,   // "low" | "medium" | "max" | "ultra"
+    pub theme: String,          // "tokyo-night" | "catppuccin-mocha" | ... | "custom"
+    pub show_thinking: bool,
+    pub opencode_api_key: String,
+    pub opencode_auth_mode: String, // "zen" | "local-serve"
+    pub opencode_server_url: String,
     pub openai_api_key: String,
     pub anthropic_api_key: String,
     pub gemini_api_key: String,
@@ -114,14 +128,21 @@ pub struct AppSettings {
     pub max_agent_iterations: usize,
     pub default_shell: String,
     pub editor_font_size: i32,
+    pub disabled_skills: Vec<String>,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            active_provider: "ollama".to_string(),
-            active_model: "qwen2.5-coder:7b".to_string(),
-            default_mode: "autonomous".to_string(),
+            active_provider: "opencode".to_string(),
+            active_model: "big-pickle".to_string(),
+            default_mode: "build".to_string(),
+            agent_effort: "medium".to_string(),
+            theme: "tokyo-night".to_string(),
+            show_thinking: true,
+            opencode_api_key: String::new(),
+            opencode_auth_mode: "zen".to_string(),
+            opencode_server_url: "http://127.0.0.1:4096".to_string(),
             openai_api_key: String::new(),
             anthropic_api_key: String::new(),
             gemini_api_key: String::new(),
@@ -132,23 +153,67 @@ impl Default for AppSettings {
             require_shell_approval: true,
             require_delete_confirmation: true,
             restrict_to_workspace: true,
-            max_agent_iterations: 15,
+            max_agent_iterations: 16,
             default_shell: if cfg!(windows) {
                 "powershell".to_string()
             } else {
                 "sh".to_string()
             },
             editor_font_size: 15,
+            disabled_skills: Vec::new(),
         }
     }
 }
 
 impl AppSettings {
+    pub fn normalized_mode(&self) -> &'static str {
+        if self.default_mode.eq_ignore_ascii_case("plan") {
+            "plan"
+        } else {
+            "build"
+        }
+    }
+
+    pub fn effort_max_iters(&self) -> usize {
+        match self.agent_effort.as_str() {
+            "low" => 6,
+            "medium" => 14,
+            "max" => 26,
+            "ultra" => 44,
+            _ => self.max_agent_iterations.clamp(4, 50),
+        }
+    }
+
+    pub fn effort_thinking_budget(&self) -> usize {
+        match self.agent_effort.as_str() {
+            "low" => 1024,
+            "medium" => 4096,
+            "max" => 16000,
+            "ultra" => 32000,
+            _ => 4096,
+        }
+    }
+
+    pub fn effort_openai_tag(&self) -> &'static str {
+        match self.agent_effort.as_str() {
+            "low" => "low",
+            "medium" => "medium",
+            "max" | "ultra" => "high",
+            _ => "medium",
+        }
+    }
+
     pub fn to_json(&self) -> JsonValue {
         JsonValue::obj(vec![
             ("activeProvider", self.active_provider.clone().into()),
             ("activeModel", self.active_model.clone().into()),
             ("defaultMode", self.default_mode.clone().into()),
+            ("agentEffort", self.agent_effort.clone().into()),
+            ("theme", self.theme.clone().into()),
+            ("showThinking", self.show_thinking.into()),
+            ("opencodeApiKey", self.opencode_api_key.clone().into()),
+            ("opencodeAuthMode", self.opencode_auth_mode.clone().into()),
+            ("opencodeServerUrl", self.opencode_server_url.clone().into()),
             ("openaiApiKey", self.openai_api_key.clone().into()),
             ("anthropicApiKey", self.anthropic_api_key.clone().into()),
             ("geminiApiKey", self.gemini_api_key.clone().into()),
@@ -165,15 +230,47 @@ impl AppSettings {
             ("maxAgentIterations", self.max_agent_iterations.into()),
             ("defaultShell", self.default_shell.clone().into()),
             ("editorFontSize", (self.editor_font_size as i64).into()),
+            (
+                "disabledSkills",
+                JsonValue::arr(
+                    self.disabled_skills
+                        .iter()
+                        .cloned()
+                        .map(JsonValue::from)
+                        .collect(),
+                ),
+            ),
         ])
     }
 
     pub fn from_json(v: &JsonValue) -> Self {
         let def = Self::default();
+        let raw_mode = v.string_or("defaultMode", &def.default_mode);
+        let norm_mode = if raw_mode == "plan" {
+            "plan".to_string()
+        } else {
+            "build".to_string()
+        };
+        let disabled_skills = v
+            .get("disabledSkills")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Self {
             active_provider: v.string_or("activeProvider", &def.active_provider),
             active_model: v.string_or("activeModel", &def.active_model),
-            default_mode: v.string_or("defaultMode", &def.default_mode),
+            default_mode: norm_mode,
+            agent_effort: v.string_or("agentEffort", &def.agent_effort),
+            theme: v.string_or("theme", &def.theme),
+            show_thinking: v.bool_or("showThinking", true),
+            opencode_api_key: v.string_or("opencodeApiKey", ""),
+            opencode_auth_mode: v.string_or("opencodeAuthMode", "zen"),
+            opencode_server_url: v.string_or("opencodeServerUrl", &def.opencode_server_url),
             openai_api_key: v.string_or("openaiApiKey", ""),
             anthropic_api_key: v.string_or("anthropicApiKey", ""),
             gemini_api_key: v.string_or("geminiApiKey", ""),
@@ -184,15 +281,24 @@ impl AppSettings {
             require_shell_approval: v.bool_or("requireShellApproval", true),
             require_delete_confirmation: v.bool_or("requireDeleteConfirmation", true),
             restrict_to_workspace: v.bool_or("restrictToWorkspace", true),
-            max_agent_iterations: v.i64_or("maxAgentIterations", 15).clamp(1, 30) as usize,
+            max_agent_iterations: v.i64_or("maxAgentIterations", 16).clamp(1, 50) as usize,
             default_shell: v.string_or("defaultShell", &def.default_shell),
             editor_font_size: v.i64_or("editorFontSize", 15).clamp(11, 24) as i32,
+            disabled_skills,
         }
     }
 
     pub fn preset_models_for_provider(provider: &str) -> &'static [&'static str] {
         match provider {
-            "openai" => &["gpt-4.1", "gpt-4o", "o3-mini", "gpt-4.1-mini"],
+            "opencode" => &[
+                "big-pickle",
+                "glm-4.7-free",
+                "minimax-m2.1-free",
+                "grok-code",
+                "claude-sonnet-4-5",
+                "gpt-5",
+            ],
+            "openai" => &["gpt-4.1", "o4-mini", "gpt-4o", "gpt-4.1-mini"],
             "anthropic" => &[
                 "claude-sonnet-4-20250514",
                 "claude-3-7-sonnet-latest",
@@ -200,8 +306,8 @@ impl AppSettings {
             ],
             "gemini" => &["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
             "openrouter" => &[
-                "anthropic/claude-3.7-sonnet",
-                "openai/gpt-4.1",
+                "anthropic/claude-sonnet-4",
+                "deepseek/deepseek-r1",
                 "deepseek/deepseek-chat-v3-0324",
                 "qwen/qwen-2.5-coder-32b-instruct",
             ],
@@ -212,6 +318,18 @@ impl AppSettings {
                 "llama3.1:8b",
             ],
             _ => &["custom-coding-model"],
+        }
+    }
+
+    pub fn has_credentials_for(&self, provider: &str) -> bool {
+        match provider {
+            "opencode" | "ollama" => true,
+            "openai" => !self.openai_api_key.trim().is_empty(),
+            "anthropic" => !self.anthropic_api_key.trim().is_empty(),
+            "gemini" => !self.gemini_api_key.trim().is_empty(),
+            "openrouter" => !self.openrouter_api_key.trim().is_empty(),
+            "custom" => !self.custom_base_url.trim().is_empty(),
+            _ => false,
         }
     }
 }
@@ -282,6 +400,8 @@ pub struct SessionSummary {
     pub title: String,
     pub project_path: String,
     pub mode: String,
+    pub parent_id: String,
+    pub compacted_count: usize,
     pub updated_at: String,
     pub message_count: usize,
 }
@@ -292,6 +412,8 @@ pub struct SessionDetail {
     pub title: String,
     pub project_path: String,
     pub mode: String,
+    pub parent_id: String,
+    pub compacted_count: usize,
     pub created_at: String,
     pub updated_at: String,
     pub messages: Vec<ChatMessage>,
@@ -338,6 +460,20 @@ unsafe fn bind_str(stmt: *mut Sqlite3Stmt, idx: c_int, s: &str) {
     );
 }
 
+unsafe fn exec_silent(raw: *mut Sqlite3Db, sql_nul: &[u8]) {
+    let mut err: *mut c_char = ptr::null_mut();
+    sqlite3_exec(
+        raw,
+        sql_nul.as_ptr() as *const c_char,
+        ptr::null(),
+        ptr::null_mut(),
+        &mut err,
+    );
+    if !err.is_null() {
+        sqlite3_free(err as *mut c_void);
+    }
+}
+
 impl SqliteStore {
     pub fn open(app_data_dir: &Path) -> Result<Self, String> {
         std::fs::create_dir_all(app_data_dir).map_err(|e| e.to_string())?;
@@ -366,6 +502,8 @@ impl SqliteStore {
                  title TEXT NOT NULL,
                  project_path TEXT NOT NULL,
                  mode TEXT NOT NULL,
+                 parent_id TEXT NOT NULL DEFAULT '',
+                 compacted_count INTEGER NOT NULL DEFAULT 0,
                  created_at TEXT NOT NULL,
                  updated_at TEXT NOT NULL
              );
@@ -413,6 +551,15 @@ impl SqliteStore {
                     return Err(format!("SQLite schema error: {}", s));
                 }
             }
+            // Safe forward migrations for databases created by v2.0
+            exec_silent(
+                raw,
+                b"ALTER TABLE sessions ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''\0",
+            );
+            exec_silent(
+                raw,
+                b"ALTER TABLE sessions ADD COLUMN compacted_count INTEGER NOT NULL DEFAULT 0\0",
+            );
         }
 
         Ok(Self {
@@ -518,10 +665,21 @@ impl SqliteStore {
     }
 
     pub fn create_session(&self, title: &str, project_path: &str, mode: &str) -> SessionDetail {
+        self.create_session_with_parent(title, project_path, mode, "")
+    }
+
+    pub fn create_session_with_parent(
+        &self,
+        title: &str,
+        project_path: &str,
+        mode: &str,
+        parent_id: &str,
+    ) -> SessionDetail {
         let id = make_unique_id("ses");
         let now = now_timestamp_label();
         let guard = self.handle.lock().unwrap();
-        let sql = b"INSERT INTO sessions (id, title, project_path, mode, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)\0";
+        let sql = b"INSERT INTO sessions (id, title, project_path, mode, parent_id, compacted_count, created_at, updated_at) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)\0";
         unsafe {
             let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
             if sqlite3_prepare_v2(
@@ -536,8 +694,9 @@ impl SqliteStore {
                 bind_str(stmt, 2, title);
                 bind_str(stmt, 3, project_path);
                 bind_str(stmt, 4, mode);
-                bind_str(stmt, 5, &now);
+                bind_str(stmt, 5, parent_id);
                 bind_str(stmt, 6, &now);
+                bind_str(stmt, 7, &now);
                 sqlite3_step(stmt);
                 sqlite3_finalize(stmt);
             }
@@ -547,16 +706,134 @@ impl SqliteStore {
             title: title.to_string(),
             project_path: project_path.to_string(),
             mode: mode.to_string(),
+            parent_id: parent_id.to_string(),
+            compacted_count: 0,
             created_at: now.clone(),
             updated_at: now,
             messages: Vec::new(),
         }
     }
 
+    pub fn rename_session(&self, session_id: &str, new_title: &str) {
+        let guard = self.handle.lock().unwrap();
+        let sql = b"UPDATE sessions SET title = ?1 WHERE id = ?2\0";
+        unsafe {
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            if sqlite3_prepare_v2(
+                guard.0,
+                sql.as_ptr() as *const c_char,
+                -1,
+                &mut stmt,
+                ptr::null_mut(),
+            ) == SQLITE_OK
+            {
+                bind_str(stmt, 1, new_title);
+                bind_str(stmt, 2, session_id);
+                sqlite3_step(stmt);
+                sqlite3_finalize(stmt);
+            }
+        }
+    }
+
+    /// Forks `source_session_id` (optionally up to `up_to_msg_idx` inclusive for Timeline point-in-time forking!)
+    /// into a brand-new independent session with full message/tool lineage preserved.
+    pub fn fork_session(
+        &self,
+        source_session_id: &str,
+        up_to_msg_idx: Option<usize>,
+    ) -> Option<SessionDetail> {
+        let src = self.load_session(source_session_id)?;
+        let fork_title = match up_to_msg_idx {
+            Some(idx) => format!("Fork #{} · {}", idx + 1, src.title),
+            None => format!("Fork · {}", src.title),
+        };
+        let created =
+            self.create_session_with_parent(&fork_title, &src.project_path, &src.mode, &src.id);
+        let limit = up_to_msg_idx
+            .map(|i| (i + 1).min(src.messages.len()))
+            .unwrap_or(src.messages.len());
+
+        for orig in src.messages.into_iter().take(limit) {
+            let mut cloned = orig;
+            cloned.id = make_unique_id("msg");
+            cloned.session_id = created.id.clone();
+            self.append_message(&cloned);
+        }
+        self.load_session(&created.id)
+    }
+
+    /// Compacts a session's older messages into a structured checkpoint message while keeping
+    /// the last 2 messages intact for immediate conversational continuity.
+    pub fn compact_session(&self, session_id: &str, summary_markdown: &str) -> Option<SessionDetail> {
+        let cur = self.load_session(session_id)?;
+        if cur.messages.is_empty() {
+            return Some(cur);
+        }
+        let tail_keep = if cur.messages.len() > 2 { 2 } else { 0 };
+        let tail: Vec<ChatMessage> = cur.messages[cur.messages.len() - tail_keep..].to_vec();
+
+        {
+            let guard = self.handle.lock().unwrap();
+            let d_sql = b"DELETE FROM messages WHERE session_id = ?1\0";
+            unsafe {
+                let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+                if sqlite3_prepare_v2(
+                    guard.0,
+                    d_sql.as_ptr() as *const c_char,
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ) == SQLITE_OK
+                {
+                    bind_str(stmt, 1, session_id);
+                    sqlite3_step(stmt);
+                    sqlite3_finalize(stmt);
+                }
+
+                let u_sql = b"UPDATE sessions SET compacted_count = compacted_count + 1, updated_at = ?1 WHERE id = ?2\0";
+                let mut ustmt: *mut Sqlite3Stmt = ptr::null_mut();
+                if sqlite3_prepare_v2(
+                    guard.0,
+                    u_sql.as_ptr() as *const c_char,
+                    -1,
+                    &mut ustmt,
+                    ptr::null_mut(),
+                ) == SQLITE_OK
+                {
+                    let now = now_timestamp_label();
+                    bind_str(ustmt, 1, &now);
+                    bind_str(ustmt, 2, session_id);
+                    sqlite3_step(ustmt);
+                    sqlite3_finalize(ustmt);
+                }
+            }
+        }
+
+        self.append_message(&ChatMessage {
+            id: make_unique_id("msg"),
+            session_id: session_id.to_string(),
+            role: "assistant".to_string(),
+            content: format!("**[Compacted Context Checkpoint]**\n{}", summary_markdown.trim()),
+            thinking: String::new(),
+            mode: cur.mode.clone(),
+            provider: "compactor".to_string(),
+            model: "checkpoint".to_string(),
+            tools: Vec::new(),
+            created_at: now_timestamp_label(),
+        });
+
+        for mut m in tail {
+            m.id = make_unique_id("msg");
+            self.append_message(&m);
+        }
+
+        self.load_session(session_id)
+    }
+
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
         let guard = self.handle.lock().unwrap();
         let mut out = Vec::new();
-        let sql = b"SELECT s.id, s.title, s.project_path, s.mode, s.updated_at, \
+        let sql = b"SELECT s.id, s.title, s.project_path, s.mode, s.parent_id, s.compacted_count, s.updated_at, \
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) \
                     FROM sessions s ORDER BY s.updated_at DESC\0";
         unsafe {
@@ -575,8 +852,10 @@ impl SqliteStore {
                         title: col_string(stmt, 1),
                         project_path: col_string(stmt, 2),
                         mode: col_string(stmt, 3),
-                        updated_at: col_string(stmt, 4),
-                        message_count: sqlite3_column_int64(stmt, 5).max(0) as usize,
+                        parent_id: col_string(stmt, 4),
+                        compacted_count: sqlite3_column_int64(stmt, 5).max(0) as usize,
+                        updated_at: col_string(stmt, 6),
+                        message_count: sqlite3_column_int64(stmt, 7).max(0) as usize,
                     });
                 }
                 sqlite3_finalize(stmt);
@@ -587,7 +866,8 @@ impl SqliteStore {
 
     pub fn load_session(&self, session_id: &str) -> Option<SessionDetail> {
         let guard = self.handle.lock().unwrap();
-        let sql = b"SELECT id, title, project_path, mode, created_at, updated_at FROM sessions WHERE id = ?1\0";
+        let sql = b"SELECT id, title, project_path, mode, parent_id, compacted_count, created_at, updated_at \
+                    FROM sessions WHERE id = ?1\0";
         let mut detail = unsafe {
             let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
             if sqlite3_prepare_v2(
@@ -607,8 +887,10 @@ impl SqliteStore {
                     title: col_string(stmt, 1),
                     project_path: col_string(stmt, 2),
                     mode: col_string(stmt, 3),
-                    created_at: col_string(stmt, 4),
-                    updated_at: col_string(stmt, 5),
+                    parent_id: col_string(stmt, 4),
+                    compacted_count: sqlite3_column_int64(stmt, 5).max(0) as usize,
+                    created_at: col_string(stmt, 6),
+                    updated_at: col_string(stmt, 7),
                     messages: Vec::new(),
                 })
             } else {
@@ -667,12 +949,13 @@ impl SqliteStore {
                 return loaded;
             }
         }
-        self.create_session("Initial Coding Session", project_path, "autonomous")
+        self.create_session("New Session", project_path, "build")
     }
 
     pub fn append_message(&self, msg: &ChatMessage) {
         let guard = self.handle.lock().unwrap();
-        let tools_json = JsonValue::arr(msg.tools.iter().map(|t| t.to_json()).collect()).to_json_string();
+        let tools_json =
+            JsonValue::arr(msg.tools.iter().map(|t| t.to_json()).collect()).to_json_string();
         let sql = b"INSERT INTO messages \
             (id, session_id, role, content, thinking, mode, provider, model, tools_json, created_at) \
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)\0";
@@ -701,7 +984,7 @@ impl SqliteStore {
             }
 
             if msg.role == "user" {
-                let short_title: String = msg.content.chars().take(42).collect();
+                let short_title: String = msg.content.chars().take(44).collect();
                 let u_sql = b"UPDATE sessions SET updated_at = ?1, \
                     title = CASE WHEN title IN ('Initial Coding Session', 'New Session') THEN ?2 ELSE title END \
                     WHERE id = ?3\0";
@@ -821,30 +1104,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sqlite_persistence_roundtrip() {
+    fn sqlite_persistence_fork_and_compact() {
         let dir = std::env::temp_dir().join(make_unique_id("sqltest"));
         let store = SqliteStore::open(&dir).expect("open sqlite");
         let mut s = store.load_settings();
-        s.active_provider = "anthropic".to_string();
+        s.active_provider = "opencode".to_string();
+        s.agent_effort = "ultra".to_string();
         store.save_settings(&s);
-        assert_eq!(store.load_settings().active_provider, "anthropic");
+        assert_eq!(store.load_settings().agent_effort, "ultra");
 
-        let ses = store.create_session("Refactor Engine", "/tmp/proj", "autonomous");
-        store.append_message(&ChatMessage {
-            id: make_unique_id("msg"),
-            session_id: ses.id.clone(),
-            role: "user".to_string(),
-            content: "Build pure rust GUI".to_string(),
-            thinking: String::new(),
-            mode: "autonomous".to_string(),
-            provider: "anthropic".to_string(),
-            model: "claude-sonnet-4-20250514".to_string(),
-            tools: Vec::new(),
-            created_at: now_timestamp_label(),
-        });
-        let loaded = store.load_session(&ses.id).expect("session exists");
-        assert_eq!(loaded.messages.len(), 1);
-        assert_eq!(loaded.messages[0].content, "Build pure rust GUI");
+        let ses = store.create_session("Build Auth", "/tmp/proj", "build");
+        for i in 1..=4 {
+            store.append_message(&ChatMessage {
+                id: make_unique_id("msg"),
+                session_id: ses.id.clone(),
+                role: if i % 2 == 1 { "user".into() } else { "assistant".into() },
+                content: format!("Turn {}", i),
+                thinking: "Analyzing...".into(),
+                mode: "build".into(),
+                provider: "opencode".into(),
+                model: "big-pickle".into(),
+                tools: Vec::new(),
+                created_at: now_timestamp_label(),
+            });
+        }
+
+        // Test point-in-time fork at message index 1 (first 2 messages)
+        let forked = store.fork_session(&ses.id, Some(1)).expect("forked");
+        assert_eq!(forked.parent_id, ses.id);
+        assert_eq!(forked.messages.len(), 2);
+
+        // Test compaction
+        let compacted = store
+            .compact_session(&ses.id, "- Implemented JWT middleware\n- Tests green")
+            .expect("compacted");
+        assert_eq!(compacted.compacted_count, 1);
+        assert_eq!(compacted.messages.len(), 3); // 1 checkpoint + last 2 kept
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

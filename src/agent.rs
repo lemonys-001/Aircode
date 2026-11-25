@@ -1,15 +1,20 @@
 //! Pure-Rust Multi-Provider Autonomous AI Coding Agent Engine (9 Tools + Permission Gate + Emergency Stop).
 
+use crate::browser::SharedBrowser;
 use crate::fs_ops::{
     compute_unified_diff, resolve_workspace_path, scan_project_tree, search_project_files,
 };
 use crate::git_ops::run_git;
 use crate::json::JsonValue;
-use crate::platform::http_request;
+use crate::mcp::{call_mcp_tool, load_mcp_configs};
+use crate::opencode_auth::{call_local_opencode_server, discover_local_credentials};
+use crate::platform::{app_data_dir, http_request};
+use crate::skills::{format_enabled_skills_for_prompt, load_all_skills, save_workspace_skill};
 use crate::sqlite::{
     make_unique_id, now_timestamp_label, AppSettings, ChatMessage, SessionDetail, SqliteStore,
     ToolExecutionRecord,
 };
+use crate::subagents::{load_all_subagents, save_subagent, SubAgentSpec};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,6 +47,8 @@ pub enum AgentUiEvent {
     ToolFinished(ToolExecutionRecord),
     PermissionRequested(PermissionPrompt),
     WorkspaceMutated,
+    OpenBrowserViewport,
+    ReloadCustomizations,
     Error(String),
     Done(Option<SessionDetail>),
 }
@@ -309,6 +316,127 @@ fn tool_schemas_openai() -> JsonValue {
             "required": ["subcommand"]
           }
         }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "browser_navigate",
+          "description": "Open a URL (localhost dev server, docs, or web app) in AirCode's inbuilt Agentic Browser and return a Playwright-style [eN] snapshot.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "url": { "type": "string", "description": "Target URL such as http://localhost:3000 or https://..." }
+            },
+            "required": ["url"]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "browser_snapshot",
+          "description": "Return the current Playwright-style accessibility & [eN] interactive element snapshot of AirCode's inbuilt Agentic Browser.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "browser_click",
+          "description": "Click an interactive link or button in AirCode's inbuilt Agentic Browser by its numeric ref (e.g. ref_id=3 for [e3]).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "ref_id": { "type": "integer", "description": "Numeric element ref ID from browser_snapshot" }
+            },
+            "required": ["ref_id"]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "browser_type",
+          "description": "Type text into an input element [eN] in AirCode's inbuilt Agentic Browser, optionally submitting its form.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "ref_id": { "type": "integer" },
+              "text": { "type": "string" },
+              "submit": { "type": "boolean" }
+            },
+            "required": ["ref_id", "text"]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "create_skill",
+          "description": "Create or update a reusable workspace skill in .aircode/skills/<slug>/SKILL.md.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "slug": { "type": "string" },
+              "title": { "type": "string" },
+              "description": { "type": "string" },
+              "instructions": { "type": "string" }
+            },
+            "required": ["slug", "title", "instructions"]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "create_subagent",
+          "description": "Create or update a specialized AI sub-agent in .aircode/subagents/<slug>.json so you can delegate tasks to it via run_subagent.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "slug": { "type": "string" },
+              "title": { "type": "string" },
+              "effort": { "type": "string", "enum": ["low", "medium", "max", "ultra"] },
+              "readonly": { "type": "boolean" },
+              "system_prompt": { "type": "string" }
+            },
+            "required": ["slug", "title", "system_prompt"]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "run_subagent",
+          "description": "Delegate a focused subtask to a built-in or self-built sub-agent (e.g. explorer, architect, test-healer, browser-verifier, or any custom slug).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "slug": { "type": "string" },
+              "task": { "type": "string" }
+            },
+            "required": ["slug", "task"]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "mcp_call",
+          "description": "Invoke a Model Context Protocol (MCP) tool exposed by a server configured in .aircode/mcp.json.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "server": { "type": "string" },
+              "tool": { "type": "string" },
+              "arguments": { "type": "object" }
+            },
+            "required": ["server", "tool"]
+          }
+        }
       }
     ]"#,
     )
@@ -368,16 +496,21 @@ fn execute_tool(
     project_root: &Path,
     settings: &AppSettings,
     gate: &PermissionGate,
+    browser: &SharedBrowser,
     tx: &Sender<AgentUiEvent>,
     session_id: &str,
     mode: &str,
+    allow_subagent_recursion: bool,
     call: &NormalizedCall,
 ) -> (String, ToolExecutionRecord) {
     let started = Instant::now();
     let args_json = call.args.to_json_string();
     let name = call.name.as_str();
 
-    let is_mut_file = matches!(name, "write_file" | "edit_file");
+    let is_mut_file = matches!(
+        name,
+        "write_file" | "edit_file" | "create_skill" | "create_subagent"
+    );
     let is_shell = matches!(name, "execute_command" | "install_dependencies" | "run_tests");
     let is_mut_git = name == "git_operation"
         && matches!(call.args.str_or("subcommand", ""), "add" | "commit");
@@ -481,6 +614,9 @@ fn execute_tool(
                         Ok(_) => {
                             let diff = compute_unified_diff(p, &old, content);
                             let _ = tx.send(AgentUiEvent::WorkspaceMutated);
+                            if p.contains(".aircode") {
+                                let _ = tx.send(AgentUiEvent::ReloadCustomizations);
+                            }
                             let m = format!("Wrote {} bytes to {}", content.len(), p);
                             (m.clone(), finish("ok", m, diff, p.to_string()))
                         }
@@ -512,6 +648,9 @@ fn execute_tool(
                                 Ok(_) => {
                                     let diff = compute_unified_diff(p, &existing, &updated);
                                     let _ = tx.send(AgentUiEvent::WorkspaceMutated);
+                                    if p.contains(".aircode") {
+                                        let _ = tx.send(AgentUiEvent::ReloadCustomizations);
+                                    }
                                     let m = format!("Edited {} successfully", p);
                                     (m.clone(), finish("ok", m, diff, p.to_string()))
                                 }
@@ -718,11 +857,266 @@ fn execute_tool(
                 Err(e) => (e.clone(), finish("error", e, String::new(), String::new())),
             }
         }
+        "browser_navigate" => {
+            let url = call.args.str_or("url", "aircode://welcome");
+            let _ = tx.send(AgentUiEvent::OpenBrowserViewport);
+            match browser.navigate(url, true) {
+                Ok(snap) => (
+                    snap,
+                    finish(
+                        "ok",
+                        format!("Browsed {}", url),
+                        String::new(),
+                        String::new(),
+                    ),
+                ),
+                Err(e) => (e.clone(), finish("error", e, String::new(), String::new())),
+            }
+        }
+        "browser_snapshot" => {
+            let _ = tx.send(AgentUiEvent::OpenBrowserViewport);
+            let snap = browser.snapshot(50);
+            (
+                snap,
+                finish(
+                    "ok",
+                    "Captured Agentic Browser DOM snapshot".into(),
+                    String::new(),
+                    String::new(),
+                ),
+            )
+        }
+        "browser_click" => {
+            let ref_id = call.args.i64_or("ref_id", 1).max(1) as usize;
+            let _ = tx.send(AgentUiEvent::OpenBrowserViewport);
+            match browser.click_ref(ref_id, true) {
+                Ok(snap) => (
+                    snap,
+                    finish(
+                        "ok",
+                        format!("Clicked browser element [e{}]", ref_id),
+                        String::new(),
+                        String::new(),
+                    ),
+                ),
+                Err(e) => (e.clone(), finish("error", e, String::new(), String::new())),
+            }
+        }
+        "browser_type" => {
+            let ref_id = call.args.i64_or("ref_id", 1).max(1) as usize;
+            let txt = call.args.str_or("text", "");
+            let submit = call.args.bool_or("submit", false);
+            let _ = tx.send(AgentUiEvent::OpenBrowserViewport);
+            match browser.type_into_ref(ref_id, txt, submit, true) {
+                Ok(snap) => (
+                    snap,
+                    finish(
+                        "ok",
+                        format!("Typed into browser [e{}]", ref_id),
+                        String::new(),
+                        String::new(),
+                    ),
+                ),
+                Err(e) => (e.clone(), finish("error", e, String::new(), String::new())),
+            }
+        }
+        "create_skill" => {
+            let slug = call.args.str_or("slug", "custom-skill");
+            let title = call.args.str_or("title", "Custom Skill");
+            let desc = call.args.str_or("description", "AI-created workspace skill");
+            let instr = call.args.str_or("instructions", "");
+            match save_workspace_skill(project_root, slug, title, desc, instr) {
+                Ok(path) => {
+                    let _ = tx.send(AgentUiEvent::WorkspaceMutated);
+                    let _ = tx.send(AgentUiEvent::ReloadCustomizations);
+                    let m = format!("Created skill '{}' at {}", slug, path.display());
+                    (m.clone(), finish("ok", m, String::new(), path.to_string_lossy().into_owned()))
+                }
+                Err(e) => (e.clone(), finish("error", e, String::new(), String::new())),
+            }
+        }
+        "create_subagent" => {
+            let spec = SubAgentSpec {
+                slug: call.args.string_or("slug", "helper-agent"),
+                title: call.args.string_or("title", "Helper Sub-Agent"),
+                effort: call.args.string_or("effort", "medium"),
+                readonly: call.args.bool_or("readonly", false),
+                system_prompt: call.args.string_or("system_prompt", ""),
+                builtin: false,
+            };
+            match save_subagent(project_root, &spec) {
+                Ok(path) => {
+                    let _ = tx.send(AgentUiEvent::WorkspaceMutated);
+                    let _ = tx.send(AgentUiEvent::ReloadCustomizations);
+                    let m = format!("Built sub-agent '{}' ({})", spec.slug, path.display());
+                    (m.clone(), finish("ok", m, String::new(), path.to_string_lossy().into_owned()))
+                }
+                Err(e) => (e.clone(), finish("error", e, String::new(), String::new())),
+            }
+        }
+        "run_subagent" => {
+            if !allow_subagent_recursion {
+                let m = "Nested sub-agents cannot spawn further sub-agents.".to_string();
+                return (m.clone(), finish("denied", m, String::new(), String::new()));
+            }
+            let slug = call.args.str_or("slug", "explorer");
+            let task = call.args.str_or("task", "");
+            let specs = load_all_subagents(project_root);
+            let Some(spec) = specs.into_iter().find(|s| s.slug == slug) else {
+                let m = format!("Sub-agent '{}' not found. Call create_subagent first or use explorer/architect/test-healer/browser-verifier.", slug);
+                return (m.clone(), finish("error", m, String::new(), String::new()));
+            };
+            let sub_mode = if mode == "plan" || spec.readonly {
+                "plan"
+            } else {
+                mode
+            };
+            let mut sub_settings = settings.clone();
+            sub_settings.agent_effort = spec.effort.clone();
+            let sub_sys = format!(
+                "You are AirCode Sub-Agent `{}` ({}).\n{}\nWorkspace: {}\nReturn a concise, verified engineering report to the parent agent.",
+                spec.slug,
+                spec.title,
+                spec.system_prompt,
+                project_root.display()
+            );
+            let mut sub_conv = vec![JsonValue::obj(vec![
+                ("role", "user".into()),
+                ("content", task.into()),
+            ])];
+            let sub_iters = sub_settings.effort_max_iters().min(8);
+            let mut sub_report = String::new();
+            for step in 1..=sub_iters {
+                if gate.is_stopped() {
+                    break;
+                }
+                let _ = tx.send(AgentUiEvent::Status(format!(
+                    "Sub-Agent `{}` step {}/{}",
+                    spec.slug, step, sub_iters
+                )));
+                match call_model_provider(
+                    &sub_settings,
+                    &sub_settings.active_provider,
+                    &sub_settings.active_model,
+                    &sub_sys,
+                    &sub_conv,
+                ) {
+                    Ok(rep) => {
+                        if !rep.text.is_empty() {
+                            sub_report = rep.text.clone();
+                        }
+                        if rep.calls.is_empty() {
+                            break;
+                        }
+                        let oa_calls: Vec<JsonValue> = rep
+                            .calls
+                            .iter()
+                            .map(|c| {
+                                JsonValue::obj(vec![
+                                    ("id", c.id.clone().into()),
+                                    ("type", "function".into()),
+                                    (
+                                        "function",
+                                        JsonValue::obj(vec![
+                                            ("name", c.name.clone().into()),
+                                            ("arguments", c.args.to_json_string().into()),
+                                        ]),
+                                    ),
+                                ])
+                            })
+                            .collect();
+                        sub_conv.push(JsonValue::obj(vec![
+                            ("role", "assistant".into()),
+                            ("content", rep.text.into()),
+                            ("tool_calls", JsonValue::arr(oa_calls)),
+                        ]));
+                        for sc in &rep.calls {
+                            let (tout, _) = execute_tool(
+                                project_root,
+                                &sub_settings,
+                                gate,
+                                browser,
+                                tx,
+                                session_id,
+                                sub_mode,
+                                false,
+                                sc,
+                            );
+                            sub_conv.push(JsonValue::obj(vec![
+                                ("role", "tool".into()),
+                                ("tool_call_id", sc.id.clone().into()),
+                                ("name", sc.name.clone().into()),
+                                ("content", tout.into()),
+                            ]));
+                        }
+                    }
+                    Err(e) => {
+                        sub_report = format!("Sub-agent `{}` error: {}", spec.slug, e);
+                        break;
+                    }
+                }
+            }
+            if sub_report.is_empty() {
+                sub_report = format!("Sub-agent `{}` completed delegated task.", spec.slug);
+            }
+            (
+                format!("[Sub-Agent `{}` Report]\n{}", spec.slug, sub_report),
+                finish(
+                    "ok",
+                    format!("Sub-agent `{}` finished", spec.slug),
+                    String::new(),
+                    String::new(),
+                ),
+            )
+        }
+        "mcp_call" => {
+            let server = call.args.str_or("server", "");
+            let tool = call.args.str_or("tool", "");
+            let args = call
+                .args
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| JsonValue::obj(vec![]));
+            let servers = load_mcp_configs(project_root, &app_data_dir());
+            match call_mcp_tool(&servers, project_root, server, tool, args) {
+                Ok(out) => (
+                    out,
+                    finish(
+                        "ok",
+                        format!("MCP {}/{}", server, tool),
+                        String::new(),
+                        String::new(),
+                    ),
+                ),
+                Err(e) => (e.clone(), finish("error", e, String::new(), String::new())),
+            }
+        }
         other => {
             let m = format!("Unknown tool '{}'", other);
             (m.clone(), finish("error", m, String::new(), String::new()))
         }
     }
+}
+
+fn split_think_tags(raw_text: &str, existing_thinking: &str) -> (String, String) {
+    let mut thinking = existing_thinking.to_string();
+    let mut clean_text = raw_text.to_string();
+    while let Some(start) = clean_text.find("<think>") {
+        if let Some(end_rel) = clean_text[start + 7..].find("</think>") {
+            let end = start + 7 + end_rel;
+            let inner = clean_text[start + 7..end].trim();
+            if !inner.is_empty() {
+                if !thinking.is_empty() {
+                    thinking.push('\n');
+                }
+                thinking.push_str(inner);
+            }
+            clean_text.replace_range(start..(end + 8), "");
+        } else {
+            break;
+        }
+    }
+    (clean_text.trim().to_string(), thinking)
 }
 
 fn call_model_provider(
@@ -735,8 +1129,14 @@ fn call_model_provider(
     let oa_tools = tool_schemas_openai();
 
     if provider == "anthropic" {
-        if settings.anthropic_api_key.trim().is_empty() {
-            return Err("Anthropic API key is empty. Click [Settings] in the top bar to configure your key, or switch to Ollama.".to_string());
+        let disc = discover_local_credentials(&settings.opencode_server_url, &settings.ollama_base_url);
+        let anth_key = if !settings.anthropic_api_key.trim().is_empty() {
+            settings.anthropic_api_key.trim().to_string()
+        } else {
+            disc.anthropic_key.unwrap_or_default()
+        };
+        if anth_key.is_empty() {
+            return Err("Anthropic API key is empty. Press Ctrl+K -> /connect to paste your key or switch to OpenCode Zen.".to_string());
         }
         let mut anth_tools = Vec::new();
         if let Some(arr) = oa_tools.as_array() {
@@ -816,19 +1216,33 @@ fn call_model_provider(
             }
         }
 
-        let payload = JsonValue::obj(vec![
+        let use_ext_thinking = matches!(settings.agent_effort.as_str(), "max" | "ultra")
+            && (model.contains("3-7") || model.contains("sonnet-4") || model.contains("opus-4"));
+        let budget = settings.effort_thinking_budget().clamp(1024, 16000) as i64;
+        let max_toks = if use_ext_thinking { budget + 4096 } else { 4096 };
+        let mut p_fields = vec![
             ("model", model.into()),
-            ("max_tokens", 4096i64.into()),
+            ("max_tokens", max_toks.into()),
             ("system", system_prompt.into()),
             ("tools", JsonValue::arr(anth_tools)),
             ("messages", JsonValue::arr(anth_msgs)),
-        ]);
+        ];
+        if use_ext_thinking {
+            p_fields.push((
+                "thinking",
+                JsonValue::obj(vec![
+                    ("type", "enabled".into()),
+                    ("budget_tokens", budget.into()),
+                ]),
+            ));
+        }
+        let payload = JsonValue::obj(p_fields);
         let resp = http_request(
             "POST",
             "https://api.anthropic.com/v1/messages",
             &[
                 ("Content-Type", "application/json"),
-                ("x-api-key", settings.anthropic_api_key.trim()),
+                ("x-api-key", &anth_key),
                 ("anthropic-version", "2023-06-01"),
             ],
             &payload.to_json_string(),
@@ -1038,42 +1452,94 @@ fn call_model_provider(
         });
     }
 
-    // OpenAI-compatible protocol: openai, openrouter, ollama, custom
-    let (endpoint, bearer) = match provider {
+    // OpenCode local server bridge workaround (`opencode serve --port 4096`)
+    if provider == "opencode" && settings.opencode_auth_mode == "local-serve" {
+        let joined_prompt = conv
+            .last()
+            .map(|m| m.string_or("content", ""))
+            .unwrap_or_default();
+        let text = call_local_opencode_server(
+            &settings.opencode_server_url,
+            model,
+            system_prompt,
+            &joined_prompt,
+        )?;
+        let (clean_t, th) = split_think_tags(&text, "");
+        return Ok(TurnReply {
+            text: clean_t,
+            thinking: th,
+            calls: Vec::new(),
+        });
+    }
+
+    // OpenAI-compatible protocol: opencode (Zen gateway + public/key workaround), openai, openrouter, ollama, custom
+    let discovered = discover_local_credentials(&settings.opencode_server_url, &settings.ollama_base_url);
+    let (endpoint, bearer, is_opencode_zen) = match provider {
+        "opencode" => {
+            let key = if !settings.opencode_api_key.trim().is_empty() {
+                settings.opencode_api_key.trim().to_string()
+            } else if let Some(k) = discovered.opencode_zen_key {
+                k
+            } else {
+                // Zero-key OpenCode Zen public client workaround for free coding models!
+                "public".to_string()
+            };
+            (
+                "https://opencode.ai/zen/v1/chat/completions".to_string(),
+                key,
+                true,
+            )
+        }
         "openai" => {
-            if settings.openai_api_key.trim().is_empty() {
+            let key = if !settings.openai_api_key.trim().is_empty() {
+                settings.openai_api_key.trim().to_string()
+            } else {
+                discovered.openai_key.unwrap_or_default()
+            };
+            if key.is_empty() {
                 return Err(
-                    "OpenAI API key is empty. Configure it in [Settings] or switch to local Ollama."
+                    "OpenAI API key is empty. Press Ctrl+K -> /connect to paste your key or switch to OpenCode Zen."
                         .to_string(),
                 );
             }
             (
                 "https://api.openai.com/v1/chat/completions".to_string(),
-                settings.openai_api_key.trim().to_string(),
+                key,
+                false,
             )
         }
         "openrouter" => {
-            if settings.openrouter_api_key.trim().is_empty() {
-                return Err("OpenRouter API key is empty. Configure it in [Settings].".to_string());
+            let key = if !settings.openrouter_api_key.trim().is_empty() {
+                settings.openrouter_api_key.trim().to_string()
+            } else {
+                discovered.openrouter_key.unwrap_or_default()
+            };
+            if key.is_empty() {
+                return Err(
+                    "OpenRouter API key is empty. Press Ctrl+K -> /connect to configure it."
+                        .to_string(),
+                );
             }
             (
                 "https://openrouter.ai/api/v1/chat/completions".to_string(),
-                settings.openrouter_api_key.trim().to_string(),
+                key,
+                false,
             )
         }
         "custom" => {
             let base = settings.custom_base_url.trim().trim_end_matches('/');
             if base.is_empty() {
-                return Err("Custom Base URL is empty in [Settings].".to_string());
+                return Err("Custom Base URL is empty. Open /connect to set it.".to_string());
             }
             (
                 format!("{}/chat/completions", base),
                 settings.custom_api_key.trim().to_string(),
+                false,
             )
         }
         _ => {
             let base = settings.ollama_base_url.trim().trim_end_matches('/');
-            (format!("{}/v1/chat/completions", base), String::new())
+            (format!("{}/v1/chat/completions", base), String::new(), false)
         }
     };
 
@@ -1083,17 +1549,27 @@ fn call_model_provider(
     ])];
     msgs.extend_from_slice(conv);
 
-    let payload = JsonValue::obj(vec![
+    let mut fields = vec![
         ("model", model.into()),
         ("messages", JsonValue::arr(msgs)),
         ("tools", oa_tools),
         ("tool_choice", "auto".into()),
-    ]);
+    ];
+    if provider == "openai" && model.starts_with('o') {
+        fields.push(("reasoning_effort", settings.effort_openai_tag().into()));
+    }
+    let payload = JsonValue::obj(fields);
 
     let auth_val = format!("Bearer {}", bearer);
     let mut hdrs = vec![("Content-Type", "application/json")];
     if !bearer.is_empty() {
         hdrs.push(("Authorization", auth_val.as_str()));
+    }
+    if is_opencode_zen {
+        hdrs.push(("User-Agent", "opencode/1.0"));
+        hdrs.push(("HTTP-Referer", "https://opencode.ai/"));
+        hdrs.push(("X-Title", "opencode"));
+        hdrs.push(("x-opencode-client", "cli"));
     }
 
     let resp = http_request("POST", &endpoint, &hdrs, &payload.to_json_string(), 120_000);
@@ -1116,12 +1592,13 @@ fn call_model_provider(
         .and_then(|c| c.get("message"))
         .ok_or_else(|| "Missing choices[0].message in response".to_string())?;
 
-    let text = msg.string_or("content", "");
-    let thinking = msg
+    let raw_text = msg.string_or("content", "");
+    let raw_reasoning = msg
         .get("reasoning_content")
+        .or_else(|| msg.get("reasoning"))
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
+    let (text, thinking) = split_think_tags(&raw_text, raw_reasoning);
 
     let mut calls = Vec::new();
     if let Some(arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
@@ -1156,9 +1633,80 @@ impl<T> VecExt for Vec<T> {
     }
 }
 
+pub fn spawn_session_compaction(
+    store: Arc<SqliteStore>,
+    session_id: String,
+    tx: Sender<AgentUiEvent>,
+) {
+    std::thread::spawn(move || {
+        let Some(detail) = store.load_session(&session_id) else {
+            let _ = tx.send(AgentUiEvent::Done(None));
+            return;
+        };
+        if detail.messages.len() <= 2 {
+            let _ = tx.send(AgentUiEvent::Status(
+                "Session is already compact (<= 2 messages).".into(),
+            ));
+            let _ = tx.send(AgentUiEvent::Done(Some(detail)));
+            return;
+        }
+        let _ = tx.send(AgentUiEvent::Status(
+            "Compacting session context into a clean checkpoint...".into(),
+        ));
+
+        let mut transcript = String::new();
+        let mut bullet_fallback = Vec::new();
+        for (idx, m) in detail.messages.iter().enumerate() {
+            let snippet: String = m.content.chars().take(300).collect();
+            transcript.push_str(&format!("[#{} {} @ {}]: {}\n", idx + 1, m.role, m.created_at, snippet));
+            if m.role == "user" {
+                let first_line = m.content.lines().next().unwrap_or("").chars().take(90).collect::<String>();
+                bullet_fallback.push(format!("- Prompt #{}: {}", idx + 1, first_line));
+            } else if !m.tools.is_empty() {
+                let tnames: Vec<String> = m.tools.iter().map(|t| t.tool_name.clone()).collect();
+                bullet_fallback.push(format!("- Tools executed: {}", tnames.join(", ")));
+            }
+        }
+
+        let settings = store.load_settings();
+        let sum_conv = vec![JsonValue::obj(vec![
+            ("role", "user".into()),
+            (
+                "content",
+                format!(
+                    "Summarize this coding session concisely into bullet points covering: (1) User goals, (2) Files modified & key architecture decisions, (3) Remaining next steps:\n\n{}",
+                    transcript
+                )
+                .into(),
+            ),
+        ])];
+
+        let summary = match call_model_provider(
+            &settings,
+            &settings.active_provider,
+            &settings.active_model,
+            "You are AirCode's Context Compactor. Return a concise markdown bullet checkpoint.",
+            &sum_conv,
+        ) {
+            Ok(rep) if !rep.text.trim().is_empty() => rep.text,
+            _ => {
+                if bullet_fallback.is_empty() {
+                    format!("Compacted {} earlier messages.", detail.messages.len())
+                } else {
+                    bullet_fallback.join("\n")
+                }
+            }
+        };
+
+        let updated = store.compact_session(&session_id, &summary);
+        let _ = tx.send(AgentUiEvent::Done(updated));
+    });
+}
+
 pub fn spawn_autonomous_agent_run(
     store: Arc<SqliteStore>,
     gate: Arc<PermissionGate>,
+    browser: SharedBrowser,
     project_root: PathBuf,
     session_id: String,
     prompt: String,
@@ -1170,6 +1718,7 @@ pub fn spawn_autonomous_agent_run(
         let settings = store.load_settings();
         let provider = settings.active_provider.clone();
         let model = settings.active_model.clone();
+        let effort = settings.agent_effort.clone();
 
         store.append_message(&ChatMessage {
             id: make_unique_id("msg"),
@@ -1186,7 +1735,7 @@ pub fn spawn_autonomous_agent_run(
 
         let mut conv: Vec<JsonValue> = Vec::new();
         if let Some(detail) = store.load_session(&session_id) {
-            let skip_n = detail.messages.len().saturating_sub(20);
+            let skip_n = detail.messages.len().saturating_sub(24);
             for m in detail.messages.into_iter().skip(skip_n) {
                 if m.role == "user" || m.role == "assistant" {
                     conv.push(JsonValue::obj(vec![
@@ -1211,20 +1760,55 @@ pub fn spawn_autonomous_agent_run(
                 .collect();
 
         let mode_instruction = match mode.as_str() {
-            "plan" => "MODE: PLAN (Strict Read-Only). Inspect files and return a thorough file-by-file architectural plan without modifying files.",
-            "ask" => "MODE: ASK. Mutating tools will prompt the user for confirmation.",
-            _ => "MODE: AUTONOMOUS. Proactively inspect files, implement complete multi-file changes, run diagnose_errors / run_tests to verify compilation, fix any errors automatically, and summarize verified results.",
+            "plan" => "MODE: PLAN (Strict Read-Only Blueprint). Do NOT modify files or run shell commands. Research the codebase with read_file / search_project / browser_snapshot and output a crisp, file-by-file implementation plan.",
+            _ => "MODE: BUILD (Autonomous Engineering). Proactively read target files, apply clean edits, verify with diagnose_errors / run_tests / Agentic Browser tools, and report verified results.",
+        };
+
+        let effort_instruction = match effort.as_str() {
+            "low" => "EFFORT: LOW — Be fast, direct, and minimal. Avoid unnecessary exploration.",
+            "max" => "EFFORT: MAX — Think deeply inside <think>...</think> before acting, inspect edge cases across callers, and run compiler/test diagnostics to verify.",
+            "ultra" => "EFFORT: ULTRA — Maximum first-principles reasoning inside <think>...</think>, thorough multi-file audit, sub-agent delegation when helpful, and full compile/test verification.",
+            _ => "EFFORT: MEDIUM — Balanced reasoning inside <think>...</think>, clean edits, and verification.",
+        };
+
+        let disabled_set: HashSet<String> = settings.disabled_skills.iter().cloned().collect();
+        let active_skills = load_all_skills(&project_root, &app_data_dir(), &disabled_set);
+        let skills_block = format_enabled_skills_for_prompt(&active_skills);
+
+        let subagents = load_all_subagents(&project_root);
+        let subagent_names: Vec<String> = subagents
+            .iter()
+            .map(|s| format!("`{}` ({})", s.slug, s.title))
+            .collect();
+
+        let mcp_servers = load_mcp_configs(&project_root, &app_data_dir());
+        let mcp_note = if mcp_servers.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = mcp_servers
+                .iter()
+                .filter(|s| s.enabled)
+                .map(|s| s.name.clone())
+                .collect();
+            format!("\nConfigured MCP Servers (use `mcp_call`): {}\n", names.join(", "))
         };
 
         let sys_prompt = format!(
-            "You are AI Coding Agent, a native Pure-Rust desktop autonomous coding agent.\n\
-             Workspace: {}\n{}\n\nWorkspace Tree:\n{}",
+            "You are AirCode, a 100% Pure-Rust Native Desktop AI Coding Studio.\n\
+             Workspace: {}\n{}\n{}\n\
+             Available Sub-Agents (`run_subagent` or `create_subagent`): {}\n{}\
+             When reasoning before your answer or tool calls, wrap your internal reasoning in <think>...</think> so AirCode can display or hide your thinking cleanly.\n\
+             \nWorkspace Tree:\n{}{}",
             project_root.display(),
             mode_instruction,
-            sample_files.join("\n")
+            effort_instruction,
+            subagent_names.join(", "),
+            mcp_note,
+            sample_files.join("\n"),
+            skills_block
         );
 
-        let max_iters = settings.max_agent_iterations.clamp(1, 30);
+        let max_iters = settings.effort_max_iters();
         let mut collected_tools = Vec::new();
         let mut final_text = String::new();
         let mut final_thinking = String::new();
@@ -1234,8 +1818,13 @@ pub fn spawn_autonomous_agent_run(
                 break;
             }
             let _ = tx.send(AgentUiEvent::Status(format!(
-                "Step {}/{}: Querying {} ({})",
-                step, max_iters, provider, model
+                "[{} · {}] Step {}/{}: {} ({})",
+                mode.to_uppercase(),
+                effort.to_uppercase(),
+                step,
+                max_iters,
+                provider,
+                model
             )));
 
             let reply = match call_model_provider(&settings, &provider, &model, &sys_prompt, &conv)
@@ -1261,6 +1850,9 @@ pub fn spawn_autonomous_agent_run(
             };
 
             if !reply.thinking.is_empty() {
+                if !final_thinking.is_empty() {
+                    final_thinking.push('\n');
+                }
                 final_thinking.push_str(&reply.thinking);
                 let _ = tx.send(AgentUiEvent::ThinkingDelta(reply.thinking));
             }
@@ -1322,9 +1914,11 @@ pub fn spawn_autonomous_agent_run(
                     &project_root,
                     &settings,
                     &gate,
+                    &browser,
                     &tx,
                     &session_id,
                     &mode,
+                    true,
                     call,
                 );
                 store.record_tool_execution(&done_rec);
@@ -1344,7 +1938,7 @@ pub fn spawn_autonomous_agent_run(
             final_text = if gate.is_stopped() {
                 "Execution halted immediately via Emergency Stop.".to_string()
             } else {
-                "Completed autonomous tool execution cycle.".to_string()
+                "Completed autonomous execution cycle.".to_string()
             };
         }
 

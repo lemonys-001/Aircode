@@ -20,9 +20,9 @@ fn main() {
 
     let app = StudioApp::new(initial_workspace);
     run_native_window(
-        "AI Coding Agent — Pure-Rust Native Studio",
-        1480,
-        920,
+        "AirCode — Pure-Rust AI Coding Studio & Agentic Browser",
+        1520,
+        940,
         Box::new(app),
     );
 }

@@ -2,8 +2,8 @@
 
 use crate::fs_ops::DriveInfo;
 use crate::platform::{
-    DesktopAppHandler, FontRole, HttpResponse, Modifiers, MouseBtn, PtyEvent, SurfaceCanvas,
-    WindowEvent,
+    DesktopAppHandler, FontRole, HttpResponse, KeyCode, Modifiers, MouseBtn, PtyEvent,
+    SurfaceCanvas, WindowEvent,
 };
 use std::ffi::{c_char, c_int, c_long, c_ulong, c_void, CString};
 use std::io::{Read, Write};
@@ -411,17 +411,128 @@ impl SurfaceCanvas for SoftwareSurface {
     }
 }
 
+// Standard IBM/VGA 8x8 bitmap glyphs for ASCII 0x20..=0x7E (MSB = leftmost pixel or bit0 = left; here bit0 = left pixel)
+const FONT8X8_BASIC: [[u8; 8]; 95] = [
+    [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00], // ' '
+    [0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00], // '!'
+    [0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00], // '"'
+    [0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00], // '#'
+    [0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00], // '$'
+    [0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00], // '%'
+    [0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00], // '&'
+    [0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00], // '\''
+    [0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00], // '('
+    [0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00], // ')'
+    [0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00], // '*'
+    [0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00], // '+'
+    [0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06], // ','
+    [0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00], // '-'
+    [0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00], // '.'
+    [0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00], // '/'
+    [0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00], // '0'
+    [0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00], // '1'
+    [0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00], // '2'
+    [0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00], // '3'
+    [0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00], // '4'
+    [0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00], // '5'
+    [0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00], // '6'
+    [0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00], // '7'
+    [0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00], // '8'
+    [0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00], // '9'
+    [0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00], // ':'
+    [0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06], // ';'
+    [0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00], // '<'
+    [0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00], // '='
+    [0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00], // '>'
+    [0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00], // '?'
+    [0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00], // '@'
+    [0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00], // 'A'
+    [0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00], // 'B'
+    [0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00], // 'C'
+    [0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00], // 'D'
+    [0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00], // 'E'
+    [0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00], // 'F'
+    [0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00], // 'G'
+    [0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00], // 'H'
+    [0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00], // 'I'
+    [0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00], // 'J'
+    [0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00], // 'K'
+    [0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00], // 'L'
+    [0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00], // 'M'
+    [0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00], // 'N'
+    [0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00], // 'O'
+    [0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00], // 'P'
+    [0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00], // 'Q'
+    [0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00], // 'R'
+    [0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00], // 'S'
+    [0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00], // 'T'
+    [0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00], // 'U'
+    [0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00], // 'V'
+    [0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00], // 'W'
+    [0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00], // 'X'
+    [0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00], // 'Y'
+    [0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00], // 'Z'
+    [0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0x00], // '['
+    [0x03,0x06,0x0C,0x18,0x30,0x60,0x40,0x00], // '\\'
+    [0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0x00], // ']'
+    [0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00], // '^'
+    [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF], // '_'
+    [0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00], // '`'
+    [0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00], // 'a'
+    [0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00], // 'b'
+    [0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00], // 'c'
+    [0x38,0x30,0x30,0x3E,0x33,0x33,0x6E,0x00], // 'd'
+    [0x00,0x00,0x1E,0x33,0x3F,0x03,0x1E,0x00], // 'e'
+    [0x1C,0x36,0x06,0x0F,0x06,0x06,0x0F,0x00], // 'f'
+    [0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F], // 'g'
+    [0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00], // 'h'
+    [0x0C,0x00,0x0E,0x0C,0x0C,0x0C,0x1E,0x00], // 'i'
+    [0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E], // 'j'
+    [0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00], // 'k'
+    [0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00], // 'l'
+    [0x00,0x00,0x33,0x7F,0x7F,0x6B,0x63,0x00], // 'm'
+    [0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x00], // 'n'
+    [0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00], // 'o'
+    [0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F], // 'p'
+    [0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78], // 'q'
+    [0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00], // 'r'
+    [0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00], // 's'
+    [0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00], // 't'
+    [0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00], // 'u'
+    [0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00], // 'v'
+    [0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00], // 'w'
+    [0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00], // 'x'
+    [0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F], // 'y'
+    [0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00], // 'z'
+    [0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00], // '{'
+    [0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00], // '|'
+    [0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00], // '}'
+    [0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00], // '~'
+];
+
 fn draw_glyph_8x14(surf: &mut SoftwareSurface, x: i32, y: i32, ch: char, rgb: u32) {
     if ch == ' ' {
         return;
     }
-    // Compact procedural crisp legibility fallback on X11
-    let code = ch as u32;
-    for row in 1..12 {
-        for col in 1..7 {
-            let bit = ((code.wrapping_mul(2654435761)) >> ((row + col) & 15)) & 1;
-            if row == 1 || row == 11 || col == 1 || bit == 1 {
-                surf.fill_rect(x + col, y + row, 1, 1, rgb);
+    let ascii = match ch {
+        '—' | '–' | '─' => '-',
+        '·' | '•' => '.',
+        '▸' | '›' | '→' => '>',
+        '▾' => 'v',
+        '✓' => '+',
+        c if (' '..='~').contains(&c) => c,
+        _ => '?',
+    };
+    let glyph = &FONT8X8_BASIC[(ascii as usize) - 0x20];
+    for (row, &bits) in glyph.iter().enumerate() {
+        if bits == 0 {
+            continue;
+        }
+        // Vertically center inside 14px line box
+        let py = y + 2 + row as i32;
+        for col in 0..8 {
+            if (bits >> col) & 1 != 0 {
+                surf.fill_rect(x + col, py, 1, 1, rgb);
             }
         }
     }
@@ -430,6 +541,8 @@ fn draw_glyph_8x14(surf: &mut SoftwareSurface, x: i32, y: i32, ch: char, rgb: u3
 type Display = c_void;
 type Window = c_ulong;
 type GC = *mut c_void;
+type KeySym = c_ulong;
+type Atom = c_ulong;
 
 #[repr(C)]
 struct XImage {
@@ -453,8 +566,87 @@ struct XImage {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
+struct XKeyEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut Display,
+    window: Window,
+    root: Window,
+    subwindow: Window,
+    time: c_ulong,
+    x: c_int,
+    y: c_int,
+    x_root: c_int,
+    y_root: c_int,
+    state: u32,
+    keycode: u32,
+    same_screen: c_int,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct XButtonEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut Display,
+    window: Window,
+    root: Window,
+    subwindow: Window,
+    time: c_ulong,
+    x: c_int,
+    y: c_int,
+    x_root: c_int,
+    y_root: c_int,
+    state: u32,
+    button: u32,
+    same_screen: c_int,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct XMotionEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut Display,
+    window: Window,
+    root: Window,
+    subwindow: Window,
+    time: c_ulong,
+    x: c_int,
+    y: c_int,
+    x_root: c_int,
+    y_root: c_int,
+    state: u32,
+    is_hint: c_char,
+    same_screen: c_int,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct XConfigureEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut Display,
+    event: Window,
+    window: Window,
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+}
+
+#[repr(C)]
 union XEvent {
     type_: c_int,
+    xkey: XKeyEvent,
+    xbutton: XButtonEvent,
+    xmotion: XMotionEvent,
+    xconfigure: XConfigureEvent,
     pad: [c_long; 24],
 }
 
@@ -471,6 +663,33 @@ unsafe fn load_sym<T: Copy>(lib: *mut c_void, name: &[u8]) -> Option<T> {
         None
     } else {
         Some(std::mem::transmute_copy(&raw))
+    }
+}
+
+fn translate_keysym(ks: KeySym) -> Option<KeyCode> {
+    match ks & 0xFFFF {
+        0xFF0D | 0xFF8D => Some(KeyCode::Enter),
+        0xFF1B => Some(KeyCode::Escape),
+        0xFF08 => Some(KeyCode::Backspace),
+        0xFFFF => Some(KeyCode::Delete),
+        0xFF09 | 0xFE20 => Some(KeyCode::Tab),
+        0xFF51 => Some(KeyCode::Left),
+        0xFF52 => Some(KeyCode::Up),
+        0xFF53 => Some(KeyCode::Right),
+        0xFF54 => Some(KeyCode::Down),
+        0xFF50 => Some(KeyCode::Home),
+        0xFF57 => Some(KeyCode::End),
+        0xFF55 => Some(KeyCode::PageUp),
+        0xFF56 => Some(KeyCode::PageDown),
+        0xFFBE => Some(KeyCode::Other(0x70)), // F1
+        0xFFC0 => Some(KeyCode::F3),
+        0xFFC2 => Some(KeyCode::F5),
+        0x002F => Some(KeyCode::Other(0xBF)), // '/' -> matches VK_OEM_2 for Ctrl+/
+        c if (0x0041..=0x005A).contains(&c) => Some(KeyCode::Letter((c as u8) as char)),
+        c if (0x0061..=0x007A).contains(&c) => {
+            Some(KeyCode::Letter(((c as u8) - 32) as char))
+        }
+        _ => None,
     }
 }
 
@@ -497,6 +716,15 @@ pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn 
     type FnMapWindow = unsafe extern "C" fn(*mut Display, Window) -> c_int;
     type FnPending = unsafe extern "C" fn(*mut Display) -> c_int;
     type FnNextEvent = unsafe extern "C" fn(*mut Display, *mut XEvent) -> c_int;
+    type FnLookupString = unsafe extern "C" fn(
+        *mut XKeyEvent,
+        *mut c_char,
+        c_int,
+        *mut KeySym,
+        *mut c_void,
+    ) -> c_int;
+    type FnInternAtom = unsafe extern "C" fn(*mut Display, *const c_char, c_int) -> Atom;
+    type FnSetWMProtocols = unsafe extern "C" fn(*mut Display, Window, *mut Atom, c_int) -> c_int;
     type FnCreateImage = unsafe extern "C" fn(
         *mut Display,
         *mut c_void,
@@ -526,7 +754,7 @@ pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn 
     unsafe {
         let lib = dlopen(b"libX11.so.6\0".as_ptr() as *const c_char, 2); // RTLD_NOW
         if lib.is_null() {
-            eprintln!("AI Coding Agent: libX11.so.6 not found (run inside a Linux desktop session).");
+            eprintln!("AirCode: libX11.so.6 not found (run inside a Linux desktop session).");
             return;
         }
         let (
@@ -542,6 +770,7 @@ pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn 
             Some(x_map_window),
             Some(x_pending),
             Some(x_next_event),
+            Some(x_lookup_string),
             Some(x_create_image),
             Some(x_put_image),
             Some(x_flush),
@@ -558,17 +787,18 @@ pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn 
             load_sym::<FnMapWindow>(lib, b"XMapWindow\0"),
             load_sym::<FnPending>(lib, b"XPending\0"),
             load_sym::<FnNextEvent>(lib, b"XNextEvent\0"),
+            load_sym::<FnLookupString>(lib, b"XLookupString\0"),
             load_sym::<FnCreateImage>(lib, b"XCreateImage\0"),
             load_sym::<FnPutImage>(lib, b"XPutImage\0"),
             load_sym::<FnFlush>(lib, b"XFlush\0"),
         ) else {
-            eprintln!("AI Coding Agent: failed resolving X11 symbols.");
+            eprintln!("AirCode: failed resolving X11 symbols.");
             return;
         };
 
         let dpy = x_open_display(ptr::null());
         if dpy.is_null() {
-            eprintln!("AI Coding Agent: X11 display not available (run inside a desktop session).");
+            eprintln!("AirCode: X11 display not available (run inside a Linux desktop session).");
             return;
         }
         let scr = x_default_screen(dpy);
@@ -581,13 +811,25 @@ pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn 
             width as u32,
             height as u32,
             0,
-            0x090D16,
-            0x090D16,
+            0x16161E,
+            0x16161E,
         );
         if let Ok(ctitle) = CString::new(title) {
             x_store_name(dpy, win, ctitle.as_ptr());
         }
-        let mask: c_long = (1 << 15) | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 17);
+
+        if let (Some(x_intern), Some(x_set_wm)) = (
+            load_sym::<FnInternAtom>(lib, b"XInternAtom\0"),
+            load_sym::<FnSetWMProtocols>(lib, b"XSetWMProtocols\0"),
+        ) {
+            let mut wm_del = x_intern(dpy, b"WM_DELETE_WINDOW\0".as_ptr() as *const c_char, 0);
+            if wm_del != 0 {
+                x_set_wm(dpy, win, &mut wm_del, 1);
+            }
+        }
+
+        // KeyPressMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | ExposureMask | StructureNotifyMask
+        let mask: c_long = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 15) | (1 << 17);
         x_select_input(dpy, win, mask);
         x_map_window(dpy, win);
 
@@ -595,51 +837,140 @@ pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn 
         let visual = x_default_visual(dpy, scr);
         let depth = x_default_depth(dpy, scr) as u32;
         let gc = x_default_gc(dpy, scr);
+        let mut left_down = false;
 
         loop {
             while x_pending(dpy) > 0 {
                 let mut ev = XEvent { type_: 0 };
                 x_next_event(dpy, &mut ev);
                 match ev.type_ {
+                    2 => {
+                        // KeyPress
+                        let mut kev = ev.xkey;
+                        let mods = Modifiers {
+                            shift: (kev.state & 1) != 0,
+                            ctrl: (kev.state & 4) != 0,
+                            alt: (kev.state & 8) != 0,
+                        };
+                        let mut buf = [0 as c_char; 16];
+                        let mut ks: KeySym = 0;
+                        let n = x_lookup_string(&mut kev, buf.as_mut_ptr(), 15, &mut ks, ptr::null_mut());
+                        if let Some(kc) = translate_keysym(ks) {
+                            app.on_event(WindowEvent::KeyDown { key: kc, mods });
+                        }
+                        if !mods.ctrl && !mods.alt && n > 0 {
+                            let bytes: Vec<u8> = buf[..(n as usize)]
+                                .iter()
+                                .map(|&c| c as u8)
+                                .collect();
+                            if let Ok(s) = std::str::from_utf8(&bytes) {
+                                for ch in s.chars() {
+                                    if ch >= ' ' && ch != '\x7f' {
+                                        app.on_event(WindowEvent::CharInput(ch));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     4 => {
-                        let x = ev.pad[8] as i32;
-                        let y = ev.pad[9] as i32;
-                        app.on_event(WindowEvent::MouseDown {
-                            x,
-                            y,
-                            button: MouseBtn::Left,
-                            mods: Modifiers::default(),
-                        });
+                        // ButtonPress
+                        let bev = ev.xbutton;
+                        let mods = Modifiers {
+                            shift: (bev.state & 1) != 0,
+                            ctrl: (bev.state & 4) != 0,
+                            alt: (bev.state & 8) != 0,
+                        };
+                        match bev.button {
+                            1 => {
+                                left_down = true;
+                                app.on_event(WindowEvent::MouseDown {
+                                    x: bev.x,
+                                    y: bev.y,
+                                    button: MouseBtn::Left,
+                                    mods,
+                                });
+                            }
+                            2 => {
+                                app.on_event(WindowEvent::MouseDown {
+                                    x: bev.x,
+                                    y: bev.y,
+                                    button: MouseBtn::Middle,
+                                    mods,
+                                });
+                            }
+                            3 => {
+                                app.on_event(WindowEvent::MouseDown {
+                                    x: bev.x,
+                                    y: bev.y,
+                                    button: MouseBtn::Right,
+                                    mods,
+                                });
+                            }
+                            4 => {
+                                app.on_event(WindowEvent::MouseWheel {
+                                    x: bev.x,
+                                    y: bev.y,
+                                    delta_lines: 3,
+                                    shift: mods.shift,
+                                });
+                            }
+                            5 => {
+                                app.on_event(WindowEvent::MouseWheel {
+                                    x: bev.x,
+                                    y: bev.y,
+                                    delta_lines: -3,
+                                    shift: mods.shift,
+                                });
+                            }
+                            _ => {}
+                        }
                     }
                     5 => {
-                        let x = ev.pad[8] as i32;
-                        let y = ev.pad[9] as i32;
-                        app.on_event(WindowEvent::MouseUp {
-                            x,
-                            y,
-                            button: MouseBtn::Left,
-                            mods: Modifiers::default(),
-                        });
+                        // ButtonRelease
+                        let bev = ev.xbutton;
+                        let mods = Modifiers {
+                            shift: (bev.state & 1) != 0,
+                            ctrl: (bev.state & 4) != 0,
+                            alt: (bev.state & 8) != 0,
+                        };
+                        if bev.button == 1 {
+                            left_down = false;
+                            app.on_event(WindowEvent::MouseUp {
+                                x: bev.x,
+                                y: bev.y,
+                                button: MouseBtn::Left,
+                                mods,
+                            });
+                        } else if bev.button == 3 {
+                            app.on_event(WindowEvent::MouseUp {
+                                x: bev.x,
+                                y: bev.y,
+                                button: MouseBtn::Right,
+                                mods,
+                            });
+                        }
                     }
                     6 => {
-                        let x = ev.pad[8] as i32;
-                        let y = ev.pad[9] as i32;
+                        let mev = ev.xmotion;
                         app.on_event(WindowEvent::MouseMove {
-                            x,
-                            y,
-                            left_down: false,
+                            x: mev.x,
+                            y: mev.y,
+                            left_down,
                         });
                     }
                     22 => {
-                        let nw = (ev.pad[6] & 0xFFFF_FFFF) as i32;
-                        let nh = ((ev.pad[6] >> 32) & 0xFFFF_FFFF) as i32;
-                        if nw > 64 && nh > 64 {
-                            surf.ensure_size(nw, nh);
+                        let cev = ev.xconfigure;
+                        if cev.width > 64 && cev.height > 64 {
+                            surf.ensure_size(cev.width, cev.height);
                             app.on_event(WindowEvent::Resize {
-                                width: nw,
-                                height: nh,
+                                width: cev.width,
+                                height: cev.height,
                             });
                         }
+                    }
+                    33 => {
+                        // ClientMessage (WM_DELETE_WINDOW)
+                        return;
                     }
                     _ => {}
                 }
@@ -677,7 +1008,7 @@ pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn 
                 libc_free(ximg as *mut c_void);
             }
             x_flush(dpy);
-            std::thread::sleep(Duration::from_millis(33));
+            std::thread::sleep(Duration::from_millis(16));
         }
     }
 }
