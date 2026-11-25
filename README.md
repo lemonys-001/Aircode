@@ -3,6 +3,10 @@
 > **Zero WebView. Zero HTML/CSS/JavaScript. Zero Electron/Tauri Web Frontend.**
 > A **100% Pure-Rust Native Desktop GUI Application** targeting **Windows 10 / 11 (x64)** and
 > **Linux Desktop Environments** (GNOME, KDE, XFCE, Cinnamon, MATE, LXQt, Sway/XWayland).
+>
+> **Default look: _Low Cortisol_** — a quiet daylight theme with warm paper surfaces, hairline
+> borders and desaturated slate-teal accents, paired with roomier spacing. Switch any time with
+> `/theme` or `Ctrl+K`.
 
 AirCode is a native AI coding agent, IDE and *agentic browser* in one window: every pixel is
 drawn by Rust (`CreateDIBSection` backbuffer on Windows, X11 `SoftwareSurface` on Linux), every
@@ -15,13 +19,14 @@ viewport** the AI itself drives — never the IDE chrome.
 
 | Area | v2.1 capability |
 | --- | --- |
-| **Themes** | 7 built-in themes (Tokyo Night, Catppuccin Mocha, One Dark Pro, Rosé Pine, Gruvbox Dark, Alabaster Light, + AirCode Dark) plus a live custom `.aircode/theme.json`. |
+| **Themes** | 8 built-in themes — **Low Cortisol** (default, calm daylight), Tokyo Night, Catppuccin Mocha, One Dark Pro, Rosé Pine, Gruvbox Dark, Alabaster Light + a live custom `.aircode/theme.json`. |
 | **Command Panel** | Fuzzy command palette (`Ctrl+K` / `Ctrl+P` / `/`) over every action, setting and slash command. |
 | **Sessions** | Multi-session management, **fork whole session or fork-from-a-prompt**, visible per-turn timestamps, interactive **Prompt Timeline**. |
 | **Thinking** | AI reasoning blocks rendered distinctly, with `/thinking on` / `/thinking off` to hide or show them. |
 | **Compaction** | `/compact` (or the UI trigger) summarizes long histories while keeping the timeline and forks usable. |
 | **Modes & Effort** | First-class **Plan** (read-only) vs **Build** (full execution) plus agent effort `low` / `medium` / `max` / `ultra` (thinking budgets 1K / 4K / 16K / 32K tokens). |
 | **Provider Setup** | OpenCode-style guided `/connect` wizard: env auto-detect, clipboard paste, browser auth link — plus the **OpenCode AI server auth workaround** (Zen gateway, local `opencode/auth.json` import, `opencode serve` bridge). |
+| **OpenCode Zen (free)** | **`/zen` — one click, no API key.** AirCode authenticates *exactly like the official OpenCode client* (UA fingerprint, `x-opencode-client`/`-project`/`-session`/`-session-id` quartet, `stream: true`, `bash`/`read` tool names — and never the `x-opencode-request` header the gateway 403s), so the anonymous `public` free lane works with zero setup. `/models` refreshes the live catalog from `opencode.ai/zen/v1/models`. |
 | **Skills** | Load/manage skills from `.aircode/skills/`, including the built-in **AirCode Customizer** skill that teaches the AI to theme and re-configure AirCode itself. |
 | **MCP** | Full MCP (`2024-11-05`) stdio + HTTP JSON-RPC client; server/tool discovery and AI tool-calling. |
 | **Sub-Agents** | The AI can create, save and run its own sub-agents (readonly or full, any effort level). |
@@ -31,12 +36,29 @@ viewport** the AI itself drives — never the IDE chrome.
 
 ---
 
+## A Calmer, Lighter UI ("Low Cortisol")
+
+v2.1's second pass was subtraction, not addition:
+
+* **Header slimmed from 9 controls to 5** — provider and model share one pill; effort stays; the
+  theme pill moved to the footer and the command palette (it is already shown in the status bar).
+* **One hairline instead of double strokes**, tinted hover/active states instead of filled slabs,
+  and a 3px accent rule for "selected" in the rail and command palette.
+* **Roomier lists** — explorer rows 26→31px, search hits 40→46px, git files 26→30px, palette rows
+  40→44px, chat lines 18→21px with a blank line above every turn, rail items 50→54px.
+* **Barely-tinted user bubbles** (6% accent instead of 10%) and muted badges.
+* **New default theme: Low Cortisol** — warm paper surfaces (`#FAF8F4` → `#FFFEFA`), hairline warm
+  grey borders, warm near-black ink (never `#000`), and a desaturated slate-teal accent
+  (`#5C7F78`) with soft success/warning/danger tones. No saturated red anywhere.
+
+---
+
 ## Pre-Built Native Deliverables (`dist/`)
 
 | Deliverable | Size | Description |
 | --- | --- | --- |
-| **`dist/AI-Coding-Agent.exe`** | **2.87 MB** | Self-contained portable **100% Pure-Rust Native GUI Studio** for **Windows x64** (`PE32+ AMD64`, `WINDOWS_GUI`): statically linked SQLite3, Win32 ClearType GDI UI, ConPTY terminal, WinHTTP TLS client, 18-tool AI agent. Zero installation, zero runtime dependencies. |
-| **`dist/AI-Coding-Agent-Setup.exe`** | **3.31 MB** | **Pure-Rust Native Windows Setup Wizard & Uninstaller** — installs to `%LOCALAPPDATA%\Programs\AI-Coding-Agent` (no UAC prompt), creates Desktop & Start Menu `.lnk` shortcuts via COM `IShellLinkW`, adds *"Open with AI Coding Agent"* to Explorer folders, registers *Installed Apps* uninstaller, supports `/S` silent install and `--uninstall`. |
+| **`dist/AI-Coding-Agent.exe`** | **2.90 MB** | Self-contained portable **100% Pure-Rust Native GUI Studio** for **Windows x64** (`PE32+ AMD64`, `WINDOWS_GUI`): statically linked SQLite3, Win32 ClearType GDI UI, ConPTY terminal, WinHTTP TLS client, 18-tool AI agent. Zero installation, zero runtime dependencies. |
+| **`dist/AI-Coding-Agent-Setup.exe`** | **3.34 MB** | **Pure-Rust Native Windows Setup Wizard & Uninstaller** — installs to `%LOCALAPPDATA%\Programs\AI-Coding-Agent` (no UAC prompt), creates Desktop & Start Menu `.lnk` shortcuts via COM `IShellLinkW`, adds *"Open with AI Coding Agent"* to Explorer folders, registers *Installed Apps* uninstaller, supports `/S` silent install and `--uninstall`. |
 | **`dist/AI-Coding-Agent-linux-amd64`** | **2.73 MB** | Linux x86-64 native build (glibc). |
 | **`dist/AI-Coding-Agent-linux-arm64`** | **2.63 MB** | Linux AArch64 build (static musl — runs on any aarch64 distro). |
 | **`dist/AI-Coding-Agent-linux-arm32`** | **2.65 MB** | Linux ARMv7 hard-float build (static musl, `armhf`). |
@@ -94,14 +116,14 @@ crate dependencies** and **zero web browser engine**:
 | `src/ui/studio.rs`, `src/ui/mod.rs`, `src/ui/commands.rs` | **Native Double-Buffered Studio GUI Workbench** — resizable 4-zone layout (Top Studio Bar, Left Dock with Explorer/Search/Git/Sessions/Extensions, Center multi-tab Editor + Diff + **Agentic Browser viewport**, Bottom multi-tab terminal, Right Agent timeline/composer), fuzzy **Command Panel**, Theme Picker, Connect Wizard, Safety, Sessions & Timeline modals. |
 | `src/platform/windows.rs` | **Pure-Rust Win32 Native Backend** — 32-bit `CreateDIBSection` backbuffer + ClearType `Segoe UI`/`Cascadia Mono` GDI typography, `DwmSetWindowAttribute` dark titlebar, genuine **ConPTY**, **WinHTTP** TLS 1.2/1.3, drive enumeration, `SHBrowseForFolderW`, `ReadDirectoryChangesW`, Unicode clipboard. |
 | `src/platform/linux.rs` | **Pure-Rust Linux Backend** — runtime-`dlopen`ed X11 native window, `SoftwareSurface` renderer, full `XLookupString` keyboard, POSIX shell session, `curl` transport, `zenity` folder picker. |
-| `src/themes.rs` | **7 Theme Palettes** + custom `.aircode/theme.json` loading, per-token syntax colors. |
+| `src/themes.rs` | **8 Theme Palettes** (Low Cortisol default) + custom `.aircode/theme.json` loading, per-token syntax colors. |
 | `src/agent.rs` | **Autonomous Multi-Provider AI Engine** — Ollama, OpenAI, Anthropic, Gemini, OpenRouter, OpenCode Zen / local `opencode serve`, and custom OpenAI-compatible endpoints; continuous tool loop with `Plan`/`Build` modes and `low`/`medium`/`max`/`ultra` effort; `PermissionGate`; emergency stop; session compaction. |
 | `src/browser.rs` | **Agentic Browser** — `[eN]` element refs, native-fast / headless DOM+JS backends, user takeover & hand-back, back/forward, external-browser hand-off. |
 | `src/editor.rs` & `src/syntax.rs` | **Native Code Editor** — multi-tab UTF-8, 80-step undo/redo, selection & clipboard, smart pairs, brace-aware indent, block indent/outdent, comment toggle, matching brackets, find/next, goto-line, and a side-by-side diff builder. |
 | `src/skills.rs` | **Skills** — embedded **AirCode Customizer** skill + workspace/app-data skills with enable/disable and prompt injection. |
 | `src/mcp.rs` | **MCP Client** — `2024-11-05` protocol over stdio and HTTP, server config persistence, tool discovery and invocation. |
 | `src/subagents.rs` | **Sub-Agents** — built-ins plus AI-authored sub-agents (slug, effort, readonly, system prompt). |
-| `src/opencode_auth.rs` | **OpenCode-Style Auth** — provider guides, env/`auth.json` credential discovery, Zen gateway, local `opencode serve` bridge. |
+| `src/opencode_auth.rs` | **OpenCode-Style Auth** — provider guides, env/`auth.json` credential discovery, Zen gateway, local `opencode serve` bridge, and the full **Zen free-lane client emulation** (session-id generator, header quartet, free-model catalog). |
 | `src/vt_screen.rs` | **ANSI/VT100 Grid** — CSI, 16/256/24-bit color, 1,500-line scrollback. |
 | `src/sqlite.rs` | **Embedded SQLite3** — safe Rust FFI over `vendor/sqlite3/sqlite3.c` (WAL) storing keys, settings, sessions, prompts/turns, tool audit logs, with `ALTER TABLE` migrations. |
 | `src/fs_ops.rs` & `src/git_ops.rs` | **Sandboxed Workspace & Silent Git** — canonical path boundary guard, project search, status/stage/branch/commit/diff. |
@@ -117,6 +139,8 @@ connection, skills, MCP servers, sub-agents and the browser.
 
 | Command | Effect |
 | --- | --- |
+| `/zen` `/free` | **OpenCode Zen free lane** — no API key, authenticates like the official OpenCode client |
+| `/models` | Refresh the live anonymous Zen free-model catalog |
 | `/connect` `/setup` `/auth` `/keys` | Guided provider wizard (env auto-detect → clipboard paste → browser link) |
 | `/plan` · `/build` | Switch Plan (read-only) / Build (full execution) mode |
 | `/effort low\|medium\|max\|ultra` | Agent effort (thinking budget 1K / 4K / 16K / 32K) |

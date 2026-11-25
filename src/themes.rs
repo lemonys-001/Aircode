@@ -1,5 +1,6 @@
-//! Dynamic Runtime Theme System for AirCode (`Tokyo Night`, `Catppuccin Mocha`, `One Dark Pro`,
-//! `Rosé Pine`, `Gruvbox Dark`, `Alabaster Light`, plus live `.aircode/theme.json` customization).
+//! Dynamic Runtime Theme System for AirCode (`Low Cortisol`, `Tokyo Night`, `Catppuccin Mocha`,
+//! `One Dark Pro`, `Rosé Pine`, `Gruvbox Dark`, `Alabaster Light`, plus live
+//! `.aircode/theme.json` customization).
 
 use crate::json::JsonValue;
 use crate::syntax::TokenKind;
@@ -64,6 +65,7 @@ pub struct ThemePalette {
 impl ThemePalette {
     pub fn builtin_list() -> &'static [(&'static str, &'static str)] {
         &[
+            ("low-cortisol", "Low Cortisol (Daylight)"),
             ("tokyo-night", "Tokyo Night"),
             ("catppuccin-mocha", "Catppuccin Mocha"),
             ("one-dark", "One Dark Pro"),
@@ -76,6 +78,7 @@ impl ThemePalette {
 
     pub fn by_id(id: &str, workspace: Option<&Path>) -> Self {
         match id {
+            "low-cortisol" => Self::low_cortisol(),
             "catppuccin-mocha" => Self::catppuccin_mocha(),
             "one-dark" => Self::one_dark(),
             "rose-pine" => Self::rose_pine(),
@@ -324,6 +327,61 @@ impl ThemePalette {
         }
     }
 
+    /// **Low Cortisol** - a deliberately quiet daylight theme.
+    ///
+    /// Warm paper surfaces, desaturated slate/sage accents and no pure black or
+    /// saturated red anywhere, so long sessions stay calm. Paired with the roomier
+    /// spacing in `ui/studio.rs` this is AirCode's default look.
+    pub fn low_cortisol() -> Self {
+        Self {
+            id: "low-cortisol".into(),
+            name: "Low Cortisol".into(),
+            is_light: true,
+            // Warm paper stack - each surface is only a few percent off its neighbour,
+            // so zones separate by tint rather than by hard contrast.
+            bg_app: 0xFAF8F4,
+            bg_rail: 0xF3F0EA,
+            bg_header: 0xF6F3ED,
+            bg_sidebar: 0xF8F6F1,
+            bg_editor: 0xFFFEFA,
+            bg_gutter: 0xFAF8F4,
+            bg_active_line: 0xF4F1EA,
+            bg_selection: 0xE6E3D8,
+            bg_terminal: 0xF6F3ED,
+            bg_agent: 0xF8F6F1,
+            bg_card: 0xFFFEFA,
+            bg_card_hover: 0xF2EFE8,
+            bg_input: 0xFFFEFA,
+            bg_modal: 0xFFFEFA,
+            bg_button: 0xEFEBE2,
+            // Hairline warm greys instead of high-contrast outlines.
+            border: 0xE3DED3,
+            border_subtle: 0xEDE9E0,
+            border_focus: 0x8FA3B0,
+            // Warm near-black ink, never #000.
+            text_primary: 0x3A372F,
+            text_secondary: 0x5D584C,
+            text_muted: 0x8C8676,
+            // Muted slate-teal accent: present, never loud.
+            accent: 0x5C7F78,
+            accent_secondary: 0x7C93A6,
+            success: 0x5F8560,
+            warning: 0xA8813F,
+            danger: 0xA8655E,
+            purple: 0x85789E,
+            diff_add_bg: 0xE7EEE4,
+            diff_del_bg: 0xF3E6E2,
+            syn_keyword: 0x6E6A9C,
+            syn_type: 0x3F6E80,
+            syn_string: 0x4F7A52,
+            syn_number: 0x9A6A3C,
+            syn_comment: 0x948E7E,
+            syn_macro: 0x3D6E7E,
+            syn_func: 0x2F5E8C,
+            syn_operator: 0x6B6555,
+        }
+    }
+
     pub fn alabaster_light() -> Self {
         Self {
             id: "alabaster-light".into(),
@@ -372,6 +430,7 @@ impl ThemePalette {
     pub fn from_custom_json(v: &JsonValue) -> Self {
         let base_id = v.string_or("base", "tokyo-night");
         let mut pal = match base_id.as_str() {
+            "low-cortisol" => Self::low_cortisol(),
             "catppuccin-mocha" => Self::catppuccin_mocha(),
             "one-dark" => Self::one_dark(),
             "rose-pine" => Self::rose_pine(),

@@ -138,7 +138,7 @@ impl Default for AppSettings {
             active_model: "big-pickle".to_string(),
             default_mode: "build".to_string(),
             agent_effort: "medium".to_string(),
-            theme: "tokyo-night".to_string(),
+            theme: "low-cortisol".to_string(),
             show_thinking: true,
             opencode_api_key: String::new(),
             opencode_auth_mode: "zen".to_string(),
@@ -290,10 +290,17 @@ impl AppSettings {
 
     pub fn preset_models_for_provider(provider: &str) -> &'static [&'static str] {
         match provider {
+            // Free lane first (no key needed - OpenCode client emulation), then the
+            // paid Zen catalog that a console key unlocks.
             "opencode" => &[
                 "big-pickle",
-                "glm-4.7-free",
-                "minimax-m2.1-free",
+                "glm-5.3-flash-free",
+                "deepseek-v4.1-flash-free",
+                "nemotron-3.5-lightning-free",
+                "space-bunny-free",
+                "mimo-v2.6-flash-free",
+                "cat-jam-free",
+                "longcat-2.5-preview-free",
                 "grok-code",
                 "claude-sonnet-4-5",
                 "gpt-5",

@@ -7,7 +7,10 @@ use crate::fs_ops::{
 use crate::git_ops::run_git;
 use crate::json::JsonValue;
 use crate::mcp::{call_mcp_tool, load_mcp_configs};
-use crate::opencode_auth::{call_local_opencode_server, discover_local_credentials};
+use crate::opencode_auth::{
+    call_local_opencode_server, discover_local_credentials, new_zen_session_id, zen_client_headers,
+    zen_tool_name_in, zen_tool_name_out, ZEN_PUBLIC_KEY,
+};
 use crate::platform::{app_data_dir, http_request};
 use crate::skills::{format_enabled_skills_for_prompt, load_all_skills, save_workspace_skill};
 use crate::sqlite::{
@@ -180,7 +183,7 @@ pub fn probe_ollama_models(base_url: &str) -> (bool, Vec<String>) {
     (true, models)
 }
 
-fn tool_schemas_openai() -> JsonValue {
+pub(crate) fn tool_schemas_openai() -> JsonValue {
     JsonValue::parse(
         r#"[
       {
@@ -1000,6 +1003,9 @@ fn execute_tool(
                     &sub_settings.active_model,
                     &sub_sys,
                     &sub_conv,
+                    // Fresh Zen session id per sub-agent, mirroring how the CLI
+                    // spreads upstream backends across sessions.
+                    &new_zen_session_id(),
                 ) {
                     Ok(rep) => {
                         if !rep.text.is_empty() {
@@ -1119,12 +1125,169 @@ fn split_think_tags(raw_text: &str, existing_thinking: &str) -> (String, String)
     (clean_text.trim().to_string(), thinking)
 }
 
+/// Rewrites AirCode's OpenAI tool schemas onto the tool names the OpenCode Zen
+/// free lane accepts (`bash`, `read`, `edit`, `grep`).
+pub(crate) fn remap_tools_for_zen(tools: &JsonValue) -> JsonValue {
+    let Some(arr) = tools.as_array() else {
+        return tools.clone();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for t in arr {
+        let Some(f) = t.get("function") else { continue };
+        let name = f.string_or("name", "");
+        let mapped = zen_tool_name_out(&name);
+        if mapped == "tool" {
+            // Unknown to the free lane - skip rather than risk a schema rejection.
+            continue;
+        }
+        out.push(JsonValue::obj(vec![
+            ("type", "function".into()),
+            (
+                "function",
+                JsonValue::obj(vec![
+                    ("name", mapped.into()),
+                    (
+                        "description",
+                        f.get("description").cloned().unwrap_or(JsonValue::Null),
+                    ),
+                    (
+                        "parameters",
+                        f.get("parameters").cloned().unwrap_or(JsonValue::Null),
+                    ),
+                ]),
+            ),
+        ]));
+    }
+    JsonValue::arr(out)
+}
+
+/// Accumulates an OpenAI-compatible SSE stream (`data: {...}` lines, terminated by
+/// `data: [DONE]`) into `(content, reasoning, tool_calls)`. Tool-call fragments are
+/// stitched back together by index, since providers split `function.name` and
+/// `function.arguments` across chunks.
+///
+/// A non-SSE (plain JSON) body is accepted too, so a provider that ignores
+/// `"stream": true` still works.
+pub(crate) fn parse_openai_sse(body: &str) -> (String, String, Vec<(String, String, JsonValue)>) {
+    let trimmed = body.trim_start();
+    if !trimmed.starts_with("data:") && !trimmed.starts_with("event:") {
+        // Not a stream - parse it as a single completion.
+        if let Ok(json) = JsonValue::parse(body) {
+            if let Some(msg) = json
+                .get("choices")
+                .and_then(|c| c.get_index(0))
+                .and_then(|c| c.get("message"))
+            {
+                let text = msg.string_or("content", "");
+                let reasoning = msg
+                    .get("reasoning_content")
+                    .or_else(|| msg.get("reasoning"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mut calls = Vec::new();
+                if let Some(arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in arr {
+                        let f = tc.get("function");
+                        let raw_args = f.map(|x| x.str_or("arguments", "{}")).unwrap_or("{}");
+                        calls.push((
+                            tc.string_or("id", ""),
+                            f.map(|x| x.string_or("name", "")).unwrap_or_default(),
+                            JsonValue::parse(raw_args).unwrap_or_else(|_| JsonValue::obj(Vec::new())),
+                        ));
+                    }
+                }
+                return (text, reasoning, calls);
+            }
+        }
+    }
+
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    // index -> (id, name, args_buffer)
+    let mut tool_buf: Vec<(usize, String, String, String)> = Vec::new();
+
+    for line in body.lines() {
+        let line = line.trim();
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(json) = JsonValue::parse(payload) else {
+            continue;
+        };
+        let Some(choice) = json
+            .get("choices")
+            .and_then(|c| c.get_index(0))
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(delta) = choice.get("delta").cloned() else {
+            continue;
+        };
+        if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
+            text.push_str(c);
+        }
+        if let Some(r) = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(|v| v.as_str())
+        {
+            reasoning.push_str(r);
+        }
+        if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in tcs {
+                let idx = tc.i64_or("index", 0).max(0) as usize;
+                let id = tc.string_or("id", "");
+                let f = tc.get("function");
+                let name = f.map(|x| x.string_or("name", "")).unwrap_or_default();
+                let args_frag = f.map(|x| x.str_or("arguments", "")).unwrap_or("");
+                let slot = match tool_buf.iter_mut().find(|(i, _, _, _)| *i == idx) {
+                    Some(s) => s,
+                    None => {
+                        tool_buf.push((idx, String::new(), String::new(), String::new()));
+                        tool_buf.last_mut().unwrap()
+                    }
+                };
+                if !id.is_empty() && slot.1.is_empty() {
+                    slot.1 = id;
+                }
+                if !name.is_empty() {
+                    slot.2.push_str(&name);
+                }
+                slot.3.push_str(args_frag);
+            }
+        }
+    }
+
+    let mut calls = Vec::new();
+    for (idx, id, name, args) in tool_buf {
+        let parsed = if args.trim().is_empty() {
+            JsonValue::obj(Vec::new())
+        } else {
+            JsonValue::parse(&args).unwrap_or_else(|_| JsonValue::obj(Vec::new()))
+        };
+        let final_id = if id.is_empty() {
+            format!("zen-{}-{}", idx, name)
+        } else {
+            id
+        };
+        calls.push((final_id, name, parsed));
+    }
+    (text, reasoning, calls)
+}
+
 fn call_model_provider(
     settings: &AppSettings,
     provider: &str,
     model: &str,
     system_prompt: &str,
     conv: &[JsonValue],
+    zen_session: &str,
 ) -> Result<TurnReply, String> {
     let oa_tools = tool_schemas_openai();
 
@@ -1474,20 +1637,24 @@ fn call_model_provider(
 
     // OpenAI-compatible protocol: opencode (Zen gateway + public/key workaround), openai, openrouter, ollama, custom
     let discovered = discover_local_credentials(&settings.opencode_server_url, &settings.ollama_base_url);
-    let (endpoint, bearer, is_opencode_zen) = match provider {
+    let (endpoint, bearer, is_opencode_zen, zen_free_lane) = match provider {
         "opencode" => {
+            // Resolution order: user-pasted console key -> `opencode auth login` file /
+            // OPENCODE_API_KEY env -> the anonymous `public` free lane.
             let key = if !settings.opencode_api_key.trim().is_empty() {
                 settings.opencode_api_key.trim().to_string()
             } else if let Some(k) = discovered.opencode_zen_key {
                 k
             } else {
                 // Zero-key OpenCode Zen public client workaround for free coding models!
-                "public".to_string()
+                ZEN_PUBLIC_KEY.to_string()
             };
+            let free_lane = key == ZEN_PUBLIC_KEY;
             (
                 "https://opencode.ai/zen/v1/chat/completions".to_string(),
                 key,
                 true,
+                free_lane,
             )
         }
         "openai" => {
@@ -1505,6 +1672,7 @@ fn call_model_provider(
             (
                 "https://api.openai.com/v1/chat/completions".to_string(),
                 key,
+                false,
                 false,
             )
         }
@@ -1524,6 +1692,7 @@ fn call_model_provider(
                 "https://openrouter.ai/api/v1/chat/completions".to_string(),
                 key,
                 false,
+                false,
             )
         }
         "custom" => {
@@ -1535,11 +1704,17 @@ fn call_model_provider(
                 format!("{}/chat/completions", base),
                 settings.custom_api_key.trim().to_string(),
                 false,
+                false,
             )
         }
         _ => {
             let base = settings.ollama_base_url.trim().trim_end_matches('/');
-            (format!("{}/v1/chat/completions", base), String::new(), false)
+            (
+                format!("{}/v1/chat/completions", base),
+                String::new(),
+                false,
+                false,
+            )
         }
     };
 
@@ -1549,30 +1724,50 @@ fn call_model_provider(
     ])];
     msgs.extend_from_slice(conv);
 
+    // Zen's anonymous free lane only recognises the tool names the CLI itself emits
+    // (`bash`, `read`, ...), so remap AirCode's richer toolset onto them and back.
+    let tools_payload = if zen_free_lane {
+        remap_tools_for_zen(&oa_tools)
+    } else {
+        oa_tools
+    };
+
     let mut fields = vec![
         ("model", model.into()),
         ("messages", JsonValue::arr(msgs)),
-        ("tools", oa_tools),
+        ("tools", tools_payload),
         ("tool_choice", "auto".into()),
     ];
     if provider == "openai" && model.starts_with('o') {
         fields.push(("reasoning_effort", settings.effort_openai_tag().into()));
     }
+    if is_opencode_zen {
+        // The free lane requires a streaming request; the SSE body is accumulated
+        // and parsed below (we are a blocking client, so we read it all at once).
+        fields.push(("stream", JsonValue::Bool(true)));
+    }
     let payload = JsonValue::obj(fields);
 
-    let auth_val = format!("Bearer {}", bearer);
-    let mut hdrs = vec![("Content-Type", "application/json")];
-    if !bearer.is_empty() {
-        hdrs.push(("Authorization", auth_val.as_str()));
-    }
-    if is_opencode_zen {
-        hdrs.push(("User-Agent", "opencode/1.0"));
-        hdrs.push(("HTTP-Referer", "https://opencode.ai/"));
-        hdrs.push(("X-Title", "opencode"));
-        hdrs.push(("x-opencode-client", "cli"));
-    }
+    // http_request takes borrowed header pairs, so keep the owned strings alive
+    // for the duration of the request.
+    let hdrs_owned: Vec<(&str, String)> = if is_opencode_zen {
+        // Speak the official OpenCode client dialect: UA fingerprint + the
+        // x-opencode-* header quartet (never x-opencode-request, which 403s).
+        zen_client_headers(zen_session, &bearer)
+    } else {
+        let auth_val = format!("Bearer {}", bearer);
+        let mut h = vec![("Content-Type", "application/json".to_string())];
+        if !bearer.is_empty() {
+            h.push(("Authorization", auth_val));
+        }
+        h
+    };
+    let hdrs: Vec<(&str, &str)> = hdrs_owned
+        .iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
 
-    let resp = http_request("POST", &endpoint, &hdrs, &payload.to_json_string(), 120_000);
+    let resp = http_request("POST", &endpoint, &hdrs, &payload.to_json_string(), 180_000);
     if let Some(e) = resp.error {
         return Err(e);
     }
@@ -1585,36 +1780,53 @@ fn call_model_provider(
         ));
     }
 
-    let body = JsonValue::parse(&resp.body)?;
-    let msg = body
-        .get("choices")
-        .and_then(|c| c.get_index(0))
-        .and_then(|c| c.get("message"))
-        .ok_or_else(|| "Missing choices[0].message in response".to_string())?;
-
-    let raw_text = msg.string_or("content", "");
-    let raw_reasoning = msg
-        .get("reasoning_content")
-        .or_else(|| msg.get("reasoning"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let (text, thinking) = split_think_tags(&raw_text, raw_reasoning);
+    // Zen answers with an SSE stream; every other provider answers with plain JSON.
+    let (raw_text, raw_reasoning, raw_calls) = if is_opencode_zen {
+        parse_openai_sse(&resp.body)
+    } else {
+        let body = JsonValue::parse(&resp.body)?;
+        let msg = body
+            .get("choices")
+            .and_then(|c| c.get_index(0))
+            .and_then(|c| c.get("message"))
+            .ok_or_else(|| "Missing choices[0].message in response".to_string())?;
+        let t = msg.string_or("content", "");
+        let th = msg
+            .get("reasoning_content")
+            .or_else(|| msg.get("reasoning"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut cs = Vec::new();
+        if let Some(arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in arr {
+                let fn_obj = tc.get("function");
+                let raw_args = fn_obj.map(|f| f.str_or("arguments", "{}")).unwrap_or("{}");
+                let parsed_args =
+                    JsonValue::parse(raw_args).unwrap_or_else(|_| JsonValue::obj(Vec::new()));
+                cs.push((
+                    tc.string_or("id", &make_unique_id("call")),
+                    fn_obj.map(|f| f.string_or("name", "")).unwrap_or_default(),
+                    parsed_args,
+                ));
+            }
+        }
+        (t, th, cs)
+    };
+    let (text, thinking) = split_think_tags(&raw_text, &raw_reasoning);
 
     let mut calls = Vec::new();
-    if let Some(arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-        for tc in arr {
-            let fn_obj = tc.get("function");
-            let raw_args = fn_obj.map(|f| f.str_or("arguments", "{}")).unwrap_or("{}");
-            let parsed_args =
-                JsonValue::parse(raw_args).unwrap_or_else(|_| JsonValue::obj(Vec::new()));
-            calls.push(NormalizedCall {
-                id: tc.string_or("id", &make_unique_id("call")),
-                name: fn_obj
-                    .map(|f| f.string_or("name", ""))
-                    .unwrap_or_default(),
-                args: parsed_args,
-            });
-        }
+    for (id, name, args) in raw_calls {
+        calls.push(NormalizedCall {
+            id,
+            // Undo the Zen free-lane tool remap so AirCode's dispatcher sees its own names.
+            name: if zen_free_lane {
+                zen_tool_name_in(&name).to_string()
+            } else {
+                name
+            },
+            args,
+        });
     }
 
     Ok(TurnReply {
@@ -1687,6 +1899,7 @@ pub fn spawn_session_compaction(
             &settings.active_model,
             "You are AirCode's Context Compactor. Return a concise markdown bullet checkpoint.",
             &sum_conv,
+            &new_zen_session_id(),
         ) {
             Ok(rep) if !rep.text.trim().is_empty() => rep.text,
             _ => {
@@ -1719,6 +1932,9 @@ pub fn spawn_autonomous_agent_run(
         let provider = settings.active_provider.clone();
         let model = settings.active_model.clone();
         let effort = settings.agent_effort.clone();
+        // One OpenCode Zen session id per agent run: the gateway pins an upstream
+        // backend per session, exactly like the official CLI does.
+        let zen_session_id = new_zen_session_id();
 
         store.append_message(&ChatMessage {
             id: make_unique_id("msg"),
@@ -1827,7 +2043,14 @@ pub fn spawn_autonomous_agent_run(
                 model
             )));
 
-            let reply = match call_model_provider(&settings, &provider, &model, &sys_prompt, &conv)
+            let reply = match call_model_provider(
+                &settings,
+                &provider,
+                &model,
+                &sys_prompt,
+                &conv,
+                &zen_session_id,
+            )
             {
                 Ok(r) => r,
                 Err(err) => {

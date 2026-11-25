@@ -59,7 +59,7 @@ use crate::vt_screen::VtScreen;
 const HEADER_H: i32 = 52;
 const RAIL_W: i32 = 60;
 const FOOTER_H: i32 = 26;
-const PAD: i32 = 12;
+const PAD: i32 = 14;
 const CARD_RADIUS: i32 = 8;
 
 struct TerminalSession {
@@ -101,6 +101,10 @@ pub struct ConnectWizardState {
     pub detected_opencode_file: Option<String>,
     pub local_server_alive: bool,
     pub ollama_alive: bool,
+    /// Live free-tier catalog pulled anonymously from `GET /zen/v1/models`.
+    pub zen_free_models: Vec<String>,
+    /// Short status line for the Zen free-lane card.
+    pub zen_status: String,
 }
 
 #[derive(Clone, Debug)]
@@ -129,7 +133,7 @@ pub struct StudioApp {
     // SQLite store + live settings + dynamic theme palette
     db: Arc<SqliteStore>,
     pub settings: AppSettings,
-    palette: ThemePalette,
+    pub palette: ThemePalette,
     ollama_models: Vec<String>,
 
     // Workspace & Explorer
@@ -359,6 +363,11 @@ impl StudioApp {
                 detected_opencode_file: None,
                 local_server_alive: false,
                 ollama_alive: false,
+                zen_free_models: crate::opencode_auth::ZEN_FREE_MODELS
+                    .iter()
+                    .map(|(id, _)| (*id).to_string())
+                    .collect(),
+                zen_status: String::new(),
             },
             skills: Vec::new(),
             subagents: Vec::new(),
@@ -899,6 +908,27 @@ impl StudioApp {
             "/connect" | "/setup" | "/auth" | "/keys" => {
                 self.open_connect_wizard();
             }
+            // One-click OpenCode Zen free lane (OpenCode-client auth emulation).
+            "/zen" | "/free" => {
+                self.use_zen_free_lane();
+            }
+            // Refresh the anonymous Zen catalog.
+            "/zen models" | "/models" => {
+                self.fetch_zen_free_models();
+                if !self.connect.zen_free_models.is_empty() {
+                    self.show_toast(format!(
+                        "{} free Zen models: {}",
+                        self.connect.zen_free_models.len(),
+                        self.connect
+                            .zen_free_models
+                            .iter()
+                            .take(5)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
             "/settings" | "/safety" => {
                 self.modal = ModalDialog::SafetySettings;
             }
@@ -1034,6 +1064,8 @@ impl StudioApp {
 
     fn execute_command_id(&mut self, id: String) {
         match id.as_str() {
+            "cmd:zen_free" => self.use_zen_free_lane(),
+            "cmd:zen_models" => self.fetch_zen_free_models(),
             "cmd:connect" => self.open_connect_wizard(),
             "cmd:toggle_thinking" => {
                 self.settings.show_thinking = !self.settings.show_thinking;
@@ -1136,6 +1168,11 @@ impl StudioApp {
                 .map(|p| p.to_string_lossy().to_string()),
             local_server_alive: disc.local_opencode_server_alive,
             ollama_alive: disc.local_ollama_alive,
+            zen_free_models: crate::opencode_auth::ZEN_FREE_MODELS
+                .iter()
+                .map(|(id, _)| (*id).to_string())
+                .collect(),
+            zen_status: String::new(),
         };
         self.modal = ModalDialog::ConnectWizard;
         self.focus = FocusTarget::ConnectKeyInput;
@@ -1147,6 +1184,51 @@ impl StudioApp {
             .iter()
             .find(|g| g.id == self.connect.provider_id)
             .unwrap_or(&PROVIDER_GUIDES[0])
+    }
+
+    /// One-click OpenCode Zen free lane: no key, no account, no card.
+    ///
+    /// This is the workaround for "free models only work inside OpenCode": AirCode
+    /// speaks the official client dialect (UA fingerprint + `x-opencode-*` session
+    /// headers + `stream: true` + `bash`/`read` tool names), so the gateway treats
+    /// it as the CLI and serves the anonymous `public` lane.
+    fn use_zen_free_lane(&mut self) {
+        self.connect.provider_id = "opencode".to_string();
+        self.connect.opencode_auth_mode = "zen".to_string();
+        self.connect.key_input = String::new();
+        self.settings.active_provider = "opencode".to_string();
+        self.settings.opencode_auth_mode = "zen".to_string();
+        self.settings.opencode_api_key = String::new();
+        let first_free = crate::opencode_auth::ZEN_FREE_MODELS
+            .first()
+            .map(|(id, _)| (*id).to_string())
+            .unwrap_or_else(|| "big-pickle".to_string());
+        self.settings.active_model = first_free.clone();
+        self.connect.model = first_free.clone();
+        self.persist_settings();
+        self.refresh_palette();
+        self.modal = ModalDialog::None;
+        self.show_toast(format!(
+            "OpenCode Zen free lane active — {} (no API key needed)",
+            first_free
+        ));
+    }
+
+    /// Refreshes the free-tier catalog straight from `GET https://opencode.ai/zen/v1/models`
+    /// (that endpoint answers anonymously, which is how the catalog stays current).
+    fn fetch_zen_free_models(&mut self) {
+        self.connect.zen_status = "Fetching live Zen catalog...".to_string();
+        let live = crate::opencode_auth::fetch_zen_free_models();
+        if live.is_empty() {
+            self.connect.zen_status =
+                "Catalog unreachable from here — showing the built-in free list.".to_string();
+        } else {
+            self.connect.zen_free_models = live;
+            self.connect.zen_status = format!(
+                "{} free models live right now — pick one in the model box.",
+                self.connect.zen_free_models.len()
+            );
+        }
     }
 
     fn save_connect_wizard(&mut self) {
@@ -1844,6 +1926,8 @@ impl StudioApp {
             }
             UiAction::ImportDetectedAuth => self.import_detected_auth(),
             UiAction::SpawnLocalOpenCodeServe => self.spawn_local_opencode_serve(),
+            UiAction::UseZenFreeLane => self.use_zen_free_lane(),
+            UiAction::FetchZenFreeModels => self.fetch_zen_free_models(),
             UiAction::SaveConnectWizard => self.save_connect_wizard(),
             UiAction::ApplyTheme(id) => {
                 self.settings.theme = id.clone();
@@ -2690,128 +2774,112 @@ impl StudioApp {
     fn draw_top_header(&mut self, canvas: &mut dyn SurfaceCanvas, w: i32) {
         let p = self.palette.clone();
         canvas.fill_rect(0, 0, w, HEADER_H, p.bg_header);
+        // One hairline, no double strokes: the header should recede, not shout.
         canvas.draw_hline(0, HEADER_H - 1, w, p.border_subtle);
 
-        // Brand emblem
-        canvas.fill_rounded_rect(PAD, 11, 30, 30, 8, p.accent);
-        canvas.draw_text(PAD + 6, 18, "AC", FontRole::UiSemibold, p.on_accent_text(p.accent));
-        canvas.draw_text(PAD + 40, 8, "AirCode", FontRole::UiTitle, p.text_primary);
+        // Brand mark - quiet, tinted rather than a solid accent slab.
+        canvas.fill_rounded_rect(PAD, 13, 26, 26, 7, mix(p.accent, p.bg_header, 0.16));
+        canvas.draw_text(PAD + 5, 20, "AC", FontRole::UiSemibold, p.accent);
+        canvas.draw_text(PAD + 36, 11, "AirCode", FontRole::UiTitle, p.text_primary);
         canvas.draw_text(
-            PAD + 40,
-            29,
+            PAD + 36,
+            31,
             "Pure-Rust Studio",
             FontRole::UiSmall,
             p.text_muted,
         );
 
-        let mut x = 176;
+        let mut x = 188;
 
-        // Workspace pill
+        // Workspace
         let ws_str = truncate_left(&self.workspace.to_string_lossy(), 30);
-        let ws_w = 236.min((w - 780).max(120));
+        let ws_w = 232.min((w - 700).max(120));
         self.draw_button(
             canvas,
-            UiRect::new(x, 11, ws_w, 30),
+            UiRect::new(x, 13, ws_w, 26),
             &format!("{}  {}", glyph("folder"), ws_str),
             p.bg_card,
             p.text_secondary,
             p.border_subtle,
             Some(UiAction::PickFolder),
         );
-        x += ws_w + 8;
+        x += ws_w + 10;
 
-        // Command search (opens fuzzy palette)
+        // Command palette search
         self.draw_button(
             canvas,
-            UiRect::new(x, 11, 190, 30),
+            UiRect::new(x, 13, 196, 26),
             &format!("{}  Search commands   Ctrl+K", glyph("search")),
             p.bg_input,
             p.text_muted,
             p.border_subtle,
             Some(UiAction::OpenModal(ModalDialog::CommandPalette)),
         );
-        x += 198;
+        x += 206;
 
-        // Provider pill
-        let prov_label = format!("{} {}", glyph("plug"), self.settings.active_provider.to_uppercase());
+        // Provider + model share one pill (they are two halves of one setting).
+        let prov_model = format!(
+            "{} {}  ·  {}",
+            glyph("plug"),
+            self.settings.active_provider,
+            truncate_right(&self.settings.active_model, 18)
+        );
         self.draw_pill(
             canvas,
-            UiRect::new(x, 11, 118, 30),
-            &prov_label,
+            UiRect::new(x, 13, 246, 26),
+            &prov_model,
             false,
             Some(UiAction::OpenModal(ModalDialog::ConnectWizard)),
         );
-        x += 124;
+        x += 254;
 
-        // Model pill
-        let model_label = format!("{} {}", glyph("chip"), truncate_right(&self.settings.active_model, 16));
+        // Plan / Build segmented control
+        let mode_w = 60;
         self.draw_pill(
             canvas,
-            UiRect::new(x, 11, 176, 30),
-            &model_label,
-            false,
-            Some(UiAction::OpenModal(ModalDialog::ConnectWizard)),
-        );
-        x += 182;
-
-        // Mode toggle: Plan / Build
-        let mode_w = 62;
-        self.draw_pill(
-            canvas,
-            UiRect::new(x, 11, mode_w, 30),
+            UiRect::new(x, 13, mode_w, 26),
             "Plan",
             self.active_mode == "plan",
             Some(UiAction::SetMode("plan")),
         );
         self.draw_pill(
             canvas,
-            UiRect::new(x + mode_w + 4, 11, mode_w, 30),
+            UiRect::new(x + mode_w + 4, 13, mode_w, 26),
             "Build",
             self.active_mode == "build",
             Some(UiAction::SetMode("build")),
         );
-        x += mode_w * 2 + 12;
+        x += mode_w * 2 + 16;
 
-        // Effort cycle
+        // Effort (theme lives in the footer + command palette, not up here)
         self.draw_pill(
             canvas,
-            UiRect::new(x, 11, 96, 30),
+            UiRect::new(x, 13, 92, 26),
             &format!("{} {}", glyph("bolt"), self.settings.agent_effort.to_uppercase()),
             true,
             Some(UiAction::CycleEffort),
         );
-        x += 102;
 
-        // Theme pill
-        self.draw_pill(
-            canvas,
-            UiRect::new(x, 11, 150, 30),
-            &format!("{} {}", glyph("brush"), truncate_right(&self.palette.name, 14)),
-            false,
-            Some(UiAction::OpenModal(ModalDialog::ThemePicker)),
-        );
-        let _ = x;
-
-        // Right-side controls
+        // Right-side controls - one quiet ghost button, one accent action.
         let mut rx = w - PAD;
-        rx -= 96;
+        rx -= 92;
         self.draw_button(
             canvas,
-            UiRect::new(rx, 11, 96, 30),
+            UiRect::new(rx, 13, 92, 26),
             "Settings",
             p.bg_card,
             p.text_secondary,
             p.border_subtle,
             Some(UiAction::OpenModal(ModalDialog::SafetySettings)),
         );
-        rx -= 104;
+        rx -= 106;
         self.draw_button(
             canvas,
-            UiRect::new(rx, 11, 100, 30),
+            UiRect::new(rx, 13, 98, 26),
             "/ Connect",
+            mix(p.accent, p.bg_header, 0.12),
             p.accent,
-            p.on_accent_text(p.accent),
-            p.accent,
+            mix(p.accent, p.bg_header, 0.35),
             Some(UiAction::OpenModal(ModalDialog::ConnectWizard)),
         );
     }
@@ -2837,11 +2905,13 @@ impl StudioApp {
             let rect = UiRect::new(6, y, RAIL_W - 12, 44);
             let active = self.left_tab == tab && self.left_panel_open;
             if active {
-                canvas.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 8, mix(p.accent, p.bg_rail, 0.20));
+                // A quiet 3px tint bar reads as "selected" without a filled slab.
+                canvas.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 8, mix(p.accent, p.bg_rail, 0.07));
+                canvas.fill_rect(rect.x, rect.y + 6, 3, rect.h - 12, mix(p.accent, p.bg_rail, 0.55));
             }
             let hovered = rect.contains(self.mouse_x, self.mouse_y);
             if !active && hovered {
-                canvas.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 8, p.bg_card);
+                canvas.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 8, mix(p.accent, p.bg_rail, 0.04));
             }
             let fg = if active { p.accent } else { p.text_muted };
             canvas.draw_text(rect.x + 16, rect.y + 6, glyph(glyph_name), FontRole::UiTitle, fg);
@@ -2862,12 +2932,18 @@ impl StudioApp {
                     bw,
                     14,
                     7,
-                    p.accent_secondary,
+                    mix(p.accent_secondary, p.bg_rail, 0.22),
                 );
-                canvas.draw_text(rect.x + rect.w - bw + 3, rect.y + 3, &bl, FontRole::UiSmall, p.bg_rail);
+                canvas.draw_text(
+                    rect.x + rect.w - bw + 3,
+                    rect.y + 3,
+                    &bl,
+                    FontRole::UiSmall,
+                    p.text_secondary,
+                );
             }
             self.push_hit(rect, UiAction::ToggleRailTab(tab));
-            y += 50;
+            y += 54;
         }
 
         // Bottom toggles: terminal + browser
@@ -2880,9 +2956,9 @@ impl StudioApp {
             term_rect.h,
             8,
             if self.terminal_open {
-                mix(p.accent, p.bg_rail, 0.2)
+                mix(p.accent, p.bg_rail, 0.10)
             } else {
-                p.bg_card
+                p.bg_rail
             },
         );
         canvas.draw_text(
@@ -2910,9 +2986,9 @@ impl StudioApp {
             br_rect.h,
             8,
             if self.center_view == CenterView::Browser {
-                mix(p.accent, p.bg_rail, 0.2)
+                mix(p.accent, p.bg_rail, 0.10)
             } else {
-                p.bg_card
+                p.bg_rail
             },
         );
         canvas.draw_text(
@@ -3067,7 +3143,8 @@ impl StudioApp {
 
         canvas.draw_hline(x, y - 4, w - 1, p.border_subtle);
 
-        let row_h = 26;
+        // Roomier rows: a calm file list beats a dense one.
+        let row_h = 31;
         let avail_rows = ((bottom - y - 6).max(0) / row_h) as usize;
         let max_scroll = self.entries.len().saturating_sub(avail_rows.max(1));
         if self.explorer_scroll > max_scroll {
@@ -3171,7 +3248,7 @@ impl StudioApp {
         );
         y += 20;
 
-        let row_h = 40;
+        let row_h = 46;
         let avail = ((bottom - y - 6).max(0) / row_h) as usize;
         let max_scroll = self.search_results.len().saturating_sub(avail.max(1));
         if self.search_scroll > max_scroll {
@@ -3293,7 +3370,7 @@ impl StudioApp {
         );
         y += 18;
 
-        let row_h = 26;
+        let row_h = 30;
         let avail = ((bottom - y - 6).max(0) / row_h) as usize;
         let max_scroll = self.git_snapshot.files.len().saturating_sub(avail.max(1));
         if self.git_scroll > max_scroll {
@@ -4733,7 +4810,7 @@ impl StudioApp {
             });
             for info in [
                 "Plan mode researches & designs; Build mode edits files, runs shell & tests.",
-                "Type / for the command palette: /connect /theme /fork /compact /effort /skills /browser",
+                "Type / for the command palette: /zen /connect /theme /fork /compact /effort /skills /browser",
                 "Ctrl+K opens fuzzy search over every command and file in the workspace.",
             ] {
                 for wl in wrap_text(info, wrap_cols) {
@@ -4749,9 +4826,18 @@ impl StudioApp {
         }
 
         for (msg_idx, msg) in self.active_session.messages.iter().enumerate() {
+            // A blank line above each turn keeps the feed calm instead of a solid wall.
+            blocks.push(ChatBlock {
+                bg: p.bg_agent,
+                fg: p.text_muted,
+                text: String::new(),
+                diff_rel: None,
+                msg_idx: None,
+            });
             self.msg_line_offsets.push(blocks.len());
             let is_user = msg.role == "user";
-            let bg = if is_user { mix(p.accent, p.bg_agent, 0.10) } else { p.bg_card };
+            // Barely-tinted user bubble: present, never loud.
+            let bg = if is_user { mix(p.accent, p.bg_agent, 0.06) } else { p.bg_card };
             let hdr_fg = if is_user { p.accent } else { p.success };
             let stamp = crate::sqlite::short_time_label(&msg.created_at);
             blocks.push(ChatBlock {
@@ -4923,7 +5009,7 @@ impl StudioApp {
             }
         }
 
-        let line_h = 18;
+        let line_h = 21;
         let vis_lines = ((feed_bottom - feed_top).max(20) / line_h) as usize;
         let total = blocks.len();
         let max_off = total.saturating_sub(vis_lines);
@@ -5205,8 +5291,8 @@ impl StudioApp {
         );
 
         let items = self.palette_entries();
-        let list_y = my + 108;
-        let row_h = 40;
+        let list_y = my + 112;
+        let row_h = 44;
         let avail = ((mh - 130) / row_h).max(3) as usize;
         canvas.push_clip(mx, list_y, mw, mh - 120);
         for (i, item) in items.iter().take(avail).enumerate() {
@@ -5215,19 +5301,35 @@ impl StudioApp {
             let selected = i == self.palette_index;
             let hovered = row.contains(self.mouse_x, self.mouse_y);
             if selected {
-                canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 8, mix(p.accent, p.bg_modal, 0.18));
-                canvas.stroke_rounded_rect(row.x, row.y, row.w, row.h, 8, p.accent);
+                // Selected = a tint plus a left rule, not a filled slab + outline.
+                canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 8, mix(p.accent, p.bg_modal, 0.10));
+                canvas.fill_rect(row.x, row.y + 6, 3, row.h - 12, p.accent);
             } else if hovered {
                 canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 8, p.bg_card);
             }
             let badge = if item.is_file { "FILE" } else { "CMD" };
-            canvas.fill_rounded_rect(row.x + 8, row.y + 8, 42, 18, 5, if item.is_file { p.bg_button } else { p.accent });
+            canvas.fill_rounded_rect(
+                row.x + 8,
+                row.y + 8,
+                42,
+                18,
+                5,
+                if item.is_file {
+                    p.bg_button
+                } else {
+                    mix(p.accent, p.bg_modal, 0.20)
+                },
+            );
             canvas.draw_text(
                 row.x + 14,
                 row.y + 10,
                 badge,
                 FontRole::UiSmall,
-                if item.is_file { p.text_muted } else { p.on_accent_text(p.accent) },
+                if item.is_file {
+                    p.text_muted
+                } else {
+                    p.accent
+                },
             );
             canvas.draw_text_clipped(
                 row.x + 58,
@@ -5262,8 +5364,9 @@ impl StudioApp {
 
     fn draw_connect_wizard(&mut self, canvas: &mut dyn SurfaceCanvas) {
         let p = self.palette.clone();
-        let mw = 760.min(self.width - 60);
-        let mh = 520.min(self.height - 80);
+        // Tall enough for the Zen free-lane card plus every provider option.
+        let mw = 820.min(self.width - 60);
+        let mh = 640.min(self.height - 40);
         let mx = (self.width - mw) / 2;
         let my = (self.height - mh) / 2;
         canvas.fill_rect(0, 0, self.width, self.height, 0x40000000);
@@ -5279,13 +5382,74 @@ impl StudioApp {
             p.text_secondary,
         );
 
+        // --- OpenCode Zen free lane: the headline option, not a footnote ---------
+        let zen_card = UiRect::new(mx + 24, my + 62, mw - 48, 62);
+        canvas.fill_rounded_rect(zen_card.x, zen_card.y, zen_card.w, zen_card.h, 10, mix(p.success, p.bg_modal, 0.10));
+        canvas.stroke_rounded_rect(zen_card.x, zen_card.y, zen_card.w, zen_card.h, 10, mix(p.success, p.bg_modal, 0.45));
+        canvas.draw_text(
+            zen_card.x + 14,
+            zen_card.y + 9,
+            &format!("{}  OpenCode Zen — free lane, no API key", glyph("spark")),
+            FontRole::UiSemibold,
+            p.text_primary,
+        );
+        canvas.draw_text_clipped(
+            zen_card.x + 14,
+            zen_card.y + 28,
+            zen_card.w - 210,
+            "AirCode authenticates exactly like the official OpenCode client, so the anonymous public tier works with zero setup.",
+            FontRole::UiSmall,
+            p.text_secondary,
+        );
+        let models_line = if self.connect.zen_free_models.is_empty() {
+            "big-pickle, glm-5.3-flash-free, deepseek-v4.1-flash-free, nemotron-3.5-lightning-free, ...".to_string()
+        } else {
+            format!(
+                "{} free models: {}",
+                self.connect.zen_free_models.len(),
+                self.connect
+                    .zen_free_models
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        canvas.draw_text_clipped(
+            zen_card.x + 14,
+            zen_card.y + 45,
+            zen_card.w - 210,
+            &models_line,
+            FontRole::UiSmall,
+            p.text_muted,
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(zen_card.x + zen_card.w - 178, zen_card.y + 12, 164, 24),
+            "Use free lane",
+            mix(p.success, p.bg_modal, 0.22),
+            p.success,
+            mix(p.success, p.bg_modal, 0.45),
+            Some(UiAction::UseZenFreeLane),
+        );
+        self.draw_button(
+            canvas,
+            UiRect::new(zen_card.x + zen_card.w - 178, zen_card.y + 38, 164, 20),
+            "Refresh catalog",
+            p.bg_card,
+            p.text_secondary,
+            p.border_subtle,
+            Some(UiAction::FetchZenFreeModels),
+        );
+
         // Provider cards
         let guides = PROVIDER_GUIDES;
         let card_w = (mw - 48 - 12 * (guides.len() as i32 - 1)) / guides.len() as i32;
-        let card_h = 96;
+        let card_h = 88;
         for (i, g) in guides.iter().enumerate() {
             let cx = mx + 24 + i as i32 * (card_w + 12);
-            let rect = UiRect::new(cx, my + 64, card_w, card_h);
+            let rect = UiRect::new(cx, my + 134, card_w, card_h);
             let selected = self.connect.provider_id == g.id;
             let hovered = rect.contains(self.mouse_x, self.mouse_y);
             canvas.fill_rounded_rect(
@@ -5307,7 +5471,7 @@ impl StudioApp {
         }
 
         let guide = self.connect_provider_guide();
-        let mut y = my + card_h + 82;
+        let mut y = my + 134 + card_h + 22;
 
         // Detected credentials
         canvas.draw_text(mx + 24, y, "Auto-detected credentials", FontRole::UiSemibold, p.text_primary);
@@ -5421,7 +5585,7 @@ impl StudioApp {
             self.connect.provider_id == "ollama",
             Some(UiAction::SelectConnectProvider("ollama")),
         );
-        y += 40;
+        y += 34;
 
         // Footer actions
         let help = format!(
