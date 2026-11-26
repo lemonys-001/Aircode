@@ -222,6 +222,7 @@
     rs.className = "pill" + (s.agentRunning ? " running" : "");
 
     $("btn-view").textContent = s.view === "workspace" ? "Chat" : "Workspace";
+    document.documentElement.classList.toggle("rail-open", !!s.sidebarOpen);
     $("btn-stop").hidden = !s.agentRunning;
     $("caret").textContent = s.agentRunning ? "▌" : ">";
 
@@ -465,6 +466,7 @@
     $("btn-new").addEventListener("click", function () { api("/api/session/new", {}); });
     $("btn-view").addEventListener("click", function () { api("/api/action", { action: "toggle-view" }); });
     $("btn-connect").addEventListener("click", function () { api("/api/action", { action: "connect" }); });
+    $("btn-rail").addEventListener("click", function () { api("/api/action", { action: "sidebar" }); });
     $("model-box").addEventListener("click", function () { api("/api/action", { action: "cycle-model" }); });
 
     $("btn-zen").addEventListener("click", function () {

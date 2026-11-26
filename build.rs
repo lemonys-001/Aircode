@@ -102,12 +102,12 @@ fn main() {
             0x8664
         };
         if let Ok(res_file) = env::var("PREBUILT_WIN32_RES") {
-            println!("cargo:rustc-link-arg-bin=AI-Coding-Agent={}", res_file);
+            println!("cargo:rustc-link-arg-bin=aircode={}", res_file);
         } else {
             let version = winres::VersionInfo::from_crate_version(
                 &env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string()),
-                "AI-Coding-Agent",
-                "AI Coding Agent — 100% Pure-Rust Native Windows x64 Desktop Studio",
+                "aircode",
+                "AirCode — Pure-Rust Desktop",
             );
             match winres::generate_from_paths(
                 machine,
@@ -119,7 +119,7 @@ fn main() {
                     let res_out = out_dir.join("app.res");
                     if fs::write(&res_out, &bytes).is_ok() {
                         println!(
-                            "cargo:rustc-link-arg-bin=AI-Coding-Agent={}",
+                            "cargo:rustc-link-arg-bin=aircode={}",
                             res_out.display()
                         );
                         println!("cargo:warning=embedded win32 resources (icon+version+manifest)");

@@ -1,11 +1,11 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-//! Pure-Rust Native Windows x64 Setup Wizard & Uninstaller (`AI-Coding-Agent-Setup.exe`).
-//! Embeds `dist/AI-Coding-Agent.exe` directly — zero external frameworks, zero WebView, zero UAC prompt required.
+//! Pure-Rust Native Windows x64 Setup Wizard & Uninstaller (`aircode-setup.exe`).
+//! Embeds `dist/aircode.exe` directly — zero external frameworks, zero WebView, zero UAC prompt required.
 
 #[cfg(not(target_os = "windows"))]
 fn main() {
-    eprintln!("AI-Coding-Agent-Setup is the Windows x64 native installer target.");
+    eprintln!("aircode-setup is the Windows x64 native installer target.");
 }
 
 #[cfg(target_os = "windows")]
@@ -16,7 +16,7 @@ mod win_setup {
     use std::process::Command;
     use std::ptr;
 
-    static APP_PAYLOAD: &[u8] = include_bytes!("../../dist/AI-Coding-Agent.exe");
+    static APP_PAYLOAD: &[u8] = include_bytes!("../../dist/aircode.exe");
 
     type HWND = *mut c_void;
     type HINSTANCE = *mut c_void;
@@ -339,22 +339,22 @@ mod win_setup {
 
     fn default_install_dir() -> PathBuf {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            PathBuf::from(local).join("Programs").join("AI-Coding-Agent")
+            PathBuf::from(local).join("Programs").join("aircode")
         } else {
-            PathBuf::from(r"C:\AI-Coding-Agent")
+            PathBuf::from(r"C:\aircode")
         }
     }
 
     fn desktop_shortcut_path() -> Option<PathBuf> {
         std::env::var("USERPROFILE")
             .ok()
-            .map(|p| PathBuf::from(p).join("Desktop").join("AI Coding Agent.lnk"))
+            .map(|p| PathBuf::from(p).join("Desktop").join("AirCode.lnk"))
     }
 
     fn start_menu_shortcut_path() -> Option<PathBuf> {
         std::env::var("APPDATA").ok().map(|p| {
             PathBuf::from(p)
-                .join(r"Microsoft\Windows\Start Menu\Programs\AI Coding Agent.lnk")
+                .join(r"Microsoft\Windows\Start Menu\Programs\AirCode.lnk")
         })
     }
 
@@ -447,7 +447,7 @@ mod win_setup {
                 &mut disp,
             ) == 0
             {
-                reg_set_sz(hk, Some("DisplayName"), "AI Coding Agent (Pure-Rust Studio)");
+                reg_set_sz(hk, Some("DisplayName"), "AirCode");
                 // Derived, not written out: a hardcoded string here silently
                 // disagrees with the binary the moment the version is bumped.
                 reg_set_sz(hk, Some("DisplayVersion"), env!("CARGO_PKG_VERSION"));
@@ -484,7 +484,7 @@ mod win_setup {
                         &mut disp,
                     ) == 0
                     {
-                        reg_set_sz(hk_ctx, None, "Open with AI Coding Agent");
+                        reg_set_sz(hk_ctx, None, "Open with AirCode");
                         reg_set_sz(hk_ctx, Some("Icon"), &exe_path.to_string_lossy());
                         RegCloseKey(hk_ctx);
                     }
@@ -526,10 +526,10 @@ mod win_setup {
         fs::create_dir_all(install_dir)
             .map_err(|e| format!("Failed creating {}: {}", install_dir.display(), e))?;
 
-        let exe_path = install_dir.join("AI-Coding-Agent.exe");
+        let exe_path = install_dir.join("aircode.exe");
         fs::write(&exe_path, APP_PAYLOAD).map_err(|e| {
             format!(
-                "Failed writing {} (close any running AI-Coding-Agent.exe first): {}",
+                "Failed writing {} (close any running aircode.exe first): {}",
                 exe_path.display(),
                 e
             )
@@ -546,7 +546,7 @@ mod win_setup {
                     &lnk,
                     &exe_path,
                     install_dir,
-                    "AI Coding Agent — 100% Pure-Rust Native Desktop IDE",
+                    "AirCode",
                 );
             }
         }
@@ -557,7 +557,7 @@ mod win_setup {
                     &lnk,
                     &exe_path,
                     install_dir,
-                    "AI Coding Agent — 100% Pure-Rust Native Desktop IDE",
+                    "AirCode",
                 );
             }
         }
@@ -576,8 +576,8 @@ mod win_setup {
             if !silent {
                 let ans = MessageBoxW(
                     ptr::null_mut(),
-                    wide("Uninstall AI Coding Agent from your computer?\n\n(Your local SQLite sessions in %LOCALAPPDATA%\\AI-Coding-Agent will be preserved.)").as_ptr(),
-                    wide("AI Coding Agent Uninstaller").as_ptr(),
+                    wide("Uninstall AirCode from your computer?\n\n(Your local SQLite sessions in %LOCALAPPDATA%\\aircode will be preserved.)").as_ptr(),
+                    wide("AirCode Uninstaller").as_ptr(),
                     MB_YESNO | MB_ICONQUESTION,
                 );
                 if ans != IDYES {
@@ -602,7 +602,7 @@ mod win_setup {
 
             if let Ok(self_exe) = std::env::current_exe() {
                 if let Some(dir) = self_exe.parent() {
-                    let app_exe = dir.join("AI-Coding-Agent.exe");
+                    let app_exe = dir.join("aircode.exe");
                     let _ = fs::remove_file(&app_exe);
                     // Schedule self-cleanup via cmd ping delay
                     let _ = Command::new("cmd.exe")
@@ -621,7 +621,7 @@ mod win_setup {
             if !silent {
                 MessageBoxW(
                     ptr::null_mut(),
-                    wide("AI Coding Agent has been uninstalled cleanly.").as_ptr(),
+                    wide("AirCode has been uninstalled cleanly.").as_ptr(),
                     wide("Uninstall Complete").as_ptr(),
                     MB_OK | MB_ICONINFORMATION,
                 );
@@ -677,12 +677,12 @@ mod win_setup {
                     (ID_CHK_STARTMENU, "Create Start Menu shortcut", 210),
                     (
                         ID_CHK_CONTEXT,
-                        "Add \"Open with AI Coding Agent\" to Windows Explorer folders",
+                        "Add \"Open with AirCode\" to Windows Explorer folders",
                         240,
                     ),
                     (
                         ID_CHK_LAUNCH,
-                        "Launch AI Coding Agent immediately after installation",
+                        "Launch AirCode immediately after installation",
                         270,
                     ),
                 ];
@@ -776,7 +776,7 @@ mod win_setup {
                 SetBkMode(hdc, 1);
                 SelectObject(hdc, FONT_TITLE as HGDIOBJ);
                 SetTextColor(hdc, rgb_bgr(0xF8FAFC));
-                let t1 = wide("AI Coding Agent v2.0 — Setup Wizard");
+                let t1 = wide("AirCode v2.2 — Setup Wizard");
                 TextOutW(hdc, 28, 18, t1.as_ptr(), (t1.len() - 1) as i32);
 
                 SelectObject(hdc, FONT_UI as HGDIOBJ);
@@ -830,7 +830,7 @@ mod win_setup {
                                     .position(|&c| c == 0)
                                     .unwrap_or(path_buf.len());
                                 let chosen = PathBuf::from(String::from_utf16_lossy(&path_buf[..len]))
-                                    .join("AI-Coding-Agent");
+                                    .join("aircode");
                                 let edit = GetDlgItem(hwnd, ID_EDIT_DIR as i32);
                                 SetWindowTextW(edit, wide(&chosen.to_string_lossy()).as_ptr());
                             }
@@ -854,7 +854,7 @@ mod win_setup {
                         };
 
                         let lbl = GetDlgItem(hwnd, ID_LBL_STATUS as i32);
-                        SetWindowTextW(lbl, wide("Installing AI-Coding-Agent.exe...").as_ptr());
+                        SetWindowTextW(lbl, wide("Installing aircode.exe...").as_ptr());
 
                         match perform_installation(
                             &target_dir,
@@ -867,7 +867,7 @@ mod win_setup {
                                 MessageBoxW(
                                     hwnd,
                                     wide(&format!(
-                                        "AI Coding Agent (Pure-Rust Native Studio) was installed successfully!\n\nLocation:\n{}",
+                                        "AirCode was installed successfully!\n\nLocation:\n{}",
                                         exe.display()
                                     ))
                                     .as_ptr(),
@@ -1006,7 +1006,7 @@ mod win_setup {
             let hwnd = CreateWindowExW(
                 0,
                 cls.as_ptr(),
-                wide("AI Coding Agent Setup (Pure-Rust Windows x64)").as_ptr(),
+                wide("AirCode Setup (Pure-Rust Windows x64)").as_ptr(),
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                 sx.max(40),
                 sy.max(40),

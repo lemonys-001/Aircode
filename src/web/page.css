@@ -32,6 +32,8 @@ html, body {
   font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
+#btn-rail { display: none; }
+
 #app, body { display: flex; flex-direction: column; }
 
 /* ---- tab strip ---------------------------------------------------------- */
@@ -359,6 +361,126 @@ li.empty, .empty { color: var(--text-muted); }
 }
 #toast[hidden] { display: none; }
 
-@media (max-width: 860px) {
+/* ==========================================================================
+   Mobile / small-screen layout
+   ==========================================================================
+   The desktop layout is a two-column flex: conversation on the left, context
+   rail on the right. On a phone that rail has to go, the chrome has to shrink,
+   and every control has to be big enough to hit with a thumb — 24px buttons
+   are unclickable at arm's length.
+
+   Three breakpoints, because a 768px tablet and a 390px phone want different
+   things:
+     <= 1100px  drop the rail, keep the tab strip
+     <= 720px   shrink chrome, grow tap targets, single-column the composer
+     <= 480px   phone: full-width controls, larger base text, sticky send row
+   ========================================================================== */
+
+/* ---- <= 1100px: the rail goes, the conversation takes the width --------- */
+@media (max-width: 1100px) {
   #rail { display: none; }
+  #btn-rail { display: inline-flex; }
+  /* ...unless the user explicitly asked for it, in which case it overlays the
+     conversation instead of stealing width from it. */
+  html.rail-open #rail {
+    display: flex;
+    position: absolute;
+    top: 40px; right: 0; bottom: 0;
+    width: min(300px, 82vw);
+    z-index: 15;
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.35);
+    overflow-y: auto;
+  }
+}
+
+/* ---- <= 720px: tablet ---------------------------------------------------- */
+@media (max-width: 720px) {
+  #tabs { height: 46px; padding: 0 8px; gap: 8px; }
+  .tab { max-width: 12ch; font-size: 13px; }
+  .tabs-right .pill { display: none; }
+
+  #transcript { padding: 12px 12px 4px; }
+  .turn { margin-bottom: 16px; }
+
+  /* Composer: full width, no side gutters, roomier line height. */
+  #input-row { padding: 6px 10px 10px; gap: 6px; }
+  #input-row textarea {
+    font-size: 16px; /* stops iOS Safari zooming in on focus */
+    line-height: 1.5;
+    min-height: 44px;
+    max-height: 40vh;
+  }
+  #btn-send { min-width: 44px; min-height: 44px; }
+  #btn-stop  { min-width: 44px; min-height: 44px; }
+
+  #status { font-size: 12px; padding: 0 10px; }
+  .status-right .pill { display: none; }
+
+  .lane-actions { flex-wrap: wrap; }
+  .lane-actions button { flex: 1 1 auto; min-height: 40px; }
+  .models { gap: 5px; }
+  .models .pill { padding: 5px 10px; }
+}
+
+/* ---- <= 480px: phone ----------------------------------------------------- */
+@media (max-width: 480px) {
+  body { font-size: 15px; }
+
+  #tabs { height: 48px; padding: 0 6px; }
+  .tabs-left { gap: 6px; }
+  .tab { max-width: 9ch; font-size: 12px; padding: 3px 7px; }
+  .tab-btn { width: 34px; height: 32px; font-size: 17px; }
+
+  #transcript { padding: 10px 8px 2px; }
+
+  /* Code blocks scroll sideways rather than blowing out the column. */
+  pre { margin-left: -8px; margin-right: -8px; border-radius: 0; font-size: 12px; }
+
+  /* The composer sticks to the bottom of the viewport so the keyboard never
+     covers it — on mobile the soft keyboard takes ~40% of the screen. */
+  #input-row {
+    position: sticky;
+    bottom: 0;
+    background: var(--bg-app);
+    border-top: 1px solid var(--border);
+    padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px));
+    z-index: 20;
+  }
+  #input-row textarea { min-height: 48px; }
+  #btn-send, #btn-stop { min-width: 48px; min-height: 48px; }
+
+  #status { font-size: 11px; }
+  .status-left { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Approval and connect panels take the full screen. */
+  .modal-card, #approval, #connect {
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    border-radius: 0;
+    border-left: none;
+    border-right: none;
+  }
+  .lane-actions { flex-direction: column; }
+  .lane-actions button { width: 100%; }
+
+  #toast { left: 8px; right: 8px; bottom: 76px; transform: none; text-align: center; }
+}
+
+/* Landscape phones: the keyboard eats most of the height, so trim the
+   transcript padding and let the composer shrink. */
+@media (max-height: 480px) and (orientation: landscape) {
+  #tabs { height: 36px; }
+  #transcript { padding-top: 6px; }
+  #input-row textarea { min-height: 34px; max-height: 30vh; }
+}
+
+/* Respect a light OS theme the same way the app theme does. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) { color-scheme: light; }
+}
+
+/* Honour "reduce motion" — the transcript streams in, so it matters here. */
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
 }

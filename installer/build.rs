@@ -6,7 +6,7 @@ use std::path::Path;
 mod winres;
 
 fn main() {
-    println!("cargo:rerun-if-changed=../dist/AI-Coding-Agent.exe");
+    println!("cargo:rerun-if-changed=../dist/aircode.exe");
     println!("cargo:rerun-if-changed=../resources/setup.rc");
     println!("cargo:rerun-if-changed=../resources/icon.ico");
     println!("cargo:rerun-if-changed=../resources/app.manifest");
@@ -23,14 +23,14 @@ fn main() {
         };
         if let Ok(res_file) = env::var("PREBUILT_SETUP_RES") {
             println!(
-                "cargo:rustc-link-arg-bin=AI-Coding-Agent-Setup={}",
+                "cargo:rustc-link-arg-bin=aircode-setup={}",
                 res_file
             );
         } else {
             let version = winres::VersionInfo::from_crate_version(
                 &env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string()),
-                "AI-Coding-Agent-Setup",
-                "AI Coding Agent Setup Wizard — Pure-Rust Windows x64 Installer",
+                "aircode-setup",
+                "AirCode Setup Wizard — Pure-Rust Windows x64 Installer",
             );
             match winres::generate_from_paths(
                 machine,
@@ -43,7 +43,7 @@ fn main() {
                     let res_out = Path::new(&out_dir).join("setup.res");
                     if fs::write(&res_out, &bytes).is_ok() {
                         println!(
-                            "cargo:rustc-link-arg-bin=AI-Coding-Agent-Setup={}",
+                            "cargo:rustc-link-arg-bin=aircode-setup={}",
                             res_out.display()
                         );
                         println!("cargo:warning=embedded win32 resources (icon+version+manifest)");

@@ -1,6 +1,6 @@
 //! The terminal front-end.
 //!
-//! `AI-Coding-Agent --tui` runs the same `StudioApp` the desktop GUI runs, but
+//! `aircode --tui` runs the same `StudioApp` the desktop GUI runs, but
 //! drives it through the shared [`crate::ui::snapshot::AppSnapshot`] instead of
 //! a canvas. Every feature the GUI has — the composer with slash autocomplete
 //! and history, `/connect`, the command palette, streaming turns, permission

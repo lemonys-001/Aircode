@@ -8,23 +8,23 @@ use ai_coding_agent::ui::studio::StudioApp;
 /// Command-line surface. Every flag here is wired to a real app action — the
 /// Linux .desktop entry's "New Session" / "Agentic Browser" actions depend on
 /// `--new-session` and `--browser` actually doing something.
-const USAGE: &str = "AirCode — Pure-Rust AI Coding Studio & Agentic Browser
+const USAGE: &str = "AirCode
 
 Usage:
-  AI-Coding-Agent [path]            open a workspace (file or folder) in the GUI
-  AI-Coding-Agent --tui             run in the terminal instead of a window
-  AI-Coding-Agent --web             run in the browser (starts a local server)
-  AI-Coding-Agent --new-session     start a fresh session instead of resuming
-  AI-Coding-Agent --browser         open the agentic browser
-  AI-Coding-Agent --connect         go straight to provider setup
-  AI-Coding-Agent --port N          port for --web (default 7777)
-  AI-Coding-Agent --host ADDR       bind address for --web (default 127.0.0.1)
-  AI-Coding-Agent --version         print the version and exit
-  AI-Coding-Agent --help            show this help
+  aircode [path]                open a workspace (file or folder) in the GUI
+  aircode --tui                 run in the terminal instead of a window
+  aircode --web                 run in the browser (starts a local server)
+  aircode --new-session         start a fresh session instead of resuming
+  aircode --browser             open the agentic browser
+  aircode --connect             go straight to provider setup
+  aircode --port N              port for --web (default 7777)
+  aircode --host ADDR           bind address for --web (default 127.0.0.1)
+  aircode --version             print the version and exit
+  aircode --help                show this help
 
 Front-ends (all drive the same engine):
   gui   the native desktop window (default)
-  tui   the terminal UI: AI-Coding-Agent --tui
+  tui   the terminal UI: aircode --tui
   web   a browser UI on http://127.0.0.1:7777
 
 With no arguments AirCode resumes the most recent project.
@@ -32,7 +32,7 @@ With no arguments AirCode resumes the most recent project.
 
 /// The executable name, kept in one place because `--version`, the Linux
 /// installer and the Windows resource all have to agree on it.
-const BIN_NAME: &str = "AI-Coding-Agent";
+const BIN_NAME: &str = "aircode";
 
 fn main() {
     let mut workspace: Option<PathBuf> = None;
@@ -142,7 +142,7 @@ fn main() {
     }
 
     run_native_window(
-        "AirCode — Pure-Rust AI Coding Studio & Agentic Browser",
+        "AirCode",
         1520,
         940,
         Box::new(app),

@@ -437,7 +437,7 @@ impl StudioApp {
             agent_prompt: String::new(),
             agent_running: false,
             compacting: false,
-            agent_status_line: "Ready — AirCode Pure-Rust Studio".to_string(),
+            agent_status_line: "Ready — AirCode".to_string(),
             agent_rx: None,
             compact_rx: None,
             permission_gate: Arc::new(PermissionGate::new()),
@@ -477,7 +477,7 @@ impl StudioApp {
             hidden_thinking_ids: Vec::new(),
             pending_approval: None,
             pending_delete: None,
-            toast_text: "AirCode v2.2 — Pure-Rust AI Coding Studio & Agentic Browser".to_string(),
+            toast_text: "AirCode".to_string(),
             toast_ticks: 110,
             focus: FocusTarget::AgentPrompt,
             blink_phase: true,
@@ -553,10 +553,16 @@ impl StudioApp {
         }
 
         if self.tabs.is_empty() {
+            // Auto-open a sensible first file so the editor is never a blank
+            // void. This must NOT steal keyboard focus: opening a project used
+            // to land on the editor, so the user's first keystrokes were typed
+            // into src/main.rs instead of the agent prompt.
+            let keep_focus = self.focus;
             for candidate in ["src/main.rs", "README.md", "Cargo.toml"] {
                 let p = self.workspace.join(candidate);
                 if p.is_file() {
                     let _ = self.open_file_in_tab(&p, candidate);
+                    self.focus = keep_focus;
                     break;
                 }
             }

@@ -1001,7 +1001,7 @@ const WELCOME_HTML: &str = r#"
 <head><title>AirCode Agentic Browser</title></head>
 <body>
   <h1>Agentic Browser for Builders</h1>
-  <p>Co-browse localhost dev servers, API endpoints, and docs alongside your AI Coding Agent. Every link, button, and input has a Playwright-style [eN] handle so the AI can navigate, click, and fill forms — and you can click "Take Over" anytime to interrupt and drive manually.</p>
+  <p>Co-browse localhost dev servers, API endpoints, and docs alongside AirCode. Every link, button, and input has a Playwright-style [eN] handle so the AI can navigate, click, and fill forms — and you can click "Take Over" anytime to interrupt and drive manually.</p>
   <form action="https://html.duckduckgo.com/html/">
     <input type="text" name="q" placeholder="Search docs or enter http://localhost:3000..." value="" />
     <button type="submit">Search / Go</button>

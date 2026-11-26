@@ -7,6 +7,6 @@ cd "$REPO_ROOT"
 echo "=== [1/2] Running Pure-Rust Unit & Headless Render Tests ==="
 cargo test
 
-echo "=== [2/2] Building Native Linux Binary (target/release/AI-Coding-Agent) ==="
+echo "=== [2/2] Building Native Linux Binary (target/release/aircode) ==="
 cargo build --release
-ls -lh target/release/AI-Coding-Agent
+ls -lh target/release/aircode

@@ -3,10 +3,10 @@
 # AirCode - Cross-Compile all Linux (DE) binaries from any Linux x64 host
 # =============================================================================
 # Produces (in dist/):
-#   AI-Coding-Agent-linux-amd64   (x86_64,  native glibc build)
-#   AI-Coding-Agent-linux-arm64   (aarch64, static musl)
-#   AI-Coding-Agent-linux-arm32   (armv7hf, static musl)
-#   AI-Coding-Agent-linux-x86     (i686,    static musl)
+#   aircode-linux-amd64   (x86_64,  native glibc build)
+#   aircode-linux-arm64   (aarch64, static musl)
+#   aircode-linux-arm32   (armv7hf, static musl)
+#   aircode-linux-x86     (i686,    static musl)
 #
 # Requirements: a Rust toolchain (rustup, distro rustc - anything recent), plus
 # `curl` and `python3`. Zig + the foreign `rust-std` components are fetched
@@ -161,7 +161,7 @@ mkdir -p dist
 
 log "Building native amd64 (x86_64-unknown-linux-gnu) ..."
 cargo build --release --offline
-install -m755 target/release/AI-Coding-Agent dist/AI-Coding-Agent-linux-amd64
+install -m755 target/release/aircode dist/aircode-linux-amd64
 
 for t in "${TARGETS[@]}"; do
   case "$t" in
@@ -169,7 +169,7 @@ for t in "${TARGETS[@]}"; do
     armv7-unknown-linux-musleabihf)      out="arm32" ;;
     i686-unknown-linux-musl)             out="x86" ;;
   esac
-  log "Building cross target ${t} -> dist/AI-Coding-Agent-linux-${out} ..."
+  log "Building cross target ${t} -> dist/aircode-linux-${out} ..."
   up="$(echo "$t" | tr 'a-z-' 'A-Z_')"
   # CC/AR must point at the cross shim too: build.rs compiles the vendored
   # SQLite amalgamation with $CC, and a host object cannot be linked into a
@@ -177,8 +177,8 @@ for t in "${TARGETS[@]}"; do
   env "CARGO_TARGET_${up}_LINKER=$BIN_DIR/cc" "CC=$BIN_DIR/cc" "AR=$BIN_DIR/ar" ZIG_TARGET="$t" \
       RUSTFLAGS="$MUSL_FLAGS" \
       cargo build --release --offline --target "$t"
-  install -m755 "target/$t/release/AI-Coding-Agent" "dist/AI-Coding-Agent-linux-${out}"
+  install -m755 "target/$t/release/aircode" "dist/aircode-linux-${out}"
 done
 
 log "Done. Linux artifacts:"
-ls -lh dist/AI-Coding-Agent-linux-*
+ls -lh dist/aircode-linux-*

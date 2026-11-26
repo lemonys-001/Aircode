@@ -1,6 +1,6 @@
 //! The browser front-end.
 //!
-//! `AI-Coding-Agent --web` starts a small HTTP server on loopback (or a LAN
+//! `aircode --web` starts a small HTTP server on loopback (or a LAN
 //! address with `--host`) and serves a single-page app plus a JSON API. The
 //! page is embedded in the binary — there is no build step, no bundler and no
 //! CDN, so the web front-end works on a machine with no internet access at all.
