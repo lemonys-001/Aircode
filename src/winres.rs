@@ -693,7 +693,7 @@ mod tests {
     #[test]
     fn test_generate_end_to_end() {
         let ico = sample_ico();
-        let v = VersionInfo::from_crate_version("2.2.0", "AI-Coding-Agent", "test");
+        let v = VersionInfo::from_crate_version("2.2.0", "aircode", "test");
         let res = generate(0x8664, &ico, Some(b"<assembly/>"), &v).expect("generate res");
         assert!(res.len() > 60);
         assert_eq!(&res[20..25], b".rsrc");

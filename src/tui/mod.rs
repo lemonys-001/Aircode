@@ -148,12 +148,7 @@ fn handle_key(
     // The connect screen owns the keyboard while it is open, as in the GUI.
     if snap.connect.open {
         if let Key::Named(KeyCode::Escape) = key {
-            // `ToggleShellView` flips Chat <-> Workspace; from Connect we want to
-            // land on Chat, so flip twice when we overshoot.
-            app.execute_action(crate::ui::UiAction::ToggleShellView);
-            if app.shell_view() != crate::ui::shell::ShellView::Chat {
-                app.execute_action(crate::ui::UiAction::ToggleShellView);
-            }
+            app.close_connect_wizard();
             return;
         }
     }
@@ -213,6 +208,20 @@ mod tests {
     use super::*;
     use crate::sqlite::SqliteStore;
     use crate::tui::screen::{render_diff, Screen};
+
+    #[test]
+    fn ctrl_chords_are_forwarded_to_the_app() {
+        // The app's key table matches uppercase letters (that is how the GUI
+        // receives them from the OS). A terminal reports ctrl chords lowercase,
+        // so `as_key_code` has to uppercase them or ctrl+L / ctrl+V / ctrl+H
+        // are dropped here and never reach the composer at all.
+        assert_eq!(Key::Ctrl('l').as_key_code(), Some(KeyCode::Letter('L')));
+        assert_eq!(Key::Ctrl('v').as_key_code(), Some(KeyCode::Letter('V')));
+        assert_eq!(Key::Ctrl('h').as_key_code(), Some(KeyCode::Letter('H')));
+        assert_eq!(Key::Ctrl('a').as_key_code(), Some(KeyCode::Letter('A')));
+        assert_eq!(Key::Char('a').as_key_code(), None);
+        assert_eq!(Key::Named(KeyCode::F3).as_key_code(), Some(KeyCode::F3));
+    }
 
     #[test]
     fn test_key_decoding_covers_the_composer() {
@@ -407,13 +416,54 @@ mod tests {
         );
         assert!(app.snapshot().connect.open);
 
-        // Escape must return to the conversation, not the IDE.
-        app.execute_action(crate::ui::UiAction::ToggleShellView);
-        if app.shell_view() != crate::ui::shell::ShellView::Chat {
-            app.execute_action(crate::ui::UiAction::ToggleShellView);
-        }
+        // Escape must return to the conversation, not the IDE...
+        app.close_connect_wizard();
         assert_eq!(app.shell_view(), crate::ui::shell::ShellView::Chat);
         assert!(!app.snapshot().connect.open);
+        // ...and hand the keyboard back. The old code drove this with
+        // `ToggleShellView`, which changed the view but left focus stranded on
+        // the connect key field: after closing /connect nothing you typed
+        // reached the composer ever again.
+        app.handle_char_input('h');
+        app.handle_char_input('i');
+        assert_eq!(app.prompt_text(), "hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Saving the wizard must not strand focus either.
+    #[test]
+    fn test_saving_the_connect_wizard_keeps_the_composer_usable() {
+        let dir = std::env::temp_dir().join(make_unique_id("tui_connect_save"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = std::sync::Arc::new(SqliteStore::open(&dir).unwrap());
+        let mut app = crate::ui::studio::StudioApp::new_headless_for_test(store, dir.clone());
+
+        app.show_connect();
+        app.execute_action(crate::ui::UiAction::SaveConnectWizard);
+        assert_eq!(app.shell_view(), crate::ui::shell::ShellView::Chat);
+        assert!(!app.snapshot().connect.open);
+
+        app.handle_char_input('o');
+        app.handle_char_input('k');
+        assert_eq!(app.prompt_text(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ctrl+L clears the composer, in the TUI and in the web UI alike.
+    #[test]
+    fn test_ctrl_l_clears_the_composer() {
+        let dir = std::env::temp_dir().join(make_unique_id("tui_ctrl_l"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = std::sync::Arc::new(SqliteStore::open(&dir).unwrap());
+        let mut app = crate::ui::studio::StudioApp::new_headless_for_test(store, dir.clone());
+        for c in ['h', 'e', 'l', 'l', 'o'] {
+            app.handle_char_input(c);
+        }
+        assert_eq!(app.prompt_text(), "hello");
+        // The TUI reports ctrl chords lowercase; the app matches uppercase.
+        let k = Key::Ctrl('l').as_key_code().expect("ctrl+l must map to a key");
+        app.handle_key_down(k, Key::Ctrl('l').modifiers());
+        assert_eq!(app.prompt_text(), "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

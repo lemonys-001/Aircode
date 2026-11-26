@@ -1495,7 +1495,7 @@ impl StudioApp {
         self.connect.model = first_free.clone();
         self.persist_settings();
         self.refresh_palette();
-        self.modal = ModalDialog::None;
+        self.close_connect_wizard();
         self.show_toast(format!(
             "OpenCode Zen free lane active — {} (no API key needed)",
             first_free
@@ -1559,7 +1559,7 @@ impl StudioApp {
             }
         }
         self.persist_settings();
-        self.modal = ModalDialog::None;
+        self.close_connect_wizard();
         self.show_toast(format!(
             "Connected to {} ({}) — auth mode {}",
             provider, self.settings.active_model, self.settings.opencode_auth_mode
@@ -1854,6 +1854,18 @@ impl StudioApp {
     pub fn show_connect(&mut self) {
         self.shell_view = ShellView::Connect;
         self.open_connect_wizard();
+    }
+
+    /// Closes the connect wizard and hands keyboard focus back to the composer.
+    ///
+    /// Escape in the GUI already did exactly this. The TUI and the web front end
+    /// reached for `ToggleShellView` instead, which changed the view but left
+    /// `focus` on `ConnectKeyInput` - so after closing /connect, nothing you
+    /// typed reached the composer (or anything else) ever again.
+    pub fn close_connect_wizard(&mut self) {
+        self.shell_view = ShellView::Chat;
+        self.modal = ModalDialog::None;
+        self.focus = FocusTarget::AgentPrompt;
     }
 
     pub fn execute_action(&mut self, action: UiAction) {
@@ -2796,6 +2808,10 @@ impl StudioApp {
             if self.modal != ModalDialog::None {
                 self.modal = ModalDialog::None;
                 self.show_mcp_add = false;
+                // Closing any modal returns focus to the composer, so the app
+                // can never end up with focus stranded on a field that is no
+                // longer on screen.
+                self.focus = FocusTarget::AgentPrompt;
                 return;
             }
             if self.show_find_bar {

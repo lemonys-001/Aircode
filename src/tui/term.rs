@@ -42,7 +42,11 @@ impl Key {
     pub fn as_key_code(&self) -> Option<KeyCode> {
         match self {
             Key::Named(k) => Some(*k),
-            Key::Ctrl('c') => Some(KeyCode::Escape),
+            // The app's key table matches uppercase letters (the GUI gets them
+            // from the OS that way), and a terminal reports ctrl chords in
+            // lowercase. Without this, ctrl+L / ctrl+V / ctrl+H were dropped
+            // here and never reached the composer at all.
+            Key::Ctrl(c) => Some(KeyCode::Letter(c.to_ascii_uppercase())),
             _ => None,
         }
     }

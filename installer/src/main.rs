@@ -432,7 +432,7 @@ mod win_setup {
         add_context_menu: bool,
     ) {
         unsafe {
-            let sub = wide(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\AICodingAgent");
+            let sub = wide(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\AirCode");
             let mut hk: HKEY = ptr::null_mut();
             let mut disp: DWORD = 0;
             if RegCreateKeyExW(
@@ -467,8 +467,8 @@ mod win_setup {
 
             if add_context_menu {
                 for base in [
-                    r"Software\Classes\Directory\shell\AICodingAgent",
-                    r"Software\Classes\Directory\Background\shell\AICodingAgent",
+                    r"Software\Classes\Directory\shell\AirCode",
+                    r"Software\Classes\Directory\Background\shell\AirCode",
                 ] {
                     let k_sub = wide(base);
                     let mut hk_ctx: HKEY = ptr::null_mut();
@@ -593,9 +593,9 @@ mod win_setup {
             }
 
             for key in [
-                r"Software\Microsoft\Windows\CurrentVersion\Uninstall\AICodingAgent",
-                r"Software\Classes\Directory\shell\AICodingAgent",
-                r"Software\Classes\Directory\Background\shell\AICodingAgent",
+                r"Software\Microsoft\Windows\CurrentVersion\Uninstall\AirCode",
+                r"Software\Classes\Directory\shell\AirCode",
+                r"Software\Classes\Directory\Background\shell\AirCode",
             ] {
                 RegDeleteTreeW(HKEY_CURRENT_USER, wide(key).as_ptr());
             }
@@ -776,7 +776,7 @@ mod win_setup {
                 SetBkMode(hdc, 1);
                 SelectObject(hdc, FONT_TITLE as HGDIOBJ);
                 SetTextColor(hdc, rgb_bgr(0xF8FAFC));
-                let t1 = wide("AirCode v2.2 — Setup Wizard");
+                let t1 = wide(&format!("AirCode v{} — Setup Wizard", env!("CARGO_PKG_VERSION")));
                 TextOutW(hdc, 28, 18, t1.as_ptr(), (t1.len() - 1) as i32);
 
                 SelectObject(hdc, FONT_UI as HGDIOBJ);
@@ -980,7 +980,7 @@ mod win_setup {
 
             let inst = GetModuleHandleW(ptr::null());
             let icon = LoadIconW(inst, 1usize as *const u16);
-            let cls = wide("AICodingAgentRustSetupWnd");
+            let cls = wide("AirCodeRustSetupWnd");
 
             let wc = WNDCLASSEXW {
                 cb_size: std::mem::size_of::<WNDCLASSEXW>() as UINT,

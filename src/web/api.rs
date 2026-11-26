@@ -366,10 +366,12 @@ fn key(app: &mut StudioApp, req: &Request) -> Response {
         "pageup" => KeyCode::PageUp,
         "pagedown" => KeyCode::PageDown,
         other => {
-            // A single letter, e.g. "p" for ctrl+p.
+            // A single letter, e.g. "p" for ctrl+p. Uppercased because the
+            // app's key table matches uppercase letters, the way the GUI
+            // receives them from the OS.
             let mut chars = other.chars();
             match (chars.next(), chars.next()) {
-                (Some(c), None) => KeyCode::Letter(c),
+                (Some(c), None) => KeyCode::Letter(c.to_ascii_uppercase()),
                 _ => return Response::bad_request(&format!("unknown key: {}", name)),
             }
         }
@@ -477,11 +479,9 @@ fn connect_save(app: &mut StudioApp, req: &Request) -> Response {
 }
 
 fn close_connect(app: &mut StudioApp) -> Response {
-    // `ToggleShellView` flips Chat <-> Workspace; from Connect we want Chat.
-    app.execute_action(crate::ui::UiAction::ToggleShellView);
-    if app.shell_view() != crate::ui::shell::ShellView::Chat {
-        app.execute_action(crate::ui::UiAction::ToggleShellView);
-    }
+    // Not `ToggleShellView`: that changes the view but leaves focus on the
+    // connect key field, which strands the keyboard.
+    app.close_connect_wizard();
     Response::json(&J::obj(vec![("ok", J::Bool(true))]))
 }
 

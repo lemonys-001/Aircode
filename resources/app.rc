@@ -17,12 +17,12 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName",      "Aircode Desktop\0"
-            VALUE "FileDescription",  "AI Coding Agent — 100% Pure-Rust Native Windows x64 Desktop Studio\0"
+            VALUE "FileDescription",  "AirCode — Pure-Rust Native Windows x64 Desktop Application\0"
             VALUE "FileVersion",      "2.2.0.0\0"
-            VALUE "InternalName",     "AI-Coding-Agent\0"
+            VALUE "InternalName",     "aircode\0"
             VALUE "LegalCopyright",   "Copyright (C) 2026 Aircode Contributors\0"
-            VALUE "OriginalFilename", "AI-Coding-Agent.exe\0"
-            VALUE "ProductName",      "AI Coding Agent (Pure Rust)\0"
+            VALUE "OriginalFilename", "aircode.exe\0"
+            VALUE "ProductName",      "AirCode\0"
             VALUE "ProductVersion",   "2.2.0\0"
         END
     END
