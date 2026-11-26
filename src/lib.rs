@@ -16,6 +16,8 @@ pub mod sqlite;
 pub mod subagents;
 pub mod syntax;
 pub mod themes;
+pub mod tui;
+pub mod web;
 pub mod ui;
 pub mod vt_screen;
 pub mod winres;

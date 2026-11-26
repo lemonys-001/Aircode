@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod shell;
+pub mod snapshot;
 pub mod studio;
 
 use std::path::PathBuf;
@@ -199,6 +200,26 @@ pub enum UiAction {
     ToggleToolBlocks,
     /// Cycle the active model (status-bar model box).
     CycleModel,
+}
+
+/// Maps a stable string id to the action it names.
+///
+/// Headless front-ends (the web UI in particular) have no enum to name, so they
+/// send these ids. Anything not listed here is a command-palette id, which the
+/// caller should route through [`UiAction::ExecuteCommandId`] instead — that
+/// keeps this table to the handful of actions a button needs to reach directly.
+pub fn action_from_id(id: &str) -> Option<UiAction> {
+    Some(match id {
+        "toggle-view" => UiAction::ToggleShellView,
+        "cycle-model" => UiAction::CycleModel,
+        "new-session" => UiAction::NewSession,
+        "connect" => UiAction::ShowConnect,
+        "stop" => UiAction::EmergencyStop,
+        "send" => UiAction::SendAgentPrompt,
+        "sidebar" => UiAction::ToggleSidebar,
+        "tool-blocks" => UiAction::ToggleToolBlocks,
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Debug)]

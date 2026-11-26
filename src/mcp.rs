@@ -293,7 +293,7 @@ fn mcp_stdio_rpc(
                     "clientInfo",
                     JsonValue::obj(vec![
                         ("name", "aircode-native-rust".into()),
-                        ("version", "2.2.0".into()),
+                        ("version", "2.2.1".into()),
                     ]),
                 ),
             ]),

@@ -20,11 +20,19 @@
 #                                   the vendored SQLite amalgamation
 #
 # Usage:
-#   ./scripts/install-linux.sh                    # install
+#   ./scripts/install-linux.sh                    # install, or update if older
 #   ./scripts/install-linux.sh --uninstall        # remove AirCode
 #   ./scripts/install-linux.sh --prefix /opt      # custom install prefix
 #   ./scripts/install-linux.sh --build-from-source
 #   ./scripts/install-linux.sh --arch arm64       # force architecture
+#   ./scripts/install-linux.sh --version 2.2.1    # install a specific version
+#   ./scripts/install-linux.sh --yes              # never prompt (answer yes)
+#   ./scripts/install-linux.sh --force            # reinstall / replace newer
+#
+# Re-running the installer checks the version of the binary already on disk:
+# older -> it asks whether to update, then updates; same -> it says so and
+# stops (--force to reinstall); newer -> it refuses to downgrade unless
+# --version or --force says that is really what you want.
 # =============================================================================
 set -euo pipefail
 
@@ -32,13 +40,16 @@ APP_NAME="AirCode"
 APP_ID="aircode"
 BIN_NAME="AI-Coding-Agent"
 REPO_SLUG="${AIRCODE_REPO:-lemonys-001/Aircode}"
-VERSION="2.2.0"
+VERSION="2.2.1"
 PREFIX="${PREFIX:-/usr/local}"
 BINDIR="${PREFIX}/bin"
 DATADIR="${PREFIX}/share/${APP_ID}"
 DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 FROM_SOURCE=0
 UNINSTALL=0
+ASSUME_YES=0
+FORCE=0
+VERSION_EXPLICIT=0
 ARCH=""
 SRC_DIR=""
 
@@ -50,10 +61,12 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --uninstall)        UNINSTALL=1 ;;
     --build-from-source) FROM_SOURCE=1 ;;
+    -y|--yes)            ASSUME_YES=1 ;;
+    --force|--reinstall) FORCE=1 ;;
     --prefix)           shift; PREFIX="${1:?--prefix needs a value}"; BINDIR="${PREFIX}/bin"; DATADIR="${PREFIX}/share/${APP_ID}" ;;
     --prefix=*)         PREFIX="${1#*=}"; BINDIR="${PREFIX}/bin"; DATADIR="${PREFIX}/share/${APP_ID}" ;;
     --arch)             shift; ARCH="${1:?--arch needs a value}" ;;
-    --version)          shift; VERSION="${1:?--version needs a value}" ;;
+    --version)          shift; VERSION="${1:?--version needs a value}"; VERSION_EXPLICIT=1 ;;
       -h|--help)          awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *)                  die "Unknown option: $1 (try --help)" ;;
   esac
@@ -126,6 +139,117 @@ if [ "$UNINSTALL" -eq 1 ]; then
     update-desktop-database "${DESKTOP_DIR}" >/dev/null 2>&1 || true
   log "Uninstalled. User data in ~/.local/share/aircode was left untouched."
   exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Version check: is an AirCode already here, and is it older than this one?
+#
+# The installed binary reports its own version, so the comparison is against
+# what is actually on disk rather than against a file we hope is current. A
+# binary from before --version existed prints nothing and exits non-zero, so
+# that case is reported as "no version" and falls through to a plain install.
+# ---------------------------------------------------------------------------
+INSTALLED_BIN="${BINDIR}/${BIN_NAME}"
+INSTALLED_VERSION=""
+WAS_UPDATE=0
+
+# version_cmp <a> <b> - prints -1, 0 or 1 for a<b, a==b, a>b.
+# Written by hand because `sort -V` is not portable to busybox.
+version_cmp() {
+  local a="$1" b="$2" i x y n
+  local -a A=() B=()
+  IFS=. read -r -a A <<<"$a"
+  IFS=. read -r -a B <<<"$b"
+  n=${#A[@]}
+  [ "${#B[@]}" -gt "$n" ] && n=${#B[@]}
+  for ((i = 0; i < n; i++)); do
+    x="${A[i]:-0}"
+    y="${B[i]:-0}"
+    # Compare numerically; "" or a suffix like "rc1" counts as 0.
+    case "$x" in '' | *[!0-9]*) x=0 ;; esac
+    case "$y" in '' | *[!0-9]*) y=0 ;; esac
+    if [ "$x" -gt "$y" ]; then echo 1; return 0; fi
+    if [ "$x" -lt "$y" ]; then echo -1; return 0; fi
+  done
+  echo 0
+}
+
+# installed_version_of <binary> - prints the version the binary reports.
+installed_version_of() {
+  local bin="$1" out=""
+  [ -x "$bin" ] || return 0
+  # An old binary rejects --version and exits 2 without opening a window, so
+  # running it is safe; failures are simply swallowed here.
+  out="$("$bin" --version 2>/dev/null || true)"
+  # Output looks like "AI-Coding-Agent 2.2.1" - take the first dotted number.
+  printf '%s\n' "$out" \
+    | awk 'match($0, /[0-9]+(\.[0-9]+)+/) { print substr($0, RSTART, RLENGTH); exit }'
+  return 0
+}
+
+# confirm <question> - answered yes by --yes, or by the user typing y.
+# Without a terminal to ask on (curl | bash, CI, a provisioner) running the
+# installer at all is the answer, so it proceeds rather than stalling.
+confirm() {
+  local reply=""
+  if [ "$ASSUME_YES" -eq 1 ]; then return 0; fi
+  if [ ! -t 0 ]; then return 0; fi
+  printf '%s [y/N] ' "$1"
+  read -r reply || return 1
+  case "$reply" in
+    y | Y | yes | YES | Yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ -e "$INSTALLED_BIN" ]; then
+  INSTALLED_VERSION="$(installed_version_of "$INSTALLED_BIN")"
+fi
+
+if [ -n "$INSTALLED_VERSION" ]; then
+  case "$(version_cmp "$INSTALLED_VERSION" "$VERSION")" in
+    -1)
+      log "AirCode ${INSTALLED_VERSION} is installed; ${VERSION} is available."
+      if confirm "Update AirCode ${INSTALLED_VERSION} -> ${VERSION} now?"; then
+        log "Updating AirCode ${INSTALLED_VERSION} -> ${VERSION} ..."
+        WAS_UPDATE=1
+      else
+        log "Update declined - AirCode ${INSTALLED_VERSION} left in place."
+        exit 0
+      fi
+      ;;
+    0)
+      log "AirCode ${VERSION} is already installed."
+      if [ "$FORCE" -eq 1 ]; then
+        log "--force given - reinstalling ${VERSION}."
+      else
+        log "Already up to date. Re-run with --force to reinstall, or --uninstall to remove."
+        exit 0
+      fi
+      ;;
+    1)
+      # What is on disk is newer than this script targets. Downgrading is
+      # almost never intended, so it takes an explicit request.
+      if [ "$VERSION_EXPLICIT" -eq 1 ]; then
+        warn "Requested ${VERSION} is older than the installed ${INSTALLED_VERSION}."
+        if confirm "Downgrade AirCode ${INSTALLED_VERSION} -> ${VERSION}?"; then
+          WAS_UPDATE=1
+        else
+          log "Downgrade declined - AirCode ${INSTALLED_VERSION} left in place."
+          exit 0
+        fi
+      elif [ "$FORCE" -eq 1 ]; then
+        warn "Replacing newer AirCode ${INSTALLED_VERSION} with ${VERSION} (--force)."
+        WAS_UPDATE=1
+      else
+        warn "AirCode ${INSTALLED_VERSION} is installed - newer than this installer's ${VERSION}."
+        log "Not downgrading. Pass --version ${VERSION} to force it, or --force to replace."
+        exit 0
+      fi
+      ;;
+  esac
+elif [ -e "$INSTALLED_BIN" ]; then
+  warn "${INSTALLED_BIN} exists but did not report a version - reinstalling over it."
 fi
 
 WORK="$(mktemp -d)"
@@ -355,14 +479,19 @@ command -v gtk-update-icon-cache >/dev/null 2>&1 && \
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-log "Installed ${APP_NAME} ${VERSION} for ${ARCH} (${RUST_TARGET})."
+if [ "$WAS_UPDATE" -eq 1 ]; then
+  log "Updated ${APP_NAME} ${INSTALLED_VERSION:-older} -> ${VERSION} for ${ARCH} (${RUST_TARGET})."
+else
+  log "Installed ${APP_NAME} ${VERSION} for ${ARCH} (${RUST_TARGET})."
+fi
 echo
 echo "  Binary : ${BINDIR}/${BIN_NAME}"
 echo "  Menu   : ${DESKTOP_DIR}/${APP_ID}.desktop (search 'AirCode' in your app grid)"
 echo "  Data   : ~/.local/share/${APP_ID} (SQLite sessions, settings, skills, MCP)"
 echo
 echo "  Run    : ${APP_ID}            # or: ${BIN_NAME} /path/to/project"
-echo "  Update : re-run this script"
+echo "  Check  : re-run this script - it reports the installed version and"
+echo "           offers to update when a newer one is available"
 echo "  Remove : $0 --uninstall"
 echo
 log "Tip: press Ctrl+K inside AirCode for the fuzzy command palette (/connect, /theme, /fork, /compact)."
