@@ -102,6 +102,40 @@ fn encode_state(snap: &AppSnapshot) -> JsonValue {
         ("statusLine", J::Str(snap.status_line.clone())),
         ("prompt", J::Str(snap.prompt_text.clone())),
         (
+            // Autocomplete, so the browser shows the same inline suggestion row
+            // the TUI and the GUI composer do.
+            "slashHits",
+            J::arr(
+                snap.slash_hits
+                    .iter()
+                    .map(|(c, d)| {
+                        J::obj(vec![
+                            ("cmd", J::Str(c.clone())),
+                            ("desc", J::Str(d.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("fileHits", J::arr(snap.file_hits.iter().map(|f| J::Str(f.clone())).collect())),
+        (
+            "paletteItems",
+            J::arr(
+                snap.palette_items
+                    .iter()
+                    .map(|i| {
+                        J::obj(vec![
+                            ("id", J::Str(i.id.clone())),
+                            ("slash", J::Str(i.slash.clone())),
+                            ("title", J::Str(i.title.clone())),
+                            ("subtitle", J::Str(i.subtitle.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("paletteQuery", J::Str(snap.palette_query.clone())),
+        (
             "history",
             J::arr(
                 snap.prompt_history
@@ -302,7 +336,11 @@ fn send(app: &mut StudioApp, req: &Request) -> Response {
     if prompt.trim().is_empty() {
         return Response::bad_request("prompt is empty");
     }
-    app.launch_agent_prompt(Some(prompt));
+    // Route through the same action the GUI's Send button and the TUI's Enter
+    // key fire. Calling `launch_agent_prompt` directly skipped the slash-command
+    // dispatch, so "/theme" was sent to the model as literal chat text.
+    app.prompt_text_set(&prompt);
+    app.execute_action(crate::ui::UiAction::SendAgentPrompt);
     Response::json(&J::obj(vec![("ok", J::Bool(true))]))
 }
 

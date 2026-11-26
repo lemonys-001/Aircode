@@ -95,6 +95,17 @@ const VK_F3: u32 = 0x72;
 const VK_F5: u32 = 0x74;
 
 const IDC_ARROW_ID: usize = 32512;
+// GetSystemMetrics indices for the two icon sizes.
+const SM_CXICON: i32 = 11;
+const SM_CYICON: i32 = 12;
+const SM_CXSMICON: i32 = 49;
+const SM_CYSMICON: i32 = 50;
+// LoadImageW flags / types.
+const IMAGE_ICON: u32 = 1;
+const LR_SHARED: u32 = 0x8000;
+
+/// The resource id the pure-Rust `.res` writer registers the app icon under.
+const APP_ICON_RES_ID: usize = 1;
 const IDC_IBEAM_ID: usize = 32513;
 const IDC_SIZEWE_ID: usize = 32644;
 const IDC_SIZENS_ID: usize = 32645;
@@ -299,7 +310,16 @@ struct URL_COMPONENTS {
 
 extern "system" {
     fn GetModuleHandleW(lpModuleName: *const u16) -> HINSTANCE;
+    fn GetSystemMetrics(nIndex: i32) -> i32;
     fn LoadIconW(hInstance: HINSTANCE, lpIconName: *const u16) -> HICON;
+    fn LoadImageW(
+        hInstance: HINSTANCE,
+        name: *const u16,
+        image_type: u32,
+        desired_width: i32,
+        desired_height: i32,
+        load_flags: u32,
+    ) -> HICON;
     fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: *const u16) -> HCURSOR;
     fn SetCursor(hCursor: HCURSOR) -> HCURSOR;
     fn RegisterClassExW(lpwcx: *const WNDCLASSEXW) -> WORD;
@@ -589,9 +609,9 @@ fn wide_null(s: &str) -> Vec<u16> {
 
 pub fn app_data_dir() -> PathBuf {
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        return PathBuf::from(local).join("AI-Coding-Agent");
+        return PathBuf::from(local).join("aircode");
     }
-    std::env::temp_dir().join("AI-Coding-Agent")
+    std::env::temp_dir().join("aircode")
 }
 
 pub fn list_drives() -> Vec<DriveInfo> {
@@ -762,7 +782,7 @@ pub fn http_request(
             };
         }
 
-        let agent = wide_null("AI-Coding-Agent-Rust/2.0");
+        let agent = wide_null("AirCode/2.2");
         let h_sess = WinHttpOpen(
             agent.as_ptr(),
             WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
@@ -1821,8 +1841,31 @@ pub fn run_native_window(title: &str, width: i32, height: i32, app: Box<dyn Desk
         CoInitializeEx(ptr::null_mut(), 0x2); // COINIT_APARTMENTTHREADED
 
         let h_inst = GetModuleHandleW(ptr::null());
-        let icon = LoadIconW(h_inst, 1usize as *const u16);
-        let class_name = wide_null("AICodingAgentPureRustStudioWnd");
+        // LoadIconW cannot read the PNG-compressed images that .ico files have
+        // carried since Vista, so it returns NULL for ours and the window falls
+        // back to the blank default Windows icon. LoadImageW handles them, so
+        // ask for each size explicitly and keep LoadIconW only as a fallback.
+        let res_id = APP_ICON_RES_ID as *const u16;
+        let want = |w: i32, h: i32| -> HICON {
+            unsafe { LoadImageW(h_inst, res_id, IMAGE_ICON, w, h, LR_SHARED) }
+        };
+        let (cx, cy) = unsafe { (GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON)) };
+        let (sx, sy) = unsafe {
+            (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON))
+        };
+        let icon = if cx > 0 && cy > 0 {
+            let big = want(cx, cy);
+            if big.is_null() { LoadIconW(h_inst, res_id) } else { big }
+        } else {
+            LoadIconW(h_inst, res_id)
+        };
+        let icon_sm = if sx > 0 && sy > 0 {
+            let small = want(sx, sy);
+            if small.is_null() { icon } else { small }
+        } else {
+            icon
+        };
+        let class_name = wide_null("AirCodeWnd");
 
         let mut state = Box::new(WindowState {
             app,
@@ -1843,7 +1886,7 @@ pub fn run_native_window(title: &str, width: i32, height: i32, app: Box<dyn Desk
             hbrBackground: ptr::null_mut(),
             lpszMenuName: ptr::null(),
             lpszClassName: class_name.as_ptr(),
-            hIconSm: icon,
+            hIconSm: icon_sm,
         };
         RegisterClassExW(&wc);
 

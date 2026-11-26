@@ -29,6 +29,62 @@ use std::time::Instant;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
+/// Turns a provider's HTTP failure into something the user can act on.
+///
+/// A bare `Provider 'opencode' HTTP 429: {json}` is the error people actually
+/// reported: it names a service and a status code and stops there. The app
+/// already knows which lane it used, so it can say what to do next.
+fn explain_provider_error(
+    provider: &str,
+    status: u16,
+    body: &str,
+    zen_free_lane: bool,
+) -> String {
+    let snippet = body.chars().take(300).collect::<String>();
+    let trimmed = snippet.trim();
+
+    // The free Zen lane is quota-limited, not misconfigured - the single most
+    // common failure, and the one where the raw body is least useful.
+    let is_quota = trimmed.contains("FreeUsageLimitError")
+        || trimmed.contains("Free usage limit")
+        || trimmed.contains("free usage limit");
+    if is_quota || (status == 429 && zen_free_lane) {
+        return format!(
+            "The free OpenCode Zen lane is out of quota for now (HTTP 429).\n\n\
+             You have three ways forward, all from /connect:\n  \
+             * paste your own key for Anthropic, OpenAI, OpenRouter or Gemini\n  \
+             * point at a local model - Ollama or LM Studio, no key at all\n  \
+             * subscribe to OpenCode Go at https://opencode.ai/go to keep using Zen\n\n\
+             The free lane resets, so retrying later also works."
+        );
+    }
+
+    match status {
+        401 | 403 => format!(
+            "{} rejected the API key (HTTP {}). Open /connect, paste the key again, \
+             and make sure it has access to the model you picked.\n{}",
+            provider, status, trimmed
+        ),
+        404 => format!(
+            "{} has no such model or endpoint (HTTP {}). Try /model to cycle to one \
+             this provider does offer.\n{}",
+            provider, status, trimmed
+        ),
+        429 => format!(
+            "{} is rate-limiting this key (HTTP {}). Wait a minute and retry, or \
+             switch providers with /connect.\n{}",
+            provider, status, trimmed
+        ),
+        400 | 422 => format!(
+            "{} refused the request (HTTP {}). This is usually a model that does not \
+             support tools or the current context length - try /model.\n{}",
+            provider, status, trimmed
+        ),
+        _ => format!("Provider '{}' HTTP {}: {}", provider, status, trimmed),
+    }
+}
+
+
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -1767,16 +1823,17 @@ fn call_model_provider(
         .map(|(k, v)| (*k, v.as_str()))
         .collect();
 
+
     let resp = http_request("POST", &endpoint, &hdrs, &payload.to_json_string(), 180_000);
     if let Some(e) = resp.error {
         return Err(e);
     }
     if resp.status < 200 || resp.status >= 300 {
-        return Err(format!(
-            "Provider '{}' HTTP {}: {}",
+        return Err(explain_provider_error(
             provider,
             resp.status,
-            resp.body.chars().take(400).collect::<String>()
+            &resp.body,
+            zen_free_lane,
         ));
     }
 
@@ -2010,7 +2067,7 @@ pub fn spawn_autonomous_agent_run(
         };
 
         let sys_prompt = format!(
-            "You are AirCode, a 100% Pure-Rust Native Desktop AI Coding Studio.\n\
+            "You are AirCode, a 100% Pure-Rust native desktop AI coding agent.\n\
              Workspace: {}\n{}\n{}\n\
              Available Sub-Agents (`run_subagent` or `create_subagent`): {}\n{}\
              When reasoning before your answer or tool calls, wrap your internal reasoning in <think>...</think> so AirCode can display or hide your thinking cleanly.\n\
@@ -2180,4 +2237,46 @@ pub fn spawn_autonomous_agent_run(
 
         let _ = tx.send(AgentUiEvent::Done(store.load_session(&session_id)));
     });
+}
+
+#[cfg(test)]
+mod provider_error_tests {
+    use super::explain_provider_error;
+
+    /// The exact failure a user reported: the free Zen lane running out of quota.
+    /// The message has to say what to do, not just name a service and a status.
+    #[test]
+    fn the_free_lane_quota_error_is_actionable() {
+        let body = r#"{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go"}}"#;
+        let m = explain_provider_error("opencode", 429, body, true);
+        assert!(m.contains("/connect"), "should point at /connect: {}", m);
+        assert!(m.contains("Ollama"), "should offer a local model: {}", m);
+        assert!(m.contains("OpenCode Go"), "should mention the paid lane: {}", m);
+        // The raw error envelope is noise once we have classified it.
+        assert!(!m.contains("\"type\":\"error\""), "should not dump the json: {}", m);
+    }
+
+    #[test]
+    fn a_rejected_key_is_reported_as_an_auth_problem() {
+        let m = explain_provider_error("anthropic", 401, "{\"error\":\"invalid api key\"}", false);
+        assert!(m.contains("rejected the API key"), "got: {}", m);
+    }
+
+    #[test]
+    fn a_missing_model_is_reported_as_a_model_problem() {
+        let m = explain_provider_error("openai", 404, "model not found", false);
+        assert!(m.contains("no such model"), "got: {}", m);
+    }
+
+    #[test]
+    fn an_unclassified_status_still_keeps_the_detail() {
+        let m = explain_provider_error("openrouter", 503, "upstream down", false);
+        assert!(m.contains("503") && m.contains("upstream down"), "got: {}", m);
+    }
+
+    #[test]
+    fn a_429_with_an_own_key_is_rate_limiting_not_quota() {
+        let m = explain_provider_error("openai", 429, "slow down", false);
+        assert!(m.contains("rate-limiting"), "got: {}", m);
+    }
 }

@@ -25,7 +25,7 @@
 #   ./scripts/install-linux.sh --prefix /opt      # custom install prefix
 #   ./scripts/install-linux.sh --build-from-source
 #   ./scripts/install-linux.sh --arch arm64       # force architecture
-#   ./scripts/install-linux.sh --version 2.2.1    # install a specific version
+#   ./scripts/install-linux.sh --version 2.2.2    # install a specific version
 #   ./scripts/install-linux.sh --yes              # never prompt (answer yes)
 #   ./scripts/install-linux.sh --force            # reinstall / replace newer
 #
@@ -38,9 +38,9 @@ set -euo pipefail
 
 APP_NAME="AirCode"
 APP_ID="aircode"
-BIN_NAME="AI-Coding-Agent"
+BIN_NAME="aircode"
 REPO_SLUG="${AIRCODE_REPO:-lemonys-001/Aircode}"
-VERSION="2.2.1"
+VERSION="2.2.2"
 PREFIX="${PREFIX:-/usr/local}"
 BINDIR="${PREFIX}/bin"
 DATADIR="${PREFIX}/share/${APP_ID}"
@@ -181,7 +181,7 @@ installed_version_of() {
   # An old binary rejects --version and exits 2 without opening a window, so
   # running it is safe; failures are simply swallowed here.
   out="$("$bin" --version 2>/dev/null || true)"
-  # Output looks like "AI-Coding-Agent 2.2.1" - take the first dotted number.
+  # Output looks like "aircode 2.2.2" - take the first dotted number.
   printf '%s\n' "$out" \
     | awk 'match($0, /[0-9]+(\.[0-9]+)+/) { print substr($0, RSTART, RLENGTH); exit }'
   return 0
@@ -437,13 +437,13 @@ cat > "${WORK}/${APP_ID}.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=${APP_NAME}
-GenericName=AI Coding Studio & Agentic Browser
+GenericName=AI coding agent & agentic browser
 Comment=100% Pure-Rust native AI coding agent, editor, terminal and agentic browser
 Exec=${BINDIR}/${BIN_NAME} %F
 TryExec=${BINDIR}/${BIN_NAME}
 Icon=${APP_ID}
 Terminal=false
-StartupWMClass=AI-Coding-Agent
+StartupWMClass=aircode
 Categories=Development;IDE;Utility;TextEditor;
 Keywords=ai;code;agent;rust;editor;terminal;browser;mcp;
 MimeType=text/plain;inode/directory;

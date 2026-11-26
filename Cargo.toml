@@ -1,12 +1,12 @@
 [package]
 name = "ai-coding-agent"
-version = "2.2.1"
+version = "2.2.2"
 edition = "2021"
-description = "Pure-Rust Native Desktop AI Coding Agent & Studio IDE (Zero Web / No WebView)"
+description = "AirCode — Pure-Rust native desktop AI coding agent (zero WebView)"
 authors = ["Aircode Contributors"]
 
 [[bin]]
-name = "AI-Coding-Agent"
+name = "aircode"
 path = "src/main.rs"
 
 [lib]

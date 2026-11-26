@@ -65,7 +65,7 @@ impl VersionInfo {
             internal_name: internal_name.to_string(),
             legal_copyright: "Copyright (C) 2026 Aircode Contributors".to_string(),
             original_filename: format!("{}.exe", internal_name),
-            product_name: "AI Coding Agent (Pure Rust)".to_string(),
+            product_name: "AirCode".to_string(),
             product_version_str: format!("{}.{}.{}", major, minor, patch),
         }
     }
@@ -588,8 +588,8 @@ mod tests {
     fn test_version_info_lengths_are_self_consistent() {
         let v = VersionInfo::from_crate_version(
             "2.2.0",
-            "AI-Coding-Agent",
-            "AI Coding Agent — Pure Rust",
+            "aircode",
+            "AirCode — Pure Rust",
         );
         let block = make_version_info(&v);
         // Root length prefix covers the entire block.
