@@ -19,6 +19,7 @@ Usage:
   AI-Coding-Agent --connect         go straight to provider setup
   AI-Coding-Agent --port N          port for --web (default 7777)
   AI-Coding-Agent --host ADDR       bind address for --web (default 127.0.0.1)
+  AI-Coding-Agent --version         print the version and exit
   AI-Coding-Agent --help            show this help
 
 Front-ends (all drive the same engine):
@@ -28,6 +29,10 @@ Front-ends (all drive the same engine):
 
 With no arguments AirCode resumes the most recent project.
 ";
+
+/// The executable name, kept in one place because `--version`, the Linux
+/// installer and the Windows resource all have to agree on it.
+const BIN_NAME: &str = "AI-Coding-Agent";
 
 fn main() {
     let mut workspace: Option<PathBuf> = None;
@@ -72,6 +77,13 @@ fn main() {
             }
             "--help" | "-h" => {
                 print!("{}", USAGE);
+                return;
+            }
+            // The Linux installer asks the installed binary for its version to
+            // decide whether an update is needed, so this must stay cheap and
+            // must not touch the terminal or open a window.
+            "--version" | "-V" => {
+                println!("{} {}", BIN_NAME, env!("CARGO_PKG_VERSION"));
                 return;
             }
             other => {

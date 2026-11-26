@@ -448,7 +448,9 @@ mod win_setup {
             ) == 0
             {
                 reg_set_sz(hk, Some("DisplayName"), "AI Coding Agent (Pure-Rust Studio)");
-                reg_set_sz(hk, Some("DisplayVersion"), "2.2.0");
+                // Derived, not written out: a hardcoded string here silently
+                // disagrees with the binary the moment the version is bumped.
+                reg_set_sz(hk, Some("DisplayVersion"), env!("CARGO_PKG_VERSION"));
                 reg_set_sz(hk, Some("Publisher"), "Aircode Desktop");
                 reg_set_sz(hk, Some("InstallLocation"), &install_dir.to_string_lossy());
                 reg_set_sz(hk, Some("DisplayIcon"), &exe_path.to_string_lossy());

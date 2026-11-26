@@ -284,10 +284,14 @@ mod tests {
         });
 
         if let Ok((job, reply)) = requests.recv_timeout(std::time::Duration::from_secs(5)) {
-            let mut app = StudioApp::new(None);
+            // The isolated headless app, not `StudioApp::new(None)`: the latter
+            // opens the real ~/.local/share/aircode database, which makes this
+            // test race against every other test running in parallel.
+            let (mut app, dir) = headless("sse");
             let resp =
                 api::route(&mut app, &job).unwrap_or_else(|| http::Response::not_found(&job.path));
             let _ = reply.send(resp);
+            let _ = std::fs::remove_dir_all(&dir);
         }
         let raw = handle.join().expect("client thread");
         assert!(raw.starts_with("HTTP/1.1 200 OK"), "bad status line: {}", raw);

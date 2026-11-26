@@ -489,7 +489,7 @@ mod tests {
             todos: &[],
             modified: &[("src/auth.rs".to_string(), 3, 1)],
             collapsed: &[],
-            version: "2.2.0",
+            version: "2.2.1",
         };
         let prompt = prompt::PromptModel {
             value: "",
@@ -522,7 +522,7 @@ mod tests {
             running: false,
             flash: None,
             workspace_path: "/home/user/project",
-            version: "2.2.0",
+            version: "2.2.1",
             command_palette: None,
             connect: None,
         };
@@ -607,7 +607,7 @@ mod tests {
             running: false,
             flash: None,
             workspace_path: "/home/user/project",
-            version: "2.2.0",
+            version: "2.2.1",
             command_palette: None,
             connect: Some(connect),
         };
