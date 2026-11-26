@@ -148,8 +148,11 @@ AIRCODE_PAYLOAD=./dist/AI-Coding-Agent-linux-arm64 ./scripts/install-linux.sh   
 What it does:
 
 1. Detects the architecture (`x86_64`→`amd64`, `aarch64`→`arm64`, `armv7l/armhf`→`arm32`, `i686/i386`→`x86`).
-2. Downloads `AI-Coding-Agent-linux-<arch>` from the matching GitHub release, **falling back to a
-   source build** (pure Rust, no system libraries) if no prebuilt asset exists.
+2. Resolves `AI-Coding-Agent-linux-<arch>` in order: **GitHub release asset** → **`dist/` inside the
+   repository's source archive** (dist/ is versioned, so the prebuilt binary is reachable even when no
+   release assets have been published, and with no Rust toolchain on the host) → **source build**
+   (pure Rust, no system libraries) as a last resort. Every downloaded binary is SHA-256 verified
+   against the `SHA256SUMS.txt` that ships beside it.
 3. Installs the binary into `<prefix>/bin`, symlinks `aircode`, and writes a
    `~/.local/share/applications/aircode.desktop` entry (+ icon) with *New Session* and
    *Agentic Browser* quick actions, so AirCode appears in your app grid.

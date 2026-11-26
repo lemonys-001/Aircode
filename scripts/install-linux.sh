@@ -8,10 +8,16 @@
 #   arm32 / armv7l   -> armv7-unknown-linux-gnueabihf
 #   x86   / i686     -> i686-unknown-linux-gnu
 #
-# The installer downloads the matching prebuilt release binary from GitHub
-# Releases when available; when no prebuilt binary matches the host it
-# transparently falls back to building AirCode from source with Cargo
-# (pure Rust; only libc + a C toolchain for the vendored SQLite amalgamation).
+# The installer resolves the matching prebuilt binary in this order:
+#   1. GitHub Releases asset      (normal path)
+#   2. dist/ inside a source archive from codeload.github.com
+#                                 - dist/ is committed to the repository, so the
+#                                   prebuilt binaries are reachable even before any
+#                                   release assets are published, and with no Rust
+#                                   toolchain on the host
+#   3. build from source with Cargo
+#                                 - last resort; needs Rust plus a C toolchain for
+#                                   the vendored SQLite amalgamation
 #
 # Usage:
 #   ./scripts/install-linux.sh                    # install
@@ -130,58 +136,145 @@ trap 'rm -rf "$WORK"' EXIT
 # ---------------------------------------------------------------------------
 PAYLOAD=""
 PAYLOAD_URL=""
-# Offline / local install: AIRCODE_PAYLOAD=/path/to/AI-Coding-Agent-linux-amd64
+SUMS_FILE="${WORK}/SHA256SUMS.txt"
+SUMS_READY=0
+
+# codeload serves repository archives. A local path, file://, ssh:// or git://
+# remote has no archive to fetch, so only plain owner/repo slugs qualify.
+CODELOAD_BASE=""
+if printf '%s' "$REPO_SLUG" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+  CODELOAD_BASE="https://codeload.github.com/${REPO_SLUG}"
+fi
+
+# fetch <url> <outfile> - tries curl, then wget.
+fetch() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 10 -o "$2" "$1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --timeout=60 -O "$2" "$1"
+  else
+    return 1
+  fi
+}
+
+# verify_sums <file> <asset-name> - compares against $SUMS_FILE when present.
+verify_sums() {
+  [ -s "$SUMS_FILE" ] || {
+    warn "No SHA256SUMS.txt available - installing unverified (set SKIP_CHECKSUM=1 to silence)."
+    return 0
+  }
+  local expected
+  expected="$(grep -F "  $2" "$SUMS_FILE" | head -n1 | awk '{print $1}')"
+  if [ -z "$expected" ]; then
+    warn "No checksum entry for $2 in SHA256SUMS.txt - installing unverified."
+    return 0
+  fi
+  local actual
+  actual="$(sha256sum "$1" | awk '{print $1}')"
+  if [ "$expected" = "$actual" ]; then
+    log "SHA-256 verified: $2"
+  else
+    die "SHA-256 mismatch for $2 (expected ${expected}, got ${actual}). Refusing to install."
+  fi
+}
+
+# 1. Explicit local payload (offline installs, mirrors, testing).
 if [ -n "${AIRCODE_PAYLOAD:-}" ]; then
   [ -f "${AIRCODE_PAYLOAD}" ] || die "AIRCODE_PAYLOAD is set but not a file: ${AIRCODE_PAYLOAD}"
   PAYLOAD="${AIRCODE_PAYLOAD}"
   log "Using local payload: ${PAYLOAD}"
-elif [ "$FROM_SOURCE" -eq 0 ]; then
+  # Honour a checksum file sitting next to the payload (a local dist/ tree).
+  for cand in "${PAYLOAD%/*}/SHA256SUMS.txt" "./SHA256SUMS.txt" "./dist/SHA256SUMS.txt"; do
+    if [ -f "$cand" ]; then cp -f "$cand" "$SUMS_FILE"; break; fi
+  done
+fi
+
+# 2. GitHub release asset.
+if [ -z "$PAYLOAD" ] && [ "$FROM_SOURCE" -eq 0 ] && [ -n "$RELEASES_BASE" ]; then
   for url in \
     "${RELEASES_BASE}/download/v${VERSION}/${ASSET_NAME}" \
     "${RELEASES_BASE}/latest/download/${ASSET_NAME}";
   do
     log "Trying release asset: ${url}"
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsSL --connect-timeout 10 -o "${WORK}/${ASSET_NAME}" "$url" && { PAYLOAD="${WORK}/${ASSET_NAME}"; PAYLOAD_URL="$url"; break; }
-    elif command -v wget >/dev/null 2>&1; then
-      wget -q --timeout=20 -O "${WORK}/${ASSET_NAME}" "$url" && { PAYLOAD="${WORK}/${ASSET_NAME}"; PAYLOAD_URL="$url"; break; }
-    else
-      warn "Neither curl nor wget is available - building from source instead."
+    if fetch "$url" "${WORK}/${ASSET_NAME}"; then
+      PAYLOAD="${WORK}/${ASSET_NAME}"
+      PAYLOAD_URL="$url"
+      if [ "${SKIP_CHECKSUM:-0}" != "1" ]; then
+        # The release ships SHA256SUMS.txt beside the binary.
+        fetch "${PAYLOAD_URL%/*}/SHA256SUMS.txt" "$SUMS_FILE" || true
+      fi
       break
     fi
   done
 fi
 
-# --- Verify the downloaded release asset against dist/SHA256SUMS.txt -----------
-if [ -n "$PAYLOAD_URL" ] && [ -s "$PAYLOAD" ] && [ "${SKIP_CHECKSUM:-0}" != "1" ]; then
-  SUMS_URL="${PAYLOAD_URL%/*}/SHA256SUMS.txt"
-  SUMS_FILE="${WORK}/SHA256SUMS.txt"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 10 -o "$SUMS_FILE" "$SUMS_URL" 2>/dev/null || true
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q --timeout=20 -O "$SUMS_FILE" "$SUMS_URL" 2>/dev/null || true
-  fi
-  if [ -s "$SUMS_FILE" ]; then
-    EXPECTED="$(grep -F "  ${ASSET_NAME}" "$SUMS_FILE" | head -n1 | awk '{print $1}')"
-    if [ -n "$EXPECTED" ]; then
-      ACTUAL="$(sha256sum "$PAYLOAD" | awk '{print $1}')"
-      if [ "$EXPECTED" = "$ACTUAL" ]; then
-        log "SHA-256 verified: ${ASSET_NAME}"
-      else
-        die "SHA-256 mismatch for ${ASSET_NAME} (expected ${EXPECTED}, got ${ACTUAL}). Refusing to install."
-      fi
-    else
-      warn "No checksum entry for ${ASSET_NAME} in SHA256SUMS.txt - continuing unverified."
-    fi
+# 3. Prebuilt binary out of dist/, from a committed source archive. dist/ is
+#    versioned, so this works with no published release and no Rust toolchain.
+if [ -z "$PAYLOAD" ] && [ "$FROM_SOURCE" -eq 0 ] && [ -n "$CODELOAD_BASE" ]; then
+  if ! command -v tar >/dev/null 2>&1; then
+    warn "tar is unavailable - cannot read dist/ out of a source archive."
   else
-    warn "Could not download SHA256SUMS.txt - continuing unverified (set SKIP_CHECKSUM=1 to silence)."
+    for ref in "refs/tags/v${VERSION}" "refs/heads/main"; do
+      url="${CODELOAD_BASE}/tar.gz/${ref}"
+      log "Trying source archive: ${url}"
+      fetch "$url" "${WORK}/aircode.tar.gz" || continue
+      [ -s "${WORK}/aircode.tar.gz" ] || continue
+      # Archives are wrapped in one top-level directory, "<repo>-<ref>", so the
+      # member we want is "<root>/dist/<asset>". Resolve the name instead of
+      # guessing it, and match members exactly - no wildcards, so this works on
+      # both GNU tar and busybox tar.
+      first="$( { tar -tzf "${WORK}/aircode.tar.gz" 2>/dev/null || true; } | head -n1 )"
+      root="${first%%/*}"
+      [ -n "$root" ] || { warn "Archive ${ref} is unreadable."; continue; }
+      log "Extracting dist/${ASSET_NAME} from ${ref} ..."
+      if tar -xzf "${WORK}/aircode.tar.gz" -C "$WORK" --strip-components=1 \
+           "${root}/dist/${ASSET_NAME}" 2>/dev/null \
+         && [ -s "${WORK}/dist/${ASSET_NAME}" ]; then
+        PAYLOAD="${WORK}/dist/${ASSET_NAME}"
+        # dist/SHA256SUMS.txt ships alongside the binary; optional. It lands
+        # in $WORK/dist/, so point the verifier at it there.
+        if tar -xzf "${WORK}/aircode.tar.gz" -C "$WORK" --strip-components=1 \
+             "${root}/dist/SHA256SUMS.txt" 2>/dev/null \
+           && [ -s "${WORK}/dist/SHA256SUMS.txt" ]; then
+          SUMS_FILE="${WORK}/dist/SHA256SUMS.txt"
+        fi
+        log "Using prebuilt binary from dist/ (${ref})"
+        break
+      fi
+      warn "Archive ${ref} carries no dist/${ASSET_NAME}."
+    done
   fi
 fi
 
+# 4. Verify whatever we resolved.
+if [ -n "$PAYLOAD" ] && [ -s "$PAYLOAD" ] && [ "${SKIP_CHECKSUM:-0}" != "1" ]; then
+  verify_sums "$PAYLOAD" "$ASSET_NAME"
+fi
+
+# 5. Last resort: build from source.
 if [ -z "$PAYLOAD" ] || [ ! -s "$PAYLOAD" ]; then
-  [ -n "$RELEASES_BASE" ] || true
-  log "No prebuilt ${ARCH} release asset - building AirCode ${VERSION} from source."
-  command -v cargo >/dev/null 2>&1 || die "cargo not found. Install Rust from https://rustup.rs and re-run."
+  log "No prebuilt ${ARCH} binary reachable - building AirCode ${VERSION} from source."
+  if ! command -v cargo >/dev/null 2>&1; then
+    cat >&2 <<MSG
+
+[error] No prebuilt AirCode ${VERSION} binary is reachable for ${ARCH}, and
+        cargo is not installed, so AirCode cannot be built here either.
+
+Pick one of these instead:
+
+  * Install Rust, then re-run this script:
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+  * Install a binary you already have (from another machine, or a mirror):
+      AIRCODE_PAYLOAD=/path/to/${ASSET_NAME} bash "$0"
+
+  * Build it somewhere that has Rust, then copy the binary across:
+      git clone --depth 1 --branch v${VERSION} ${REPO_URL}.git
+      cd Aircode && cargo build --release
+
+MSG
+    exit 1
+  fi
   SRC_DIR="${WORK}/src"
   if command -v git >/dev/null 2>&1; then
     git clone --depth 1 --branch "v${VERSION}" "${REPO_URL}.git" "$SRC_DIR" 2>/dev/null \
