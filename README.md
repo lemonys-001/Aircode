@@ -7,6 +7,11 @@
 > **Default look: _Low Cortisol_** — a quiet daylight theme with warm paper surfaces, hairline
 > borders and desaturated slate-teal accents, paired with roomier spacing. Switch any time with
 > `/theme` or `Ctrl+K`.
+>
+> **v2.2 rebuilds the whole interface on the OpenCode layout** — a session tab strip, a single
+> conversation column with collapsible `+ Thought` / `+ Tool` blocks and inline green/red diffs,
+> a right context sidebar (tokens, cost, MCP, LSP, todos, modified files) and a status bar. The
+> full IDE (explorer, editor, terminal, git, browser) is one click away behind `Workspace`.
 
 AirCode is a native AI coding agent, IDE and *agentic browser* in one window: every pixel is
 drawn by Rust (`CreateDIBSection` backbuffer on Windows, X11 `SoftwareSurface` on Linux), every
@@ -15,7 +20,24 @@ viewport** the AI itself drives — never the IDE chrome.
 
 ---
 
-## What's New in v2.1
+## What's New in v2.2 — a from-scratch OpenCode-style shell
+
+v2.2 replaces the previous "everything on screen at once" layout with the OpenCode design:
+one conversation, one context rail, one status bar, everything else one keystroke away.
+
+| Area | v2.2 capability |
+| --- | --- |
+| **Shell** | OpenCode-style front door: session tab strip + `+`, conversation column, right context sidebar, bottom status bar. The classic IDE lives behind the `Workspace` toggle in the tab strip — nothing was removed, it just stopped competing for attention. |
+| **Transcript** | Per-turn headers (`Model (12:04)`), `>` user prompts, rendered markdown, collapsible `+ Thought: 16s` / `+ Read src/greet.py` rows, **inline green/red diffs**, and a `Done.` + `Build · Model · Provider · effort` footer per turn. |
+| **Context sidebar** | Session identity, context meter (tokens / % / cost), **MCP servers** with status dots, LSP servers, todos parsed from the assistant's checklists, and modified files with `+adds -dels` — every section collapsible. |
+| **Status bar** | `[ctrl+? help] Tokens: 16.4K (8%) Cost: $0.12` on the left; workspace path and a filled model box (`big-pickle | medium`) on the right. Click the model box to cycle models. |
+| **Prompt composer (reworked)** | Live slash-command autocomplete with descriptions, `@file` autocomplete, Up/Down history recall over sent prompts, `shift+enter` for a newline, `ctrl+h` to toggle tool blocks, `ctrl+l` to clear, and a visible **Send** button. A leading `/` no longer hijacks the keyboard into the palette — that was why `/connect` could never be typed. |
+| **`/connect` rebuilt** | A full screen instead of a buried modal, with the **OpenCode Zen free lane** as the first, largest card (`Start free lane` — no key, no account, no card), a bring-your-own-key card, and an "import detected local auth" card. Reachable from `/connect`, the palette, `ctrl+shift+P`, `--connect`, or the status bar. |
+| **Windows icon** | `rc.exe`/`windres` are absent from cross toolchains, so the icon and version resource were silently dropped. `src/winres.rs` now **generates the COFF `.res` in pure Rust** (RT_ICON / RT_GROUP_ICON / VS_VERSION_INFO / RT_MANIFEST) and `build.rs` links it — every Windows binary ships the icon and `2.2.0.0` version info. |
+| **Cross builds fixed** | `build.rs` now declares `rerun-if-env-changed=CC/AR`, so switching to a cross compiler no longer reuses a host-built `sqlite3.o` (which broke every musl target with `sqlite3.o is incompatible with <arch>`). `scripts/cross-build-linux.sh` exports `CC`/`AR` too. |
+| **CLI** | `--new-session`, `--browser`, `--connect` — the Linux `.desktop` actions are real now. |
+
+### What's New in v2.1
 
 | Area | v2.1 capability |
 | --- | --- |
@@ -36,7 +58,40 @@ viewport** the AI itself drives — never the IDE chrome.
 
 ---
 
-## A Calmer, Lighter UI ("Low Cortisol")
+## The OpenCode Layout
+
+```
++--------------------------------------------------------------+----------+
+| [Fix the login bug] [Add tests] [+]                 Workspace|  (tabs)  |
++--------------------------------------------------------------+----------+
+|                                                              | CONTEXT  |
+|  big-pickle (12:04)                                          | 16.4K 8% |
+|  > fix the failing login test                                | $0.12    |
+|                                                              |          |
+|  I found the bug.                                            | MCP      |
+|  * wrong password hash                                       | * github |
+|  * missing session cookie                                    | * fs     |
+|                                                              |          |
+|  + Thought: 16s                                              | LSP      |
+|  + Edit src/auth.rs (42ms)                                   |          |
+|  - old line                                                  | TODOS    |
+|  + new line                                                  | [ ] test |
+|                                                              |          |
+|  Done.                                                       | MODIFIED |
+|  Build - big-pickle - opencode - medium                      | auth.rs  |
+|  ---------------------------------------------------------  | +3 -1    |
+|  enter to send | shift+enter newline | ctrl+h tools          |          |
+|  > _                                                  [Send] |          |
++--------------------------------------------------------------+----------+
+| [ctrl+? help] Tokens: 16.4K (8%) Cost: $0.12  opencode v2.2 [big-pickle|medium]|
++--------------------------------------------------------------+----------+
+```
+
+The right sidebar appears once the window is wider than 900px; `Workspace` in the tab strip
+swaps the conversation for the full IDE (explorer, editor, terminal drawer, git, browser) while
+keeping the same tab strip and status bar.
+
+### A Calmer, Lighter UI ("Low Cortisol")
 
 v2.1's second pass was subtraction, not addition:
 
@@ -113,7 +168,7 @@ crate dependencies** and **zero web browser engine**:
 
 | Module | Responsibility |
 | --- | --- |
-| `src/ui/studio.rs`, `src/ui/mod.rs`, `src/ui/commands.rs` | **Native Double-Buffered Studio GUI Workbench** — resizable 4-zone layout (Top Studio Bar, Left Dock with Explorer/Search/Git/Sessions/Extensions, Center multi-tab Editor + Diff + **Agentic Browser viewport**, Bottom multi-tab terminal, Right Agent timeline/composer), fuzzy **Command Panel**, Theme Picker, Connect Wizard, Safety, Sessions & Timeline modals. |
+| `src/ui/shell/` | **OpenCode-style shell** (`mod`, `chat`, `sidebar`, `statusbar`, `prompt`, `palette`, `connect`, `markdown`, `theme`) — session tab strip, conversation column with collapsible `+ Thought` / `+ Tool` blocks and inline diffs, right context sidebar, prompt composer with autocomplete + history, grouped command palette and the full-screen `/connect` screen. |
 | `src/platform/windows.rs` | **Pure-Rust Win32 Native Backend** — 32-bit `CreateDIBSection` backbuffer + ClearType `Segoe UI`/`Cascadia Mono` GDI typography, `DwmSetWindowAttribute` dark titlebar, genuine **ConPTY**, **WinHTTP** TLS 1.2/1.3, drive enumeration, `SHBrowseForFolderW`, `ReadDirectoryChangesW`, Unicode clipboard. |
 | `src/platform/linux.rs` | **Pure-Rust Linux Backend** — runtime-`dlopen`ed X11 native window, `SoftwareSurface` renderer, full `XLookupString` keyboard, POSIX shell session, `curl` transport, `zenity` folder picker. |
 | `src/themes.rs` | **8 Theme Palettes** (Low Cortisol default) + custom `.aircode/theme.json` loading, per-token syntax colors. |
@@ -125,6 +180,7 @@ crate dependencies** and **zero web browser engine**:
 | `src/subagents.rs` | **Sub-Agents** — built-ins plus AI-authored sub-agents (slug, effort, readonly, system prompt). |
 | `src/opencode_auth.rs` | **OpenCode-Style Auth** — provider guides, env/`auth.json` credential discovery, Zen gateway, local `opencode serve` bridge, and the full **Zen free-lane client emulation** (session-id generator, header quartet, free-model catalog). |
 | `src/vt_screen.rs` | **ANSI/VT100 Grid** — CSI, 16/256/24-bit color, 1,500-line scrollback. |
+| `src/winres.rs` | **Pure-Rust Windows `.res` generator** — builds the COFF resource object (RT_ICON / RT_GROUP_ICON / VS_VERSION_INFO / RT_MANIFEST) so the icon and version info survive toolchains with no `rc.exe`. |
 | `src/sqlite.rs` | **Embedded SQLite3** — safe Rust FFI over `vendor/sqlite3/sqlite3.c` (WAL) storing keys, settings, sessions, prompts/turns, tool audit logs, with `ALTER TABLE` migrations. |
 | `src/fs_ops.rs` & `src/git_ops.rs` | **Sandboxed Workspace & Silent Git** — canonical path boundary guard, project search, status/stage/branch/commit/diff. |
 | `installer/src/main.rs` | **Pure-Rust Native Win32 Installer** — embeds the app via `include_bytes!`, dark Win32 wizard, COM `.lnk` shortcuts, Explorer context menu, *Installed Apps* registration. |
@@ -133,15 +189,25 @@ crate dependencies** and **zero web browser engine**:
 
 ## Command Panel & Slash Commands
 
-Open with **`Ctrl+K`**, **`Ctrl+P`**, or by typing **`/`** in the composer. The palette fuzzy-matches
+Open with **`Ctrl+K`**, **`Ctrl+P`**, or **`Ctrl+?`** (help). The palette groups its entries the way
+OpenCode does — **Session**, **Provider**, **Agent**, **View**, **System** — and fuzzy-matches
 sessions, modes, effort levels, thinking visibility, compaction, forking, themes, provider
 connection, skills, MCP servers, sub-agents and the browser.
+
+The composer itself autocompletes: type `/co` for `/connect`, `@src/ma` for a workspace file,
+`Up`/`Down` to recall a prompt you already sent, `Tab` to accept the highlighted suggestion,
+`shift+enter` for a newline, `ctrl+h` to hide the tool blocks and `ctrl+l` to clear.
 
 | Command | Effect |
 | --- | --- |
 | `/zen` `/free` | **OpenCode Zen free lane** — no API key, authenticates like the official OpenCode client |
 | `/models` | Refresh the live anonymous Zen free-model catalog |
-| `/connect` `/setup` `/auth` `/keys` | Guided provider wizard (env auto-detect → clipboard paste → browser link) |
+| `/connect` `/setup` `/auth` `/keys` `/login` | Full-screen provider setup (Zen free lane → BYO key → import detected auth) |
+| `/workspace` | Swap the conversation for the full IDE |
+| `/sidebar` | Show / hide the right context sidebar |
+| `/tools` | Show / hide the `+ Thought` / `+ Tool` blocks |
+| `/model` `/models` | Cycle the active model |
+| `/browser` · `/editor` · `/terminal` | Jump to a specific workspace surface |
 | `/plan` · `/build` | Switch Plan (read-only) / Build (full execution) mode |
 | `/effort low\|medium\|max\|ultra` | Agent effort (thinking budget 1K / 4K / 16K / 32K) |
 | `/thinking` · `/thinking off` | Show / hide AI thinking blocks |
@@ -193,6 +259,14 @@ Every mutating tool is gated by the `PermissionGate` (approve once / approve ses
 ---
 
 ## Building from Source
+
+```bash
+AI-Coding-Agent [path]         # open a workspace (file or folder)
+AI-Coding-Agent --new-session  # fresh session instead of resuming
+AI-Coding-Agent --browser      # open the agentic browser
+AI-Coding-Agent --connect      # go straight to provider setup
+AI-Coding-Agent --help
+```
 
 ### Windows 10 / 11 (x64)
 

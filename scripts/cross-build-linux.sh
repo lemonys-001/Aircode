@@ -171,7 +171,10 @@ for t in "${TARGETS[@]}"; do
   esac
   log "Building cross target ${t} -> dist/AI-Coding-Agent-linux-${out} ..."
   up="$(echo "$t" | tr 'a-z-' 'A-Z_')"
-  env "CARGO_TARGET_${up}_LINKER=$BIN_DIR/cc" ZIG_TARGET="$t" \
+  # CC/AR must point at the cross shim too: build.rs compiles the vendored
+  # SQLite amalgamation with $CC, and a host object cannot be linked into a
+  # foreign target ("sqlite3.o is incompatible with <arch>").
+  env "CARGO_TARGET_${up}_LINKER=$BIN_DIR/cc" "CC=$BIN_DIR/cc" "AR=$BIN_DIR/ar" ZIG_TARGET="$t" \
       RUSTFLAGS="$MUSL_FLAGS" \
       cargo build --release --offline --target "$t"
   install -m755 "target/$t/release/AI-Coding-Agent" "dist/AI-Coding-Agent-linux-${out}"

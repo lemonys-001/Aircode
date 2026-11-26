@@ -18,6 +18,10 @@ pub mod syntax;
 pub mod themes;
 pub mod ui;
 pub mod vt_screen;
+pub mod winres;
+
+/// Crate version, surfaced in the Windows version resource and the status bar.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
 mod tests {
@@ -236,6 +240,172 @@ mod tests {
     }
 
     #[test]
+    fn test_shell_auth_is_startable_from_a_clean_state() {
+        let dir = std::env::temp_dir().join(make_unique_id("shell_auth_test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = std::sync::Arc::new(SqliteStore::open(&dir).unwrap());
+        let mut app = ui::studio::StudioApp::new_headless_for_test(store, dir.clone());
+
+        // A brand-new install has no credentials at all.
+        assert!(app.settings.opencode_api_key.is_empty());
+        assert!(app.settings.anthropic_api_key.is_empty());
+
+        // /connect must land on the dedicated provider screen, not a dead modal.
+        app.execute_slash_command("/connect");
+        assert_eq!(app.shell_view(), ui::shell::ShellView::Connect);
+        // The wizard pre-populates the free-model catalog so the first screen is
+        // never empty.
+        assert!(!app.connect.zen_free_models.is_empty());
+
+        // The one-click free lane is a single action away and needs no key.
+        app.execute_action(ui::UiAction::UseZenFreeLane);
+        assert_eq!(app.settings.active_provider, "opencode");
+        assert_eq!(app.settings.opencode_auth_mode, "zen");
+        assert!(app.settings.opencode_api_key.is_empty());
+        assert!(!app.settings.active_model.is_empty());
+
+        // Escape brings you back to the conversation.
+        app.handle_key_down(crate::platform::KeyCode::Escape, crate::platform::Modifiers::default());
+        assert_eq!(app.shell_view(), ui::shell::ShellView::Chat);
+
+        // The prompt composer accepts a full slash command now (no "/" hijack).
+        app.agent_prompt = "/zen models".to_string();
+        assert!(app.execute_slash_command("/zen models"));
+        assert!(!app.connect.zen_free_models.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_shell_prompt_composer_history_and_multiline() {
+        use crate::platform::{KeyCode, Modifiers};
+        let dir = std::env::temp_dir().join(make_unique_id("shell_prompt_test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = std::sync::Arc::new(SqliteStore::open(&dir).unwrap());
+        let mut app = ui::studio::StudioApp::new_headless_for_test(store, dir.clone());
+        app.focus = crate::ui::FocusTarget::AgentPrompt;
+
+        // Typing a slash command must not open the palette (that was the bug).
+        app.handle_char_input('/');
+        assert!(!app.palette_open());
+        app.handle_char_input('c');
+        app.handle_char_input('o');
+        assert_eq!(app.prompt_text(), "/co");
+
+        // Escape clears the composer.
+        app.handle_key_down(KeyCode::Escape, Modifiers::default());
+        assert_eq!(app.prompt_text(), "");
+
+        // Shift+Enter inserts a newline; plain Enter sends.
+        app.prompt_text_set("line one");
+        app.handle_key_down(KeyCode::Enter, Modifiers { shift: true, ..Default::default() });
+        assert!(app.prompt_text().contains('\n'));
+        app.prompt_text_set("");
+        app.handle_char_input('h');
+        app.handle_char_input('i');
+        app.handle_key_down(KeyCode::Enter, Modifiers::default());
+        assert_eq!(app.prompt_text(), "");
+        // The sent prompt is recalled with Up.
+        app.handle_key_down(KeyCode::Up, Modifiers::default());
+        assert_eq!(app.prompt_text(), "hi");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_shell_chat_blocks_toggle() {
+        let dir = std::env::temp_dir().join(make_unique_id("shell_block_test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = std::sync::Arc::new(SqliteStore::open(&dir).unwrap());
+        let mut app = ui::studio::StudioApp::new_headless_for_test(store, dir.clone());
+
+        app.execute_action(ui::UiAction::ToggleChatBlock("tool:m1:0".into()));
+        assert!(app.chat_block_expanded("tool:m1:0"));
+        app.execute_action(ui::UiAction::ToggleChatBlock("tool:m1:0".into()));
+        assert!(!app.chat_block_expanded("tool:m1:0"));
+
+        // Sidebar sections collapse and expand.
+        app.execute_action(ui::UiAction::ToggleSidebarSection("mcp".into()));
+        assert!(app.sidebar_section_collapsed("mcp"));
+        app.execute_action(ui::UiAction::ToggleSidebarSection("mcp".into()));
+        assert!(!app.sidebar_section_collapsed("mcp"));
+
+        // The view toggle is a real state change.
+        app.execute_action(ui::UiAction::ToggleShellView);
+        assert_eq!(app.shell_view(), ui::shell::ShellView::Workspace);
+        app.execute_action(ui::UiAction::ToggleShellView);
+        assert_eq!(app.shell_view(), ui::shell::ShellView::Chat);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_shell_renders_the_opencode_layout() {
+        let dir = std::env::temp_dir().join(make_unique_id("shell_render_test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = std::sync::Arc::new(SqliteStore::open(&dir).unwrap());
+        let mut app = ui::studio::StudioApp::new_headless_for_test(store, dir.clone());
+
+        // Seed a conversation so the transcript has real content.
+        app.seed_message_for_test("user", "summarise the workspace", "");
+        app.seed_message_for_test(
+            "assistant",
+            "Here is the plan.\n\n- read the entry point\n- list the modules",
+            "Let me look at the file tree first.",
+        );
+        app.chat_pin_to_bottom();
+        app.render(&mut TestSurface::new(1520, 940));
+        app.render(&mut TestSurface::new(1520, 940));
+
+        let mut surf = TestSurface::new(1520, 940);
+        app.render(&mut surf);
+        let text = surf.drawn.join("\n");
+
+        // Tab strip, transcript, sidebar, prompt hint and status bar all render.
+        assert!(text.contains("Workspace"), "view switch missing");
+        assert!(text.contains("enter to send"), "prompt hint missing");
+        assert!(text.contains("Tokens:"), "status bar missing");
+        assert!(text.contains("Context"), "sidebar section missing");
+        assert!(text.contains("MCP Servers"), "MCP section missing");
+        assert!(text.contains("Todos"), "todos section missing");
+        assert!(text.contains("Modified Files"), "modified-files section missing");
+        assert!(text.contains(">"), "prompt marker missing");
+
+        // Every hit zone the shell produced must be on-screen.
+        for z in app.hit_zones_snapshot() {
+            assert!(z.x >= 0 && z.y >= 0, "hit zone off-screen: {:?}", z);
+            assert!(z.x < 1520 && z.y < 940, "hit zone off-screen: {:?}", z);
+            assert!(z.w > 0 && z.h > 0, "degenerate hit zone: {:?}", z);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_shell_workspace_view_renders() {
+        let dir = std::env::temp_dir().join(make_unique_id("shell_ws_test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = std::sync::Arc::new(SqliteStore::open(&dir).unwrap());
+        let mut app = ui::studio::StudioApp::new_headless_for_test(store, dir.clone());
+        std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+        app.reload_workspace(false);
+
+        // Chat first, then flip to the IDE and make sure it still paints.
+        let mut chat = TestSurface::new(1440, 900);
+        app.render(&mut chat);
+        app.execute_action(ui::UiAction::ToggleShellView);
+        assert_eq!(app.shell_view(), ui::shell::ShellView::Workspace);
+        let mut ws = TestSurface::new(1440, 900);
+        app.render(&mut ws);
+        assert!(ws.text_calls > 40, "workspace view drew almost nothing");
+        // The shell chrome (tab strip + status bar) is shared by both views.
+        assert!(ws.drawn.iter().any(|t| t.contains("Workspace")));
+        assert!(ws.drawn.iter().any(|t| t.contains("Tokens:")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_opencode_zen_client_emulation() {
         use crate::opencode_auth::{
             is_zen_free_model, new_zen_session_id, zen_client_headers, zen_tool_name_in,
@@ -370,6 +540,7 @@ data: [DONE]
         height: i32,
         pixels: Vec<u32>,
         text_calls: usize,
+        drawn: Vec<String>,
     }
 
     impl TestSurface {
@@ -379,6 +550,7 @@ data: [DONE]
                 height: h,
                 pixels: vec![0; (w * h) as usize],
                 text_calls: 0,
+                drawn: Vec::new(),
             }
         }
     }
@@ -420,11 +592,13 @@ data: [DONE]
         }
         fn draw_text(&mut self, x: i32, y: i32, text: &str, font: FontRole, rgb: u32) {
             self.text_calls += 1;
-            let _ = (x, y, text, font, rgb);
+            self.drawn.push(text.to_string());
+            let _ = (x, y, font, rgb);
         }
         fn draw_text_clipped(&mut self, x: i32, y: i32, max_w: i32, text: &str, font: FontRole, rgb: u32) {
             self.text_calls += 1;
-            let _ = (x, y, max_w, text, font, rgb);
+            self.drawn.push(text.to_string());
+            let _ = (x, y, max_w, font, rgb);
         }
         fn measure_text_width(&mut self, text: &str, font: FontRole) -> i32 {
             let per = match font {

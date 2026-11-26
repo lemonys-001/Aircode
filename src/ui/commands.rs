@@ -37,6 +37,38 @@ pub fn builtin_palette_commands(show_thinking: bool, mode: &str, effort: &str, t
             is_file: false,
         },
         PaletteItem {
+            id: "cmd:shell_workspace".into(),
+            slash: "/workspace".into(),
+            title: "Switch to the Workspace IDE".into(),
+            subtitle: "Files, editor, terminal, git and the agentic browser".into(),
+            shortcut: "ctrl+1".into(),
+            is_file: false,
+        },
+        PaletteItem {
+            id: "cmd:shell_sidebar".into(),
+            slash: "/sidebar".into(),
+            title: "Toggle the Context Sidebar".into(),
+            subtitle: "Tokens, cost, MCP, LSP, todos and modified files".into(),
+            shortcut: "ctrl+b".into(),
+            is_file: false,
+        },
+        PaletteItem {
+            id: "cmd:shell_tools".into(),
+            slash: "/tools".into(),
+            title: "Toggle Tool Blocks in the Transcript".into(),
+            subtitle: "Show or hide the + Thought / + Tool disclosures".into(),
+            shortcut: "ctrl+h".into(),
+            is_file: false,
+        },
+        PaletteItem {
+            id: "cmd:cycle_model".into(),
+            slash: "(model box)".into(),
+            title: "Cycle the Active Model".into(),
+            subtitle: "Step through the models available for this provider".into(),
+            shortcut: "".into(),
+            is_file: false,
+        },
+        PaletteItem {
             id: "cmd:toggle_thinking".into(),
             slash: "/thinking".into(),
             title: if show_thinking {

@@ -48,6 +48,7 @@ use crate::subagents::{load_all_subagents, save_subagent, SubAgentSpec};
 use crate::syntax::tokenize_line;
 use crate::themes::ThemePalette;
 use crate::ui::commands::{builtin_palette_commands, filter_palette_items, PaletteItem};
+use crate::ui::shell::{self, ShellFlash, ShellView, SessionTab};
 use crate::ui::{
     CenterView, FocusTarget, HitZone, LeftTab, ModalDialog, UiAction, UiRect,
 };
@@ -56,7 +57,10 @@ use crate::vt_screen::VtScreen;
 // ---------------------------------------------------------------------------
 // Layout constants — generous spacing for a clean, modern, uncluttered feel
 // ---------------------------------------------------------------------------
-const HEADER_H: i32 = 52;
+/// Workspace-mode chrome must sit below the shell's tab strip and above its
+/// status bar, otherwise the two layers overlap.
+const SHELL_CHROME_TOP: i32 = crate::ui::shell::TABSTRIP_H + 1;
+const SHELL_CHROME_BOTTOM: i32 = crate::ui::shell::STATUSBAR_H;
 const RAIL_W: i32 = 60;
 const FOOTER_H: i32 = 26;
 const PAD: i32 = 14;
@@ -189,7 +193,7 @@ pub struct StudioApp {
     live_tools: Vec<ToolExecutionRecord>,
     streaming_thinking: String,
     streaming_text: String,
-    agent_prompt: String,
+    pub agent_prompt: String,
     agent_running: bool,
     compacting: bool,
     agent_status_line: String,
@@ -210,7 +214,7 @@ pub struct StudioApp {
     palette_open: bool,
     palette_query: String,
     palette_index: usize,
-    connect: ConnectWizardState,
+    pub connect: ConnectWizardState,
 
     // Skills / Sub-Agents / MCP hub
     skills: Vec<crate::skills::SkillEntry>,
@@ -224,12 +228,36 @@ pub struct StudioApp {
 
     // Safety / preferences modal
 
+    // ---- OpenCode-style shell state --------------------------------------
+    shell_view: ShellView,
+    chat_scroll: usize,
+    /// When true the transcript stays pinned to the newest row.
+    chat_pinned: bool,
+    /// Block ids whose `+ Thought` / `+ Tool` disclosure is expanded.
+    expanded_blocks: Vec<String>,
+    show_tool_blocks: bool,
+    sidebar_open: bool,
+    sidebar_collapsed: Vec<String>,
+    /// Prompts already sent this process, newest last.
+    prompt_history: Vec<String>,
+    /// Index into `prompt_history` while recalling with Up/Down.
+    history_idx: Option<usize>,
+    shell_flash: ShellFlash,
+    /// Scratch buffers so the shell models can borrow instead of clone.
+    shell_mcp_status_buf: Vec<(String, String)>,
+    shell_todos_buf: Vec<String>,
+    shell_modified_buf: Vec<(String, usize, usize)>,
+    shell_slash_buf: Vec<(&'static str, &'static str)>,
+    shell_file_buf: Vec<String>,
+    shell_palette_buf: Vec<PaletteItem>,
+    shell_zen_buf: Vec<String>,
+
     pending_approval: Option<PermissionPrompt>,
     pending_delete: Option<DeleteConfirmState>,
     toast_text: String,
     toast_ticks: u32,
 
-    focus: FocusTarget,
+    pub focus: FocusTarget,
     blink_phase: bool,
     tick_counter: u64,
     hit_zones: Vec<HitZone>,
@@ -238,6 +266,76 @@ pub struct StudioApp {
 impl StudioApp {
     pub fn new(initial_workspace: Option<PathBuf>) -> Self {
         Self::new_with_options(initial_workspace, true)
+    }
+
+    /// Test / introspection helpers for the shell state machine.
+    pub fn shell_view(&self) -> crate::ui::shell::ShellView {
+        self.shell_view
+    }
+    pub fn palette_open(&self) -> bool {
+        self.palette_open
+    }
+    pub fn prompt_text(&self) -> &str {
+        &self.agent_prompt
+    }
+    pub fn prompt_text_set(&mut self, v: &str) {
+        self.agent_prompt = v.to_string();
+    }
+    pub fn chat_block_expanded(&self, id: &str) -> bool {
+        self.expanded_blocks.iter().any(|b| b == id)
+    }
+    /// Test helper: pin the transcript to the newest row.
+    pub fn chat_pin_to_bottom(&mut self) {
+        self.chat_pinned = true;
+    }
+
+    /// Test helper: append a message to the active session and reload it.
+    pub fn seed_message_for_test(&mut self, role: &str, content: &str, thinking: &str) {
+        let msg = crate::sqlite::ChatMessage {
+            id: crate::sqlite::make_unique_id("msg"),
+            session_id: self.active_session.id.clone(),
+            role: role.to_string(),
+            content: content.to_string(),
+            thinking: thinking.to_string(),
+            mode: self.active_mode.clone(),
+            provider: self.settings.active_provider.clone(),
+            model: self.settings.active_model.clone(),
+            tools: Vec::new(),
+            created_at: crate::sqlite::now_timestamp_label(),
+        };
+        self.db.append_message(&msg);
+        if let Some(updated) = self.db.load_session(&self.active_session.id) {
+            self.active_session = updated;
+        }
+    }
+
+    /// Snapshot of the interactive regions from the last frame (used by tests).
+    pub fn hit_zones_snapshot(&self) -> Vec<crate::ui::UiRect> {
+        self.hit_zones.iter().map(|z| z.rect).collect()
+    }
+    pub fn sidebar_section_collapsed(&self, name: &str) -> bool {
+        self.sidebar_collapsed.iter().any(|c| c == name)
+    }
+
+    /// Public API used by the CLI (`--new-session`, `--browser`, ...) so the
+    /// desktop-entry actions are real features rather than dead shortcuts.
+    pub fn start_new_session(&mut self) {
+        self.execute_action(UiAction::NewSession);
+        self.shell_view = ShellView::Chat;
+        self.focus = FocusTarget::AgentPrompt;
+    }
+
+    /// Open the agentic browser as the primary surface.
+    pub fn open_browser_view(&mut self) {
+        self.shell_view = ShellView::Workspace;
+        self.center_view = CenterView::Browser;
+        self.left_panel_open = false;
+        self.terminal_open = false;
+    }
+
+    /// Open the provider setup screen (what `/connect` and the palette do).
+    pub fn open_connect_screen(&mut self) {
+        self.show_connect();
     }
 
     /// Headless constructor used by unit tests / CI smoke runs (no PTY spawning).
@@ -379,12 +477,29 @@ impl StudioApp {
             hidden_thinking_ids: Vec::new(),
             pending_approval: None,
             pending_delete: None,
-            toast_text: "AirCode v2.1 — Pure-Rust AI Coding Studio & Agentic Browser".to_string(),
+            toast_text: "AirCode v2.2 — Pure-Rust AI Coding Studio & Agentic Browser".to_string(),
             toast_ticks: 110,
             focus: FocusTarget::AgentPrompt,
             blink_phase: true,
             tick_counter: 0,
             hit_zones: Vec::with_capacity(320),
+            shell_view: ShellView::Chat,
+            chat_scroll: 0,
+            chat_pinned: true,
+            expanded_blocks: Vec::new(),
+            show_tool_blocks: true,
+            sidebar_open: true,
+            sidebar_collapsed: Vec::new(),
+            prompt_history: Vec::new(),
+            history_idx: None,
+            shell_flash: ShellFlash::default(),
+            shell_mcp_status_buf: Vec::new(),
+            shell_todos_buf: Vec::new(),
+            shell_modified_buf: Vec::new(),
+            shell_slash_buf: Vec::new(),
+            shell_file_buf: Vec::new(),
+            shell_palette_buf: Vec::new(),
+            shell_zen_buf: Vec::new(),
         };
 
         app.reload_customizations();
@@ -422,7 +537,7 @@ impl StudioApp {
         self.mcp_servers = load_mcp_configs(&self.workspace, &platform::app_data_dir());
     }
 
-    fn reload_workspace(&mut self, reset_watcher: bool) {
+    pub fn reload_workspace(&mut self, reset_watcher: bool) {
         self.drives = platform::list_drives();
         self.entries = scan_project_tree(&self.workspace, &self.collapsed_dirs, false, 950);
         self.git_snapshot = inspect_git_status(&self.workspace);
@@ -648,6 +763,16 @@ impl StudioApp {
         if prompt.is_empty() {
             return;
         }
+
+        // Remember what was sent so Up/Down can recall it in the composer.
+        if self.prompt_history.last().map(|p| p != &prompt).unwrap_or(true) {
+            self.prompt_history.push(prompt.clone());
+            if self.prompt_history.len() > 64 {
+                self.prompt_history.remove(0);
+            }
+        }
+        self.history_idx = None;
+        self.chat_pinned = true; // follow the new turn
 
         self.db.save_settings(&self.settings);
         self.live_tools.clear();
@@ -880,6 +1005,28 @@ impl StudioApp {
                 self.center_view = CenterView::Browser;
                 self.show_toast("Agentic Browser viewport opened.");
             }
+            "/workspace" => {
+                self.execute_action(UiAction::ToggleShellView);
+            }
+            "/sidebar" => {
+                self.execute_action(UiAction::ToggleSidebar);
+            }
+            "/tools" => {
+                self.execute_action(UiAction::ToggleToolBlocks);
+            }
+            "/model" => {
+                self.cycle_model();
+            }
+            "/models" => {
+                // Documented behaviour: refresh the anonymous Zen catalog.
+                self.fetch_zen_free_models();
+                if !self.connect.zen_free_models.is_empty() {
+                    self.show_toast(format!(
+                        "{} free Zen models live right now.",
+                        self.connect.zen_free_models.len()
+                    ));
+                }
+            }
             "/editor" => {
                 self.center_view = CenterView::Editor;
             }
@@ -905,15 +1052,15 @@ impl StudioApp {
             "/theme" | "/themes" => {
                 self.modal = ModalDialog::ThemePicker;
             }
-            "/connect" | "/setup" | "/auth" | "/keys" => {
-                self.open_connect_wizard();
+            "/connect" | "/setup" | "/auth" | "/keys" | "/login" | "/signin" => {
+                self.show_connect();
             }
             // One-click OpenCode Zen free lane (OpenCode-client auth emulation).
             "/zen" | "/free" => {
                 self.use_zen_free_lane();
             }
             // Refresh the anonymous Zen catalog.
-            "/zen models" | "/models" => {
+            "/zen models" => {
                 self.fetch_zen_free_models();
                 if !self.connect.zen_free_models.is_empty() {
                     self.show_toast(format!(
@@ -1066,7 +1213,19 @@ impl StudioApp {
         match id.as_str() {
             "cmd:zen_free" => self.use_zen_free_lane(),
             "cmd:zen_models" => self.fetch_zen_free_models(),
-            "cmd:connect" => self.open_connect_wizard(),
+            "cmd:connect" => self.show_connect(),
+            "cmd:shell_workspace" => {
+                self.execute_action(UiAction::ToggleShellView);
+            }
+            "cmd:shell_sidebar" => {
+                self.execute_action(UiAction::ToggleSidebar);
+            }
+            "cmd:shell_tools" => {
+                self.execute_action(UiAction::ToggleToolBlocks);
+            }
+            "cmd:cycle_model" => {
+                self.cycle_model();
+            }
             "cmd:toggle_thinking" => {
                 self.settings.show_thinking = !self.settings.show_thinking;
                 self.persist_settings();
@@ -1473,8 +1632,205 @@ impl StudioApp {
 // Action dispatcher
 // ---------------------------------------------------------------------------
 impl StudioApp {
-    fn execute_action(&mut self, action: UiAction) {
+    // -----------------------------------------------------------------------
+    // OpenCode-style shell actions
+    // -----------------------------------------------------------------------
+    fn shell_show_flash(&mut self, msg: impl Into<String>) {
+        self.shell_flash = ShellFlash::new(msg);
+    }
+
+    fn toggle_chat_block(&mut self, id: String) {
+        if let Some(pos) = self.expanded_blocks.iter().position(|b| *b == id) {
+            self.expanded_blocks.remove(pos);
+        } else {
+            self.expanded_blocks.push(id);
+        }
+    }
+
+    fn toggle_sidebar_section(&mut self, name: String) {
+        if let Some(pos) = self.sidebar_collapsed.iter().position(|c| *c == name) {
+            self.sidebar_collapsed.remove(pos);
+        } else {
+            self.sidebar_collapsed.push(name);
+        }
+    }
+
+    /// Walk the sent-prompt history. `dir` is -1 (older) or +1 (newer).
+    fn recall_prompt_history(&mut self, dir: i32) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        let len = self.prompt_history.len();
+        let next = match self.history_idx {
+            None => {
+                if dir < 0 {
+                    Some(len - 1)
+                } else {
+                    None
+                }
+            }
+            Some(i) => {
+                if dir < 0 {
+                    Some(i.saturating_sub(1))
+                } else if i + 1 < len {
+                    Some(i + 1)
+                } else {
+                    None
+                }
+            }
+        };
+        match next {
+            Some(i) => {
+                self.history_idx = Some(i);
+                self.agent_prompt = self.prompt_history[i].clone();
+            }
+            None => {
+                self.history_idx = None;
+                self.agent_prompt.clear();
+            }
+        }
+    }
+
+    fn cycle_model(&mut self) {
+        let models: Vec<String> = if self.settings.active_provider == "opencode" {
+            if self.connect.zen_free_models.is_empty() {
+                crate::opencode_auth::ZEN_FREE_MODELS
+                    .iter()
+                    .map(|(id, _)| (*id).to_string())
+                    .collect()
+            } else {
+                self.connect.zen_free_models.clone()
+            }
+        } else {
+            AppSettings::preset_models_for_provider(&self.settings.active_provider)
+                .iter()
+                .map(|m| (*m).to_string())
+                .collect()
+        };
+        if models.is_empty() {
+            self.shell_show_flash("No models for this provider yet.");
+            return;
+        }
+        let cur = models
+            .iter()
+            .position(|m| *m == self.settings.active_model)
+            .unwrap_or(0);
+        let next = models[(cur + 1) % models.len()].clone();
+        self.settings.active_model = next.clone();
+        self.persist_settings();
+        self.shell_show_flash(format!("Model -> {}", next));
+    }
+
+    /// Enter the provider-setup screen from anywhere.
+    pub fn show_connect(&mut self) {
+        self.shell_view = ShellView::Connect;
+        self.open_connect_wizard();
+    }
+
+    pub fn execute_action(&mut self, action: UiAction) {
+        // ---- OpenCode-style shell actions -----------------------------------
         match action {
+            UiAction::ToggleShellView => {
+                self.shell_view = if self.shell_view == ShellView::Workspace {
+                    ShellView::Chat
+                } else {
+                    ShellView::Workspace
+                };
+                self.shell_show_flash(if self.shell_view == ShellView::Workspace {
+                    "Workspace view — files, editor, terminal, git."
+                } else {
+                    "Chat view — the conversation is the app."
+                });
+                return;
+            }
+            UiAction::ShowConnect => {
+                self.show_connect();
+                return;
+            }
+            UiAction::SelectSessionTab(i) => {
+                let tabs = self.shell_tabs();
+                if let Some(t) = tabs.get(i) {
+                    if t.active {
+                        self.shell_view = ShellView::Chat;
+                    } else {
+                        let id = t.id.clone();
+                        self.execute_action(UiAction::SelectSession(id));
+                    }
+                }
+                return;
+            }
+            UiAction::ToggleChatBlock(id) => {
+                self.toggle_chat_block(id);
+                return;
+            }
+            UiAction::ToggleSidebarSection(name) => {
+                self.toggle_sidebar_section(name);
+                return;
+            }
+            UiAction::OpenWorkspaceFile(rel) => {
+                let abs = self.workspace.join(&rel);
+                if let Err(e) = self.open_file_in_tab(&abs, &rel) {
+                    self.shell_show_flash(e);
+                } else {
+                    self.shell_view = ShellView::Workspace;
+                }
+                return;
+            }
+            UiAction::PaletteSelect(i) => {
+                let items = self.shell_palette_items();
+                if let Some(item) = items.get(i).cloned() {
+                    self.apply_palette_item(&item);
+                }
+                return;
+            }
+            UiAction::FocusPrompt => {
+                self.focus = FocusTarget::AgentPrompt;
+                return;
+            }
+            UiAction::ScrollChat(delta) => {
+                let rows = shell::chat::build_rows(&self.shell_chat_model(), ((self.width / 8).max(20)) as usize).len();
+                let visible = ((self.height - shell::TABSTRIP_H - shell::STATUSBAR_H - 58) / 20).max(3) as usize;
+                let max = rows.saturating_sub(visible);
+                let next = (self.chat_scroll as isize + delta as isize).clamp(0, max as isize) as usize;
+                self.chat_scroll = next;
+                self.chat_pinned = next >= max;
+                return;
+            }
+            UiAction::ToggleSidebar => {
+                self.sidebar_open = !self.sidebar_open;
+                self.persist_settings();
+                return;
+            }
+            UiAction::ToggleToolBlocks => {
+                self.show_tool_blocks = !self.show_tool_blocks;
+                self.expanded_blocks.clear();
+                self.shell_show_flash(if self.show_tool_blocks {
+                    "Tool blocks shown — click + to expand."
+                } else {
+                    "Tool blocks hidden."
+                });
+                return;
+            }
+            UiAction::CycleModel => {
+                self.cycle_model();
+                return;
+            }
+            _ => {}
+        }
+        match action {
+            // Handled by the shell pass above; repeated so this match is exhaustive.
+            UiAction::ToggleShellView
+            | UiAction::ShowConnect
+            | UiAction::SelectSessionTab(_)
+            | UiAction::ToggleChatBlock(_)
+            | UiAction::ToggleSidebarSection(_)
+            | UiAction::OpenWorkspaceFile(_)
+            | UiAction::PaletteSelect(_)
+            | UiAction::FocusPrompt
+            | UiAction::ScrollChat(_)
+            | UiAction::ToggleSidebar
+            | UiAction::ToggleToolBlocks
+            | UiAction::CycleModel => {}
             UiAction::Focus(target) => self.focus = target,
             UiAction::PickFolder => {
                 if let Some(chosen) = platform::pick_folder_dialog(&self.workspace) {
@@ -1915,6 +2271,7 @@ impl StudioApp {
                 }
             }
             UiAction::OpenProviderKeyUrl(url, open_external) => {
+                let url = url.as_str();
                 if open_external {
                     open_in_external_browser(url);
                     self.show_toast(format!("Opened {} in your system browser.", url));
@@ -2109,7 +2466,7 @@ impl StudioApp {
         }
     }
 
-    fn handle_key_down(&mut self, key: KeyCode, mods: Modifiers) {
+    pub fn handle_key_down(&mut self, key: KeyCode, mods: Modifiers) {
         let modal_blocking = self.modal != ModalDialog::None
             || self.pending_approval.is_some()
             || self.pending_delete.is_some();
@@ -2290,6 +2647,12 @@ impl StudioApp {
         }
 
         if key == KeyCode::Escape {
+            if self.shell_view == ShellView::Connect {
+                self.shell_view = ShellView::Chat;
+                self.modal = ModalDialog::None;
+                self.focus = FocusTarget::AgentPrompt;
+                return;
+            }
             if self.pending_approval.is_some() {
                 self.execute_action(UiAction::ApprovePermission {
                     approved: false,
@@ -2456,28 +2819,77 @@ impl StudioApp {
             return;
         }
 
-        // ---- Agent prompt composer -------------------------------------------
+        // ---- Prompt composer (reworked) --------------------------------------
+        //
+        // The old composer hijacked a leading "/" into the command palette, so
+        // you could never type "/connect" — which is exactly why auth felt
+        // impossible to start. Slash commands now autocomplete inline, and the
+        // composer behaves like a real input: history recall, tab-completion,
+        // shift+enter newlines and an explicit clear.
         if self.focus == FocusTarget::AgentPrompt && !modal_blocking {
-            if mods.ctrl && key == KeyCode::Letter('V') {
-                if let Some(clip) = platform::clipboard_get_text() {
-                    self.agent_prompt.push_str(&clip);
+            if mods.ctrl {
+                match key {
+                    KeyCode::Letter('V') => {
+                        if let Some(clip) = platform::clipboard_get_text() {
+                            self.agent_prompt.push_str(&clip.replace('\r', ""));
+                        }
+                        return;
+                    }
+                    KeyCode::Letter('H') => {
+                        self.execute_action(UiAction::ToggleToolBlocks);
+                        return;
+                    }
+                    KeyCode::Letter('L') => {
+                        self.agent_prompt.clear();
+                        self.history_idx = None;
+                        return;
+                    }
+                    _ => {}
                 }
-                return;
             }
             match key {
                 KeyCode::Enter => {
                     if mods.shift {
                         self.agent_prompt.push('\n');
-                    } else {
+                    } else if !self.agent_prompt.trim().is_empty() {
                         self.execute_action(UiAction::SendAgentPrompt);
                     }
                 }
                 KeyCode::Backspace => {
                     self.agent_prompt.pop();
+                    self.history_idx = None;
+                }
+                KeyCode::Tab => {
+                    // Accept the highlighted autocomplete entry.
+                    if !self.shell_slash_buf.is_empty() {
+                        let (cmd, _) = self.shell_slash_buf[0];
+                        let mut base = cmd.to_string();
+                        if !base.ends_with(' ') {
+                            base.push(' ');
+                        }
+                        self.agent_prompt = base;
+                    } else if !self.shell_file_buf.is_empty() {
+                        let f = self.shell_file_buf[0].clone();
+                        let cut = self
+                            .agent_prompt
+                            .rfind('@')
+                            .map(|i| i + 1)
+                            .unwrap_or(self.agent_prompt.len());
+                        self.agent_prompt.truncate(cut);
+                        self.agent_prompt.push_str(&f);
+                        self.agent_prompt.push(' ');
+                    }
                 }
                 KeyCode::Up => {
-                    if let Some(last) = self.active_session.messages.iter().rev().find(|m| m.role == "user") {
-                        self.agent_prompt = last.content.clone();
+                    self.recall_prompt_history(-1);
+                }
+                KeyCode::Down => {
+                    self.recall_prompt_history(1);
+                }
+                KeyCode::Escape => {
+                    if !self.agent_prompt.is_empty() {
+                        self.agent_prompt.clear();
+                        self.history_idx = None;
                     }
                 }
                 _ => {}
@@ -2540,7 +2952,7 @@ impl StudioApp {
         }
     }
 
-    fn handle_char_input(&mut self, ch: char) {
+    pub fn handle_char_input(&mut self, ch: char) {
         if ch < ' ' {
             return;
         }
@@ -2572,14 +2984,10 @@ impl StudioApp {
         }
 
         if self.focus == FocusTarget::AgentPrompt && !modal_blocking {
-            // A leading "/" opens the fuzzy Command Panel in slash-command mode
-            if ch == '/' && self.agent_prompt.is_empty() {
-                self.open_command_palette();
-                self.palette_query = "/".to_string();
-                self.palette_index = 0;
-                return;
-            }
+            // Slash commands autocomplete inline (see shell::prompt); the leading
+            // "/" is just text now.
             self.agent_prompt.push(ch);
+            self.history_idx = None;
             return;
         }
 
@@ -2614,8 +3022,8 @@ impl StudioApp {
         {
             return CursorShape::Arrow;
         }
-        let top = HEADER_H;
-        let bottom = self.height - FOOTER_H;
+        let top = SHELL_CHROME_TOP;
+        let bottom = self.height - SHELL_CHROME_BOTTOM;
         if self.mouse_y >= top && self.mouse_y < bottom {
             let panel_x = if self.left_panel_open {
                 RAIL_W + self.left_w
@@ -2771,118 +3179,415 @@ impl StudioApp {
     // -----------------------------------------------------------------------
     // Header
     // -----------------------------------------------------------------------
-    fn draw_top_header(&mut self, canvas: &mut dyn SurfaceCanvas, w: i32) {
-        let p = self.palette.clone();
-        canvas.fill_rect(0, 0, w, HEADER_H, p.bg_header);
-        // One hairline, no double strokes: the header should recede, not shout.
-        canvas.draw_hline(0, HEADER_H - 1, w, p.border_subtle);
+    // -----------------------------------------------------------------------
+    // OpenCode-style shell rendering
+    // -----------------------------------------------------------------------
 
-        // Brand mark - quiet, tinted rather than a solid accent slab.
-        canvas.fill_rounded_rect(PAD, 13, 26, 26, 7, mix(p.accent, p.bg_header, 0.16));
-        canvas.draw_text(PAD + 5, 20, "AC", FontRole::UiSemibold, p.accent);
-        canvas.draw_text(PAD + 36, 11, "AirCode", FontRole::UiTitle, p.text_primary);
+    /// Session tabs for the top strip (active session first).
+    fn shell_tabs(&self) -> Vec<SessionTab> {
+        let mut tabs: Vec<SessionTab> = Vec::with_capacity(self.sessions.len() + 1);
+        let active_id = self.active_session.id.clone();
+        tabs.push(SessionTab {
+            id: active_id.clone(),
+            title: if self.active_session.title.is_empty() {
+                "New session".to_string()
+            } else {
+                self.active_session.title.clone()
+            },
+            active: true,
+        });
+        for s in self.sessions.iter().take(7) {
+            if s.id == active_id {
+                continue;
+            }
+            tabs.push(SessionTab {
+                id: s.id.clone(),
+                title: s.title.clone(),
+                active: false,
+            });
+        }
+        tabs
+    }
+
+    /// Rough token accounting for the context readout: ~4 chars per token over
+    /// the whole transcript plus the live buffers.
+    fn shell_token_estimate(&self) -> u64 {
+        let mut chars: u64 = 0;
+        for m in self.active_session.messages.iter() {
+            chars += m.content.chars().count() as u64;
+            chars += m.thinking.chars().count() as u64 / 2;
+            for t in m.tools.iter() {
+                chars += t.result_summary.chars().count() as u64 / 2;
+                chars += t.args_json.chars().count() as u64 / 4;
+            }
+        }
+        chars += self.streaming_text.chars().count() as u64;
+        chars += self.streaming_thinking.chars().count() as u64 / 2;
+        chars / 4
+    }
+
+    fn shell_token_pct(&self) -> f32 {
+        // A 200K-token context window is the common denominator across providers.
+        (self.shell_token_estimate() as f32 / 200_000.0).clamp(0.0, 1.0)
+    }
+
+    fn shell_cost(&self) -> f64 {
+        // Rough blended estimate; providers are not queried per token.
+        self.shell_token_estimate() as f64 * 0.000_003
+    }
+
+    fn shell_slash_hits(&self) -> Vec<(&'static str, &'static str)> {
+        shell::prompt::slash_hits(&self.agent_prompt)
+    }
+
+    fn shell_file_hits(&self) -> Vec<String> {
+        let q = shell::prompt::at_query(&self.agent_prompt, self.agent_prompt.chars().count());
+        let Some(q) = q else { return Vec::new() };
+        self.entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .filter(|e| q.is_empty() || e.rel_path.to_ascii_lowercase().contains(&q))
+            .take(8)
+            .map(|e| e.rel_path.clone())
+            .collect()
+    }
+
+    fn shell_palette_items(&self) -> Vec<PaletteItem> {
+        let files: Vec<(String, String)> = self
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .take(900)
+            .map(|e| (e.rel_path.clone(), e.name.clone()))
+            .collect();
+        shell::palette::items_for(
+            &self.palette_query,
+            self.settings.show_thinking,
+            &self.active_mode,
+            &self.settings.agent_effort,
+            &self.settings.theme,
+            &files,
+        )
+    }
+
+    /// Modified files for the sidebar: git changes plus any dirty editor tabs.
+    /// The +/- counts come from `git diff --numstat` when the workspace is a repo.
+    fn shell_modified_files(&self) -> Vec<(String, usize, usize)> {
+        let numstat = crate::git_ops::run_git(&self.workspace, &["diff", "--numstat"])
+            .ok()
+            .map(|(_, out, _)| out)
+            .unwrap_or_default();
+        let mut counts: std::collections::HashMap<String, (usize, usize)> =
+            std::collections::HashMap::new();
+        for line in numstat.lines() {
+            let mut it = line.split('\t');
+            let add = it.next().unwrap_or("0").parse::<usize>().unwrap_or(0);
+            let del = it.next().unwrap_or("0").parse::<usize>().unwrap_or(0);
+            if let Some(path) = it.next() {
+                counts.insert(path.to_string(), (add, del));
+            }
+        }
+        let mut out: Vec<(String, usize, usize)> = Vec::new();
+        for f in self.git_snapshot.files.iter() {
+            let (a, d) = counts.get(&f.path).copied().unwrap_or((0, 0));
+            out.push((f.path.clone(), a, d));
+        }
+        if out.is_empty() {
+            for t in self.tabs.iter() {
+                if t.is_dirty() {
+                    out.push((t.rel_path.clone(), 0, 0));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn shell_todos(&self) -> Vec<String> {
+        // Surface the plan's todo lines when the assistant writes a checklist.
+        let mut out: Vec<String> = Vec::new();
+        if let Some(m) = self.active_session.messages.last() {
+            for line in m.content.lines() {
+                let t = line.trim();
+                if (t.starts_with("- [ ]") || t.starts_with("* [ ]"))
+                    && out.len() < 12
+                {
+                    out.push(t.trim_start_matches("- [ ]").trim_start_matches("* [ ]").trim().to_string());
+                }
+            }
+        }
+        out
+    }
+
+    fn shell_mcp_status(&self) -> Vec<(String, String)> {
+        self.mcp_servers
+            .iter()
+            .map(|m| (m.name.clone(), m.status.clone()))
+            .collect()
+    }
+
+    fn draw_shell_chrome(&mut self, canvas: &mut dyn SurfaceCanvas) {
+        let w = self.width;
+        let h = self.height;
+        canvas.fill_rect(0, 0, w, shell::TABSTRIP_H, self.palette.bg_header);
+        canvas.draw_hline(0, shell::TABSTRIP_H, w, self.palette.border_subtle);
+
+        let tabs = self.shell_tabs();
+        let mut tx = 8;
+        for (i, tab) in tabs.iter().enumerate() {
+            let label = shell::truncate_right(&tab.title, 18);
+            let tw = canvas.measure_text_width(&label, FontRole::UiSmall) + 22;
+            let selected = tab.active;
+            canvas.fill_rounded_rect(
+                tx,
+                5,
+                tw,
+                shell::TABSTRIP_H - 12,
+                5,
+                if selected { self.palette.bg_card } else { self.palette.bg_header },
+            );
+            canvas.draw_text(
+                tx + 11,
+                11,
+                &label,
+                FontRole::UiSmall,
+                if selected { self.palette.text_primary } else { self.palette.text_muted },
+            );
+            self.push_hit(
+                UiRect::new(tx, 5, tw, shell::TABSTRIP_H - 12),
+                UiAction::SelectSessionTab(i),
+            );
+            tx += tw + 6;
+            if tx > w - 120 {
+                break;
+            }
+        }
+        canvas.fill_rounded_rect(tx, 5, 26, shell::TABSTRIP_H - 12, 5, self.palette.bg_header);
+        canvas.draw_text(tx + 8, 11, "+", FontRole::UiSemibold, self.palette.text_secondary);
+        self.push_hit(UiRect::new(tx, 5, 26, shell::TABSTRIP_H - 12), UiAction::NewSession);
+
+        let switch_label = if self.shell_view == ShellView::Workspace {
+            "Chat"
+        } else {
+            "Workspace"
+        };
+        let sw_w = canvas.measure_text_width(switch_label, FontRole::UiSmall) + 20;
+        canvas.fill_rounded_rect(w - sw_w - 10, 5, sw_w, shell::TABSTRIP_H - 12, 5, self.palette.bg_button);
+        canvas.draw_text(w - sw_w - 2, 11, switch_label, FontRole::UiSmall, self.palette.text_secondary);
+        self.push_hit(
+            UiRect::new(w - sw_w - 10, 5, sw_w, shell::TABSTRIP_H - 12),
+            UiAction::ToggleShellView,
+        );
+
+        let sy = h - shell::STATUSBAR_H;
+        canvas.fill_rect(0, sy, w, shell::STATUSBAR_H, self.palette.bg_header);
+        canvas.draw_hline(0, sy, w, self.palette.border_subtle);
+        let pct = (self.shell_token_pct() * 100.0) as i32;
+        let left = format!(
+            "[ctrl+? help]  Tokens: {} ({}%)  Cost: {}",
+            shell::fmt_tokens(self.shell_token_estimate()),
+            pct,
+            shell::fmt_cost(self.shell_cost())
+        );
+        canvas.draw_text(10, sy + 6, &left, FontRole::UiSmall, self.palette.text_secondary);
+        if self.shell_flash.visible() {
+            let msg = shell::truncate_right(&self.shell_flash.text, 60);
+            let mw = canvas.measure_text_width(&msg, FontRole::UiSmall);
+            canvas.draw_text(w / 2 - mw / 2, sy + 6, &msg, FontRole::UiSmall, self.palette.accent);
+        }
+        let ws = shell::shorten_path(&self.workspace.to_string_lossy(), 40);
+        let ws_w = canvas.measure_text_width(&ws, FontRole::UiSmall);
+        canvas.draw_text(w - ws_w - 10, sy + 6, &ws, FontRole::UiSmall, self.palette.text_muted);
+        let model_box = format!("{} | {}", self.settings.active_model, self.settings.agent_effort);
+        let mb_w = canvas.measure_text_width(&model_box, FontRole::UiSmall) + 18;
+        let mb_x = w - ws_w - mb_w - 26;
+        canvas.fill_rounded_rect(mb_x, sy + 3, mb_w, shell::STATUSBAR_H - 6, 4, self.palette.accent);
         canvas.draw_text(
-            PAD + 36,
-            31,
-            "Pure-Rust Studio",
+            mb_x + 9,
+            sy + 6,
+            &model_box,
             FontRole::UiSmall,
-            p.text_muted,
+            self.palette.on_accent_text(self.palette.accent),
         );
-
-        let mut x = 188;
-
-        // Workspace
-        let ws_str = truncate_left(&self.workspace.to_string_lossy(), 30);
-        let ws_w = 232.min((w - 700).max(120));
-        self.draw_button(
-            canvas,
-            UiRect::new(x, 13, ws_w, 26),
-            &format!("{}  {}", glyph("folder"), ws_str),
-            p.bg_card,
-            p.text_secondary,
-            p.border_subtle,
-            Some(UiAction::PickFolder),
+        canvas.draw_text(
+            mb_x - 78,
+            sy + 6,
+            &format!("{} v{}", self.settings.active_provider, crate::VERSION),
+            FontRole::UiSmall,
+            self.palette.text_muted,
         );
-        x += ws_w + 10;
-
-        // Command palette search
-        self.draw_button(
-            canvas,
-            UiRect::new(x, 13, 196, 26),
-            &format!("{}  Search commands   Ctrl+K", glyph("search")),
-            p.bg_input,
-            p.text_muted,
-            p.border_subtle,
-            Some(UiAction::OpenModal(ModalDialog::CommandPalette)),
-        );
-        x += 206;
-
-        // Provider + model share one pill (they are two halves of one setting).
-        let prov_model = format!(
-            "{} {}  ·  {}",
-            glyph("plug"),
-            self.settings.active_provider,
-            truncate_right(&self.settings.active_model, 18)
-        );
-        self.draw_pill(
-            canvas,
-            UiRect::new(x, 13, 246, 26),
-            &prov_model,
-            false,
-            Some(UiAction::OpenModal(ModalDialog::ConnectWizard)),
-        );
-        x += 254;
-
-        // Plan / Build segmented control
-        let mode_w = 60;
-        self.draw_pill(
-            canvas,
-            UiRect::new(x, 13, mode_w, 26),
-            "Plan",
-            self.active_mode == "plan",
-            Some(UiAction::SetMode("plan")),
-        );
-        self.draw_pill(
-            canvas,
-            UiRect::new(x + mode_w + 4, 13, mode_w, 26),
-            "Build",
-            self.active_mode == "build",
-            Some(UiAction::SetMode("build")),
-        );
-        x += mode_w * 2 + 16;
-
-        // Effort (theme lives in the footer + command palette, not up here)
-        self.draw_pill(
-            canvas,
-            UiRect::new(x, 13, 92, 26),
-            &format!("{} {}", glyph("bolt"), self.settings.agent_effort.to_uppercase()),
-            true,
-            Some(UiAction::CycleEffort),
-        );
-
-        // Right-side controls - one quiet ghost button, one accent action.
-        let mut rx = w - PAD;
-        rx -= 92;
-        self.draw_button(
-            canvas,
-            UiRect::new(rx, 13, 92, 26),
-            "Settings",
-            p.bg_card,
-            p.text_secondary,
-            p.border_subtle,
-            Some(UiAction::OpenModal(ModalDialog::SafetySettings)),
-        );
-        rx -= 106;
-        self.draw_button(
-            canvas,
-            UiRect::new(rx, 13, 98, 26),
-            "/ Connect",
-            mix(p.accent, p.bg_header, 0.12),
-            p.accent,
-            mix(p.accent, p.bg_header, 0.35),
-            Some(UiAction::OpenModal(ModalDialog::ConnectWizard)),
+        self.push_hit(
+            UiRect::new(mb_x, sy, mb_w, shell::STATUSBAR_H),
+            UiAction::CycleModel,
         );
     }
+
+    fn render_shell(&mut self, canvas: &mut dyn SurfaceCanvas) {
+        let w = self.width;
+        let h = self.height;
+
+        // Resolve the effective scroll offset: pinned means "bottom".
+        let row_count = shell::chat::build_rows(&self.shell_chat_model(), ((w / 8).max(20)) as usize).len();
+        let visible_rows =
+            ((h - shell::TABSTRIP_H - shell::STATUSBAR_H - 58) / 20).max(3) as usize;
+        if self.chat_pinned {
+            self.chat_scroll = row_count.saturating_sub(visible_rows);
+        } else {
+            self.chat_scroll = self.chat_scroll.min(row_count.saturating_sub(visible_rows));
+        }
+        let effective_scroll = self.chat_scroll;
+
+        // Refresh the scratch buffers the shell models borrow from.
+        self.shell_mcp_status_buf = self.shell_mcp_status();
+        self.shell_todos_buf = self.shell_todos();
+        self.shell_modified_buf = self.shell_modified_files();
+        self.shell_slash_buf = self.shell_slash_hits();
+        self.shell_file_buf = self.shell_file_hits();
+        self.shell_palette_buf = self.shell_palette_items();
+        self.shell_zen_buf = self.connect.zen_free_models.clone();
+
+        let tabs = self.shell_tabs();
+        let sidebar_model = if self.sidebar_open && w > 900 {
+            Some(self.shell_sidebar_model())
+        } else {
+            None
+        };
+        let prompt_model = self.shell_prompt_model();
+        let palette_model = if self.palette_open {
+            Some(self.shell_palette_model())
+        } else {
+            None
+        };
+        let connect_model = if self.shell_view == ShellView::Connect {
+            Some(self.shell_connect_model())
+        } else {
+            None
+        };
+
+        let frame = shell::ShellFrame {
+            width: w,
+            height: h,
+            palette: &self.palette,
+            view: self.shell_view,
+            tabs: &tabs,
+            active_tab: 0,
+            chat: self.shell_chat_model(),
+            chat_scroll: effective_scroll,
+            sidebar: sidebar_model,
+            prompt: prompt_model,
+            model_label: &self.settings.active_model,
+            provider_label: &self.settings.active_provider,
+            effort_label: &self.settings.agent_effort,
+            tokens: self.shell_token_estimate(),
+            token_pct: self.shell_token_pct(),
+            cost_usd: self.shell_cost(),
+            running: self.agent_running,
+            flash: if self.shell_flash.visible() {
+                Some(&self.shell_flash)
+            } else {
+                None
+            },
+            workspace_path: &self.workspace.to_string_lossy(),
+            version: crate::VERSION,
+            command_palette: palette_model,
+            connect: connect_model,
+        };
+
+        let zones = shell::render(canvas, &frame);
+        for (rect, action) in zones {
+            self.push_hit(rect, action);
+        }
+
+        // Overlays that only exist in Chat mode.
+        if self.shell_view == ShellView::Chat {
+            if self.modal == ModalDialog::ThemePicker {
+                self.draw_theme_picker(canvas);
+            } else if self.modal == ModalDialog::SafetySettings {
+                self.draw_safety_modal(canvas);
+            }
+        }
+        if let Some(req) = self.pending_approval.clone() {
+            self.draw_approval_modal(canvas, &req);
+        }
+        if let Some(del) = self.pending_delete.clone() {
+            self.draw_delete_modal(canvas, &del);
+        }
+    }
+
+    fn shell_chat_model(&self) -> shell::chat::ChatModel<'_> {
+        shell::chat::ChatModel {
+            session: &self.active_session,
+            streaming_text: self.streaming_text.as_str(),
+            streaming_thinking: self.streaming_thinking.as_str(),
+            live_tools: self.live_tools.as_slice(),
+            running: self.agent_running,
+            status_line: self.agent_status_line.as_str(),
+            show_thinking: self.settings.show_thinking,
+            expanded: self.expanded_blocks.as_slice(),
+            active_model: self.settings.active_model.as_str(),
+            active_mode: self.active_mode.as_str(),
+            effort: self.settings.agent_effort.as_str(),
+        }
+    }
+
+    fn shell_sidebar_model(&self) -> shell::sidebar::SidebarModel<'_> {
+        shell::sidebar::SidebarModel {
+            session: &self.active_session,
+            tokens: self.shell_token_estimate(),
+            token_pct: self.shell_token_pct(),
+            cost_usd: self.shell_cost(),
+            mcp_servers: self.mcp_servers.as_slice(),
+            mcp_status: &self.shell_mcp_status_buf,
+            todos: &self.shell_todos_buf,
+            modified: &self.shell_modified_buf,
+            collapsed: self.sidebar_collapsed.as_slice(),
+            version: crate::VERSION,
+        }
+    }
+
+    fn shell_prompt_model(&self) -> shell::prompt::PromptModel<'_> {
+        shell::prompt::PromptModel {
+            value: self.agent_prompt.as_str(),
+            caret: self.agent_prompt.chars().count(),
+            focused: self.focus == FocusTarget::AgentPrompt,
+            caret_visible: self.blink_phase,
+            history: self.prompt_history.as_slice(),
+            slash_hits: self.shell_slash_buf.as_slice(),
+            file_hits: self.shell_file_buf.as_slice(),
+            ac_index: 0,
+            running: self.agent_running,
+        }
+    }
+
+    fn shell_palette_model(&self) -> shell::palette::PaletteModel<'_> {
+        shell::palette::PaletteModel {
+            query: self.palette_query.as_str(),
+            index: self.palette_index,
+            items: self.shell_palette_buf.as_slice(),
+            caret_visible: self.blink_phase,
+        }
+    }
+
+    fn shell_connect_model(&self) -> shell::connect::ConnectModel<'_> {
+        shell::connect::ConnectModel {
+            provider: self.connect.provider_id.as_str(),
+            model: self.connect.model.as_str(),
+            key: self.connect.key_input.as_str(),
+            url: self.connect.url_input.as_str(),
+            auth_mode: self.connect.opencode_auth_mode.as_str(),
+            zen_models: self.shell_zen_buf.as_slice(),
+            zen_status: self.connect.zen_status.as_str(),
+            detected: self.connect.detected_summary.as_slice(),
+            detected_file: &self.connect.detected_opencode_file,
+            local_server_alive: self.connect.local_server_alive,
+            ollama_alive: self.connect.ollama_alive,
+            focus_key: self.focus == FocusTarget::ConnectKeyInput,
+            caret_visible: self.blink_phase,
+            scroll: 0,
+        }
+    }
+
 
     // -----------------------------------------------------------------------
     // Left activity rail + panels
@@ -5603,7 +6308,7 @@ impl StudioApp {
             p.bg_card,
             p.accent_secondary,
             p.border_subtle,
-            Some(UiAction::OpenProviderKeyUrl(guide.key_url, true)),
+            Some(UiAction::OpenProviderKeyUrl(guide.key_url.to_string(), true)),
         );
         self.draw_button(
             canvas,
@@ -5612,7 +6317,7 @@ impl StudioApp {
             p.bg_card,
             p.purple,
             p.border_subtle,
-            Some(UiAction::OpenProviderKeyUrl(guide.key_url, false)),
+            Some(UiAction::OpenProviderKeyUrl(guide.key_url.to_string(), false)),
         );
         self.draw_button(
             canvas,
@@ -5996,8 +6701,8 @@ impl StudioApp {
                     return self.compute_cursor();
                 }
 
-                let top = HEADER_H;
-                let bottom = self.height - FOOTER_H;
+                let top = SHELL_CHROME_TOP;
+                let bottom = self.height - SHELL_CHROME_BOTTOM;
                 if y >= top && y < bottom {
                     let panel_x = if self.left_panel_open {
                         RAIL_W + self.left_w
@@ -6113,6 +6818,24 @@ impl StudioApp {
             } => {
                 if self.modal == ModalDialog::None {
                     let steps = (delta_lines as isize) * 3;
+                    // The OpenCode-style shell scrolls its own transcript.
+                    if self.shell_view == ShellView::Chat {
+                        // Wheel up unpins; scrolling back to the bottom re-pins.
+                        let rows = shell::chat::build_rows(
+                            &self.shell_chat_model(),
+                            ((self.width / 8).max(20)) as usize,
+                        )
+                        .len();
+                        let vis = ((self.height - shell::TABSTRIP_H - shell::STATUSBAR_H - 58)
+                            / 20)
+                            .max(3) as usize;
+                        let max_off = rows.saturating_sub(vis);
+                        let next = (self.chat_scroll as isize + steps).clamp(0, max_off as isize)
+                            as usize;
+                        self.chat_scroll = next;
+                        self.chat_pinned = next >= max_off;
+                        return self.compute_cursor();
+                    }
                     if x < RAIL_W {
                         return self.compute_cursor();
                     }
@@ -6199,15 +6922,27 @@ impl StudioApp {
         self.width = canvas.width().max(760);
         self.height = canvas.height().max(520);
         self.hit_zones.clear();
+        self.shell_flash.tick();
 
+        // The OpenCode-style shell owns Chat / Connect; Workspace keeps the
+        // classic IDE panels.
+        if self.shell_view == ShellView::Workspace {
+            self.render_workspace(canvas);
+            return;
+        }
+        self.render_shell(canvas);
+    }
+
+    /// Classic IDE layout (explorer + editor + terminal + git + browser).
+    fn render_workspace(&mut self, canvas: &mut dyn SurfaceCanvas) {
         canvas.clear(self.palette.bg_app);
 
         let modal_open = self.modal != ModalDialog::None
             || self.pending_approval.is_some()
             || self.pending_delete.is_some();
 
-        let top = HEADER_H;
-        let bottom = self.height - FOOTER_H;
+        let top = SHELL_CHROME_TOP;
+        let bottom = self.height - SHELL_CHROME_BOTTOM;
         let panel_x = if self.left_panel_open {
             RAIL_W + self.left_w
         } else {
@@ -6222,7 +6957,7 @@ impl StudioApp {
         };
         let center_h = (bottom - top - term_h).max(120);
 
-        self.draw_top_header(canvas, self.width);
+        self.draw_shell_chrome(canvas);
         self.draw_left_rail(canvas, top, bottom);
         if self.left_panel_open {
             self.draw_left_panel(canvas, top, bottom);
@@ -6295,16 +7030,6 @@ fn truncate_right(s: &str, max_chars: usize) -> String {
     } else {
         let head: String = chars[..max_chars.saturating_sub(2)].iter().collect();
         format!("{}..", head)
-    }
-}
-
-fn truncate_left(s: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max_chars {
-        s.to_string()
-    } else {
-        let tail: String = chars[chars.len() - max_chars.saturating_sub(2)..].iter().collect();
-        format!("..{}", tail)
     }
 }
 
