@@ -1,6 +1,6 @@
 [package]
 name = "ai-coding-agent"
-version = "2.2.2"
+version = "2.2.3"
 edition = "2021"
 description = "AirCode — Pure-Rust native desktop AI coding agent (zero WebView)"
 authors = ["Aircode Contributors"]

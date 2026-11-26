@@ -219,6 +219,15 @@ mod tests {
         // An unknown key is a 400, not a panic.
         let bad = api::route(&mut app, &req("POST", "/api/key", "{\"key\":\"nonsense\"}")).unwrap();
         assert_eq!(bad.status, 400);
+
+        // ctrl+L clears the line. The route used to compare the lowercase "l"
+        // straight against the app's uppercase Letter('L'), so the clear silently
+        // did nothing.
+        api::route(&mut app, &req("POST", "/api/char", "{\"ch\":\"x\"}")).unwrap();
+        assert_eq!(app.prompt_text(), "hx");
+        let clr = api::route(&mut app, &req("POST", "/api/key", "{\"key\":\"l\",\"ctrl\":true}")).unwrap();
+        assert_eq!(clr.status, 200);
+        assert_eq!(app.prompt_text(), "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -318,9 +327,12 @@ mod tests {
         let handle = std::thread::spawn(move || {
             use std::io::Read;
             let (mut s, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 256];
-            let n = s.read(&mut buf).unwrap();
-            String::from_utf8_lossy(&buf[..n]).to_string()
+            // Read to EOF rather than one fixed-size chunk: a single 256-byte
+            // read can split the headers from the event frame and make this
+            // test fail at random, which only ever hid real regressions.
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).to_string()
         });
         let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         assert!(http::begin_sse(&mut client));

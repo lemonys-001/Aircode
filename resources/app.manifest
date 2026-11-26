@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
-  <assemblyIdentity version="1.0.0.0" processorArchitecture="amd64" name="Aircode.AICodingAgent" type="win32"/>
-  <description>AI Coding Agent — Native Windows x64 Desktop Application</description>
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="amd64" name="Aircode.AirCode" type="win32"/>
+  <description>AirCode — Pure-Rust Native Windows x64 Desktop Application</description>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="amd64" publicKeyToken="6595b64144ccf1df" language="*"/>
