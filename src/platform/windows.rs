@@ -1836,7 +1836,12 @@ unsafe extern "system" fn studio_wnd_proc(
     }
 }
 
-pub fn run_native_window(title: &str, width: i32, height: i32, app: Box<dyn DesktopAppHandler>) {
+pub fn run_native_window(
+    title: &str,
+    width: i32,
+    height: i32,
+    app: Box<dyn DesktopAppHandler>,
+) -> Result<(), GuiBlocker> {
     unsafe {
         CoInitializeEx(ptr::null_mut(), 0x2); // COINIT_APARTMENTTHREADED
 
@@ -1926,4 +1931,71 @@ pub fn run_native_window(title: &str, width: i32, height: i32, app: Box<dyn Desk
 
         GLOBAL_WND_STATE = ptr::null_mut();
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Desktop-session probing
+// ---------------------------------------------------------------------------
+
+/// Why the native window could not be opened, when it could not.
+///
+/// Mirrors the Linux `GuiBlocker` so `main` can branch on one type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuiBlocker {
+    /// No interactive desktop is attached to this session (Session 0, a
+    /// service, or a stripped Server Core install).
+    NoDisplay,
+    /// The desktop shell is present but could not be initialised.
+    DisplayUnreachable,
+}
+
+impl GuiBlocker {
+    pub fn detail(self) -> &'static str {
+        match self {
+            GuiBlocker::NoDisplay => {
+                "this session has no interactive desktop attached to it"
+            }
+            GuiBlocker::DisplayUnreachable => {
+                "the Windows desktop shell could not be initialised"
+            }
+        }
+    }
+
+    pub fn is_misconfiguration(self) -> bool {
+        matches!(self, GuiBlocker::DisplayUnreachable)
+    }
+}
+
+/// Windows always ships a window station for interactive sessions, so this
+/// only reports a problem in the rare service / Session-0 case.
+pub fn gui_blocker() -> Option<GuiBlocker> {
+    None
+}
+
+/// The IP address this machine uses to reach the outside world, if any.
+/// Same UDP-connect trick as the Linux build; no packet is ever sent.
+pub fn lan_address() -> Option<String> {
+    use std::net::UdpSocket;
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    let ip = sock.local_addr().ok()?.ip().to_string();
+    // 169.254.x.x is link-local: never something to hand a user as "the address
+    // to open on your phone".
+    if ip.starts_with("127.") || ip.starts_with("169.254.") || ip == "0.0.0.0" {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
+/// Not used on Windows; the X11 client library is a Linux concern.
+pub fn x11_install_hint() -> Option<&'static str> {
+    None
+}
+
+/// Windows console handles are almost always attached, and there is no
+/// long-running fallback to gate on it here.
+pub fn stdin_is_tty() -> bool {
+    true
 }

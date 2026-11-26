@@ -18,13 +18,29 @@ use std::time::Duration;
 static CLIPBOARD_MEM: Mutex<String> = Mutex::new(String::new());
 
 pub fn app_data_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        return PathBuf::from(xdg).join("ai-coding-agent");
+    let dir = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        PathBuf::from(xdg).join("aircode")
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".local/share/aircode")
+    } else {
+        std::env::temp_dir().join("aircode")
+    };
+    migrate_legacy_data_dir(&dir);
+    dir
+}
+
+/// The pre-rename directory, still on disk for anyone who ran 2.x before the
+/// app was called AirCode. Moving it keeps sessions, settings, skills and MCP
+/// config instead of silently orphaning them in a directory nothing reads.
+fn migrate_legacy_data_dir(new_dir: &Path) {
+    let Some(parent) = new_dir.parent() else { return };
+    let legacy = parent.join("ai-coding-agent");
+    if !legacy.is_dir() || new_dir.exists() {
+        return;
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".local/share/ai-coding-agent");
-    }
-    std::env::temp_dir().join("ai-coding-agent")
+    // Best effort: a read-only home or a cross-device move just means the user
+    // keeps the old directory and we carry on with an empty new one.
+    let _ = std::fs::rename(&legacy, new_dir);
 }
 
 pub fn list_drives() -> Vec<DriveInfo> {
@@ -693,7 +709,172 @@ fn translate_keysym(ks: KeySym) -> Option<KeyCode> {
     }
 }
 
-pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn DesktopAppHandler>) {
+// ---------------------------------------------------------------------------
+// Desktop-session probing
+// ---------------------------------------------------------------------------
+
+/// Why the native window could not be opened, when it could not.
+///
+/// The old behaviour was a single `eprintln!` and a silent `return`, which left
+/// the process exiting **0** - so a shell, a script or the installer believed
+/// AirCode had run successfully. Worse, the message named a shared object the
+/// user cannot act on and never mentioned that AirCode ships two front-ends
+/// that need no X11 at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuiBlocker {
+    /// Neither `DISPLAY` nor `WAYLAND_DISPLAY` is set: there is nothing to
+    /// draw on. SSH sessions, containers, CI and proot shells land here.
+    NoDisplay,
+    /// A display is advertised but the X11 client library is missing. This is
+    /// the "libX11.so.6 not found" case, typically a minimal or proot install.
+    MissingX11Library,
+    /// `DISPLAY` is set and libX11 is present, but no X server answered - the
+    /// session died, or the socket is stale.
+    DisplayUnreachable,
+}
+
+impl GuiBlocker {
+    /// A one-line "what happened", phrased for a human at a terminal.
+    pub fn detail(self) -> &'static str {
+        match self {
+            GuiBlocker::NoDisplay => {
+                "no DISPLAY or WAYLAND_DISPLAY is set, so there is no desktop to draw on"
+            }
+            GuiBlocker::MissingX11Library => {
+                "a display is advertised, but the X11 client library libX11.so.6 is not installed"
+            }
+            GuiBlocker::DisplayUnreachable => {
+                "DISPLAY is set and libX11 is present, but no X server answered on it"
+            }
+        }
+    }
+
+    /// True when a desktop was *expected* here - i.e. the user did everything
+    /// right and something is still missing from the machine.
+    pub fn is_misconfiguration(self) -> bool {
+        !matches!(self, GuiBlocker::NoDisplay)
+    }
+}
+
+/// The package-manager command that installs the X11 client library on this
+/// machine, derived from `/etc/os-release`. Returns `None` for an unknown
+/// distro rather than guessing wrong.
+pub fn x11_install_hint() -> Option<&'static str> {
+    let text = std::fs::read_to_string("/etc/os-release").ok()?;
+    let field = |key: &str| -> Option<String> {
+        text.lines()
+            .map(|l| l.trim())
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().trim_matches('"').to_string())
+    };
+    let id = field("ID=").unwrap_or_default();
+    let like = field("ID_LIKE=").unwrap_or_default();
+    let haystack = format!("{} {}", id, like);
+
+    // Order matters: a derivative can carry several ID_LIKE tokens.
+    if haystack.split_whitespace().any(|t| {
+        matches!(
+            t,
+            "debian" | "ubuntu" | "linuxmint" | "pop" | "raspbian" | "deepin"
+                | "elementary" | "kali" | "devuan" | "zorin" | "mx"
+        )
+    }) {
+        Some("sudo apt-get install -y libx11-6")
+    } else if haystack.split_whitespace().any(|t| {
+        matches!(
+            t,
+            "fedora" | "rhel" | "centos" | "rocky" | "almalinux" | "anolis"
+        )
+    }) {
+        Some("sudo dnf install -y libX11")
+    } else if haystack
+        .split_whitespace()
+        .any(|t| matches!(t, "arch" | "manjaro" | "endeavouros" | "garuda" | "artix"))
+    {
+        Some("sudo pacman -S --noconfirm libx11")
+    } else if haystack.split_whitespace().any(|t| t == "alpine") {
+        Some("sudo apk add libx11")
+    } else if haystack
+        .split_whitespace()
+        .any(|t| matches!(t, "opensuse" | "suse" | "sles"))
+    {
+        Some("sudo zypper install -y libX11-6")
+    } else if haystack.split_whitespace().any(|t| t == "void") {
+        Some("sudo xbps-install -y libX11")
+    } else if haystack.split_whitespace().any(|t| t == "gentoo") {
+        Some("sudo emerge -n x11-libs/libX11")
+    } else {
+        None
+    }
+}
+
+/// The IP address this machine uses to reach the outside world, if any.
+///
+/// A `connect()` on a UDP socket never sends a packet - it only makes the
+/// kernel pick a route and bind a source address - so this is a cheap, purely
+/// local way to answer "what would a phone on my network type?". Returns
+/// `None` when there is no route at all (a box with only loopback).
+pub fn lan_address() -> Option<String> {
+    use std::net::UdpSocket;
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    let addr = sock.local_addr().ok()?;
+    let ip = addr.ip().to_string();
+    // 169.254.x.x is link-local: never something to hand a user as "the address
+    // to open on your phone".
+    if ip.starts_with("127.") || ip.starts_with("169.254.") || ip == "0.0.0.0" {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
+/// True when stdin is a terminal. Used to decide whether AirCode may start a
+/// long-running front-end on the user's behalf: in a pipe or CI there is nobody
+/// to read the banner, and blocking would hang the caller.
+pub fn stdin_is_tty() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn isatty(fd: i32) -> i32;
+        }
+        unsafe { isatty(0) == 1 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// Decides whether the native window can be opened, without opening it.
+///
+/// Checks the environment first (cheap and side-effect free) and only then the
+/// X11 client library, so the common headless case never touches `dlopen`.
+pub fn gui_blocker() -> Option<GuiBlocker> {
+    let display = std::env::var("DISPLAY").unwrap_or_default();
+    let wayland = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    if display.trim().is_empty() && wayland.trim().is_empty() {
+        return Some(GuiBlocker::NoDisplay);
+    }
+    // A display is advertised, so the client library has to be there.
+    unsafe {
+        let lib = dlopen(
+            b"libX11.so.6\0".as_ptr() as *const c_char,
+            2, // RTLD_NOW
+        );
+        if lib.is_null() {
+            return Some(GuiBlocker::MissingX11Library);
+        }
+    }
+    None
+}
+
+pub fn run_native_window(
+    title: &str,
+    width: i32,
+    height: i32,
+    mut app: Box<dyn DesktopAppHandler>,
+) -> Result<(), GuiBlocker> {
     type FnOpenDisplay = unsafe extern "C" fn(*const c_char) -> *mut Display;
     type FnDefaultScreen = unsafe extern "C" fn(*mut Display) -> c_int;
     type FnRootWindow = unsafe extern "C" fn(*mut Display, c_int) -> Window;
@@ -754,8 +935,7 @@ pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn 
     unsafe {
         let lib = dlopen(b"libX11.so.6\0".as_ptr() as *const c_char, 2); // RTLD_NOW
         if lib.is_null() {
-            eprintln!("AirCode: libX11.so.6 not found (run inside a Linux desktop session).");
-            return;
+            return Err(GuiBlocker::MissingX11Library);
         }
         let (
             Some(x_open_display),
@@ -792,14 +972,12 @@ pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn 
             load_sym::<FnPutImage>(lib, b"XPutImage\0"),
             load_sym::<FnFlush>(lib, b"XFlush\0"),
         ) else {
-            eprintln!("AirCode: failed resolving X11 symbols.");
-            return;
+            return Err(GuiBlocker::MissingX11Library);
         };
 
         let dpy = x_open_display(ptr::null());
         if dpy.is_null() {
-            eprintln!("AirCode: X11 display not available (run inside a Linux desktop session).");
-            return;
+            return Err(GuiBlocker::DisplayUnreachable);
         }
         let scr = x_default_screen(dpy);
         let root = x_root_window(dpy, scr);
@@ -839,7 +1017,9 @@ pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn 
         let gc = x_default_gc(dpy, scr);
         let mut left_down = false;
 
-        loop {
+        // Labelled so the WM_DELETE_WINDOW case below can leave the message
+        // loop and report a clean shutdown instead of falling off the end.
+        'message_loop: loop {
             while x_pending(dpy) > 0 {
                 let mut ev = XEvent { type_: 0 };
                 x_next_event(dpy, &mut ev);
@@ -969,8 +1149,9 @@ pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn 
                         }
                     }
                     33 => {
-                        // ClientMessage (WM_DELETE_WINDOW)
-                        return;
+                        // ClientMessage (WM_DELETE_WINDOW): the window manager
+                        // asked us to close, so leave the loop cleanly.
+                        break 'message_loop;
                     }
                     _ => {}
                 }
@@ -1009,6 +1190,88 @@ pub fn run_native_window(title: &str, width: i32, height: i32, mut app: Box<dyn 
             }
             x_flush(dpy);
             std::thread::sleep(Duration::from_millis(16));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod gui_probe_tests {
+    use super::*;
+
+    #[test]
+    fn no_display_is_not_a_misconfiguration() {
+        // Telling someone to `apt install libx11-6` on a headless box is wrong,
+        // and that is exactly what the first draft of the message did.
+        assert!(GuiBlocker::NoDisplay.is_misconfiguration() == false);
+        assert!(GuiBlocker::MissingX11Library.is_misconfiguration());
+        assert!(GuiBlocker::DisplayUnreachable.is_misconfiguration());
+    }
+
+    #[test]
+    fn every_blocker_explains_itself() {
+        for b in [
+            GuiBlocker::NoDisplay,
+            GuiBlocker::MissingX11Library,
+            GuiBlocker::DisplayUnreachable,
+        ] {
+            assert!(!b.detail().is_empty(), "{:?} has no explanation", b);
+            // The message has to name the thing that is actually wrong.
+            match b {
+                GuiBlocker::NoDisplay => assert!(b.detail().contains("DISPLAY")),
+                GuiBlocker::MissingX11Library => assert!(b.detail().contains("libX11.so.6")),
+                GuiBlocker::DisplayUnreachable => assert!(b.detail().contains("X server")),
+            }
+        }
+    }
+
+    #[test]
+    fn probe_reports_no_display_when_the_environment_is_empty() {
+        // The probe reads the real environment, so only assert the branch we
+        // can control: with both variables blanked it must say NoDisplay.
+        let prev_d = std::env::var("DISPLAY").ok();
+        let prev_w = std::env::var("WAYLAND_DISPLAY").ok();
+        std::env::remove_var("DISPLAY");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        assert_eq!(gui_blocker(), Some(GuiBlocker::NoDisplay));
+        if let Some(v) = prev_d {
+            std::env::set_var("DISPLAY", v);
+        }
+        if let Some(v) = prev_w {
+            std::env::set_var("WAYLAND_DISPLAY", v);
+        }
+    }
+
+    #[test]
+    fn a_wayland_display_counts_as_a_desktop() {
+        // Wayland-only sessions must not be told they are headless.
+        let prev = std::env::var("DISPLAY").ok();
+        std::env::remove_var("DISPLAY");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        let got = gui_blocker();
+        if let Some(v) = prev {
+            std::env::set_var("DISPLAY", v);
+        }
+        std::env::remove_var("WAYLAND_DISPLAY");
+        assert_ne!(got, Some(GuiBlocker::NoDisplay));
+    }
+
+    #[test]
+    fn install_hint_is_a_runnable_command_or_nothing() {
+        // Never invent a command for a distro we do not recognise.
+        if let Some(cmd) = x11_install_hint() {
+            assert!(cmd.contains("install") || cmd.contains("emerge"), "{}", cmd);
+        }
+    }
+
+    #[test]
+    fn lan_address_never_hands_back_a_loopback_or_link_local_ip() {
+        // 169.254.x.x is what this sandbox gets; it is not something to tell a
+        // user to open on their phone.
+        if let Some(ip) = lan_address() {
+            assert!(!ip.starts_with("127."), "{}", ip);
+            assert!(!ip.starts_with("169.254."), "{}", ip);
+            assert_ne!(ip, "0.0.0.0");
         }
     }
 }

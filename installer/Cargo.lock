@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "ai-coding-agent-setup"
-version = "2.2.3"
+version = "2.3.0"

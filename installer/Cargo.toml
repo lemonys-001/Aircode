@@ -1,6 +1,6 @@
 [package]
 name = "ai-coding-agent-setup"
-version = "2.2.3"
+version = "2.3.0"
 edition = "2021"
 description = "AirCode — Pure-Rust Windows x64 setup wizard & uninstaller"
 build = "build.rs"
