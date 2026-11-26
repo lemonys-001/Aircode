@@ -750,7 +750,9 @@ impl StudioApp {
     // -----------------------------------------------------------------------
     // Agent run + background stream draining
     // -----------------------------------------------------------------------
-    fn launch_agent_prompt(&mut self, prompt_override: Option<String>) {
+    /// Starts an autonomous run for `prompt_override`, or for whatever is in
+    /// the composer when `None`. Shared by every front-end.
+    pub fn launch_agent_prompt(&mut self, prompt_override: Option<String>) {
         if self.agent_running {
             self.show_toast("Agent is running — click STOP to interrupt first.");
             return;
@@ -818,6 +820,127 @@ impl StudioApp {
         self.compacting = true;
         self.agent_status_line = "Compacting session context into a checkpoint...".to_string();
         self.show_toast("Compacting session context...");
+    }
+
+    /// A plain-data view of the app for front-ends that have no canvas.
+    ///
+    /// This is the seam the TUI and the web front-end render through. It is
+    /// deliberately cheap: everything is a `String`, `Vec` or scalar, so it can
+    /// be serialised straight to JSON or walked as text.
+    pub fn snapshot(&self) -> crate::ui::snapshot::AppSnapshot {
+        use crate::ui::snapshot::*;
+
+        let messages = self
+            .active_session
+            .messages
+            .iter()
+            .map(|m| SnapshotMessage {
+                id: m.id.clone(),
+                role: m.role.clone(),
+                content: m.content.clone(),
+                thinking: m.thinking.clone(),
+                model: m.model.clone(),
+                provider: m.provider.clone(),
+                mode: m.mode.clone(),
+                created_at: m.created_at.clone(),
+                tools: m.tools.iter().map(SnapshotTool::from_record).collect(),
+            })
+            .collect();
+
+        // Same numbers the shell's status bar shows, so a terminal and the
+        // desktop app never disagree about cost or context pressure.
+        let tokens = self.shell_token_estimate();
+        let context_pct = self.shell_token_pct();
+        let cost = self.shell_cost();
+
+        let (mcp, todos, modified) = self.shell_sidecar_lists();
+
+        AppSnapshot {
+            version: crate::VERSION.to_string(),
+            workspace: self.workspace.display().to_string(),
+            shell_view: match self.shell_view {
+                crate::ui::shell::ShellView::Chat => "chat".to_string(),
+                crate::ui::shell::ShellView::Workspace => "workspace".to_string(),
+                crate::ui::shell::ShellView::Connect => "connect".to_string(),
+            },
+            palette_open: self.palette_open,
+
+            sessions: self.sessions.clone(),
+            active_session_id: self.active_session.id.clone(),
+            active_title: self.active_session.title.clone(),
+            messages,
+
+            agent_running: self.agent_running,
+            compacting: self.compacting,
+            status_line: self.agent_status_line.clone(),
+            streaming_thinking: self.streaming_thinking.clone(),
+            streaming_text: self.streaming_text.clone(),
+            live_tools: self.live_tools.iter().map(SnapshotTool::from_record).collect(),
+
+            prompt_text: self.agent_prompt.clone(),
+            prompt_history: self.prompt_history.clone(),
+            slash_hits: self
+                .shell_slash_buf
+                .iter()
+                .map(|(c, d)| ((*c).to_string(), (*d).to_string()))
+                .collect(),
+            file_hits: self.shell_file_buf.clone(),
+            palette_items: self
+                .shell_palette_buf
+                .iter()
+                .map(|i| crate::ui::snapshot::SnapshotPaletteItem {
+                    id: i.id.clone(),
+                    slash: i.slash.clone(),
+                    title: i.title.clone(),
+                    subtitle: i.subtitle.clone(),
+                    shortcut: i.shortcut.clone(),
+                    is_file: i.is_file,
+                })
+                .collect(),
+            palette_query: self.palette_query.clone(),
+            toast: self.toast_text.clone(),
+
+            model: self.settings.active_model.clone(),
+            provider: self.settings.active_provider.clone(),
+            mode: self.active_mode.clone(),
+            tokens,
+            context_pct,
+            cost,
+
+            mcp_servers: mcp,
+            todos,
+            modified_files: modified,
+
+            pending_approval: self.pending_approval.clone(),
+
+            palette: self.palette.clone(),
+            connect: SnapshotConnect {
+                open: self.connect_screen_open(),
+                provider_id: self.connect.provider_id.clone(),
+                model: self.connect.model.clone(),
+                key_input: self.connect.key_input.clone(),
+                url_input: self.connect.url_input.clone(),
+                auth_mode: self.connect.opencode_auth_mode.clone(),
+                detected: self.connect.detected_summary.clone(),
+                detected_file: self.connect.detected_opencode_file.clone(),
+                local_server_alive: self.connect.local_server_alive,
+                ollama_alive: self.connect.ollama_alive,
+                zen_models: self.connect.zen_free_models.clone(),
+                zen_status: self.connect.zen_status.clone(),
+            },
+            sidebar_open: self.sidebar_open,
+            expanded_blocks: self.expanded_blocks.clone(),
+            show_tool_blocks: self.show_tool_blocks,
+        }
+    }
+
+    /// Pumps the terminal PTYs, the filesystem watcher and the agent event
+    /// stream. The native GUI calls this from `render()`; headless front-ends
+    /// (TUI, web) have no render loop of their own, so they call `tick()`.
+    pub fn tick(&mut self) {
+        self.drain_background_streams();
+        // Keeps Tab-completion and the palette live without a render frame.
+        self.refresh_shell_scratch();
     }
 
     fn drain_background_streams(&mut self) {
@@ -3226,6 +3349,23 @@ impl StudioApp {
         chars / 4
     }
 
+    /// MCP / todo / modified-file lists, as the sidebar shows them.
+    ///
+    /// Headless front-ends cannot borrow the per-frame scratch buffers the GUI
+    /// fills during `render()`, so they get the values computed fresh.
+    fn shell_sidecar_lists(&self) -> (Vec<(String, String)>, Vec<String>, Vec<(String, usize, usize)>) {
+        (
+            self.shell_mcp_status(),
+            self.shell_todos(),
+            self.shell_modified_files(),
+        )
+    }
+
+    /// True when the `/connect` screen is what the user is looking at.
+    fn connect_screen_open(&self) -> bool {
+        matches!(self.shell_view, crate::ui::shell::ShellView::Connect)
+    }
+
     fn shell_token_pct(&self) -> f32 {
         // A 200K-token context window is the common denominator across providers.
         (self.shell_token_estimate() as f32 / 200_000.0).clamp(0.0, 1.0)
@@ -3423,6 +3563,21 @@ impl StudioApp {
         );
     }
 
+    /// Recomputes the scratch buffers the shell models borrow from.
+    ///
+    /// The GUI calls this once per frame. Headless front-ends (TUI, web) have no
+    /// frame, so `tick()` calls it instead — without it, Tab-completion in the
+    /// composer silently does nothing because `shell_slash_buf` stays empty.
+    pub fn refresh_shell_scratch(&mut self) {
+        self.shell_mcp_status_buf = self.shell_mcp_status();
+        self.shell_todos_buf = self.shell_todos();
+        self.shell_modified_buf = self.shell_modified_files();
+        self.shell_slash_buf = self.shell_slash_hits();
+        self.shell_file_buf = self.shell_file_hits();
+        self.shell_palette_buf = self.shell_palette_items();
+        self.shell_zen_buf = self.connect.zen_free_models.clone();
+    }
+
     fn render_shell(&mut self, canvas: &mut dyn SurfaceCanvas) {
         let w = self.width;
         let h = self.height;
@@ -3438,14 +3593,7 @@ impl StudioApp {
         }
         let effective_scroll = self.chat_scroll;
 
-        // Refresh the scratch buffers the shell models borrow from.
-        self.shell_mcp_status_buf = self.shell_mcp_status();
-        self.shell_todos_buf = self.shell_todos();
-        self.shell_modified_buf = self.shell_modified_files();
-        self.shell_slash_buf = self.shell_slash_hits();
-        self.shell_file_buf = self.shell_file_hits();
-        self.shell_palette_buf = self.shell_palette_items();
-        self.shell_zen_buf = self.connect.zen_free_models.clone();
+        self.refresh_shell_scratch();
 
         let tabs = self.shell_tabs();
         let sidebar_model = if self.sidebar_open && w > 900 {

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AirCode</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header id="tabs">
+  <div class="tabs-left">
+    <span class="tab active" id="active-tab">new session</span>
+    <span class="tab" id="other-tabs"></span>
+    <button class="tab-btn" id="btn-new" title="Start a new session (⌘N)">+</button>
+  </div>
+  <div class="tabs-right">
+    <span class="pill" id="run-state">idle</span>
+    <button class="ghost" id="btn-view" title="Toggle the IDE">Workspace</button>
+    <button class="ghost" id="btn-connect" title="Provider setup (/connect)">/connect</button>
+  </div>
+</header>
+
+<main id="body">
+  <section id="chat">
+    <div id="transcript"></div>
+    <div id="composer">
+      <div id="hint">enter to send · shift+enter for a newline · ↑↓ history · tab to complete</div>
+      <div id="input-row">
+        <span id="caret">&#62;</span>
+        <textarea id="prompt" rows="1" spellcheck="false"
+          placeholder="Ask AirCode anything…  (/ for commands, @ for files)"></textarea>
+        <button id="btn-send" title="Send">Send</button>
+        <button id="btn-stop" class="danger" title="Interrupt the run" hidden>Stop</button>
+      </div>
+      <div id="autocomplete" hidden></div>
+    </div>
+  </section>
+
+  <aside id="rail">
+    <section class="rail-block">
+      <h2>Context</h2>
+      <div class="meter"><div class="meter-fill" id="ctx-fill"></div></div>
+      <dl>
+        <dt>Tokens</dt><dd id="ctx-tokens">0</dd>
+        <dt>Used</dt><dd id="ctx-pct">0%</dd>
+        <dt>Cost</dt><dd id="ctx-cost">$0.000</dd>
+      </dl>
+    </section>
+
+    <section class="rail-block">
+      <h2>MCP Servers</h2>
+      <ul id="mcp-list" class="dot-list"><li class="empty">none configured</li></ul>
+    </section>
+
+    <section class="rail-block" id="todos-block" hidden>
+      <h2>Todos</h2>
+      <ul id="todo-list" class="check-list"></ul>
+    </section>
+
+    <section class="rail-block" id="modified-block" hidden>
+      <h2>Modified Files</h2>
+      <ul id="modified-list" class="file-list"></ul>
+    </section>
+
+    <section class="rail-block">
+      <h2>Sessions</h2>
+      <ul id="session-list" class="session-list"></ul>
+    </section>
+  </aside>
+</main>
+
+<footer id="status">
+  <span class="status-left" id="status-line">ready</span>
+  <span class="status-right">
+    <span id="status-tokens">Tokens: 0 (0%)</span>
+    <span id="status-cost">$0.000</span>
+    <span class="model-box" id="model-box">no model</span>
+  </span>
+</footer>
+
+<div id="connect" hidden>
+  <div class="card wide">
+    <h1>Connect a provider</h1>
+
+    <div class="lane" id="lane-zen">
+      <div class="lane-head">
+        <h2>OpenCode Zen — free lane</h2>
+        <span class="badge free">no key · no account · no card</span>
+      </div>
+      <p class="lane-body">
+        Start coding immediately with the free anonymous tier. No signup, no
+        credit card, nothing to paste.
+      </p>
+      <div class="lane-actions">
+        <button class="primary" id="btn-zen">Start free lane</button>
+        <span class="lane-status" id="zen-status">not started</span>
+      </div>
+      <div class="models" id="zen-models"></div>
+    </div>
+
+    <div class="lane">
+      <div class="lane-head"><h2>Bring your own key</h2></div>
+      <p class="lane-body">Anthropic, OpenAI, Google, Ollama or any OpenAI-compatible endpoint.</p>
+      <div class="form-grid">
+        <label>Provider<input id="in-provider" list="provider-list" placeholder="anthropic"></label>
+        <datalist id="provider-list">
+          <option value="anthropic"></option>
+          <option value="openai"></option>
+          <option value="google"></option>
+          <option value="ollama"></option>
+          <option value="openai-compatible"></option>
+        </datalist>
+        <label>Model<input id="in-model" placeholder="claude-sonnet-4-5"></label>
+        <label>API key<input id="in-key" type="password" placeholder="sk-…" autocomplete="off"></label>
+        <label>Base URL<input id="in-url" placeholder="https://api.anthropic.com"></label>
+      </div>
+      <div class="lane-actions">
+        <button class="primary" id="btn-save-connect">Save &amp; connect</button>
+      </div>
+    </div>
+
+    <div class="lane">
+      <div class="lane-head"><h2>Import detected local auth</h2></div>
+      <p class="lane-body" id="detected-summary">Scanning for local credentials…</p>
+      <ul class="detect-list" id="detected-list"></ul>
+    </div>
+
+    <div class="lane-actions">
+      <button class="ghost" id="btn-close-connect">Back to the conversation (esc)</button>
+    </div>
+  </div>
+</div>
+
+<div id="approval" hidden>
+  <div class="card narrow">
+    <h1 id="approval-title">Permission required</h1>
+    <p id="approval-detail"></p>
+    <pre id="approval-target"></pre>
+    <div class="lane-actions">
+      <button class="primary" id="btn-allow">Allow</button>
+      <button class="ghost" id="btn-deny">Deny</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>
